@@ -17,7 +17,7 @@ def sanitize_basename(name: str) -> str:
     >>> sanitize_basename("Adenine + Ribose")
     'adenine_ribose'
     >>> sanitize_basename("2,6-Diaminopurine")
-    '2_6_diaminopurine'
+    '26_diaminopurine'
     """
     s = name.strip().lower()
     s = s.replace(" + ", "_").replace("+", "_").replace(",", "")
