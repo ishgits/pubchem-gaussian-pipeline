@@ -1,3 +1,5 @@
+https://doi.org/10.5281/zenodo.18894724
+
 # PubChem → Gaussian Input File Pipeline
 
 Automated generation of **Gaussian input files** (`.com`) and **SLURM submission scripts** (`.sh`) from molecule names — no manual structure building required.
