@@ -111,7 +111,7 @@ def write_gaussian_com(
             f"--Link1--\n"
             f"%nprocshared={nproc}\n"
             f"%chk={chk_name}\n"
-            f"{route_freq}\n"
+            f"{route_freq}\n\n"
         )
 
     with open(com_path, "w") as f:
