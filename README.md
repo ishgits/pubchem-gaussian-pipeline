@@ -35,7 +35,7 @@ Every step writes a log CSV. If the pipeline is interrupted, rerunning skips com
 ### 1. Clone & install dependencies
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/pubchem-gaussian-pipeline.git
+git clone https://github.com/ishgits/pubchem-gaussian-pipeline.git
 cd pubchem-gaussian-pipeline
 conda env create -f environment.yml
 conda activate gaussian-pipeline
