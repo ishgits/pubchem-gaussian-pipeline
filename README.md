@@ -135,6 +135,11 @@ Tests cover the pure functions (coordinate formatting, file generation, scoring 
 - **Jupyter** (to run the notebook)
 - **Gaussian 16** (on your HPC cluster, not needed locally)
 
+## Citation
+
+If you use this workflow or any part of the dataset in your research, please cite:
+Ishaan Madan. (2026). ishgits/pubchem-gaussian-pipeline: v1.1 – Initial Release (v1.1). Zenodo. https://doi.org/10.5281/zenodo.18894724
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
