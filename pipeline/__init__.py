@@ -27,6 +27,7 @@ from .pubchem import (
 )
 from .geometry import sdf_to_xyz, convert_sdfs_to_xyz
 from .conformers import (
+    check_conformer_eligibility,
     generate_conformers,
     search_conformers,
     select_top_n,

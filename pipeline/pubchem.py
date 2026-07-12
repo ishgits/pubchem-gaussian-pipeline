@@ -93,10 +93,16 @@ def get_cids_by_name(name_query: str, **kwargs) -> list[int]:
 
 
 def get_props_by_cids(cids: list[int], **kwargs) -> list[dict]:
-    """Fetch a standard set of properties for one or more CIDs."""
+    """Fetch a standard set of properties for one or more CIDs.
+
+    NB: PubChem renamed its SMILES properties in 2025 — the stereo-bearing
+    ``IsomericSMILES`` became ``SMILES`` and the stereo-free ``CanonicalSMILES``
+    became ``ConnectivitySMILES``. We request the current names; response parsing
+    (:func:`_isomeric_smiles`) still accepts the legacy keys for old caches.
+    """
     props = ",".join([
-        "IsomericSMILES",
-        "CanonicalSMILES",
+        "SMILES",              # stereo-bearing (formerly IsomericSMILES)
+        "ConnectivitySMILES",  # stereo-free    (formerly CanonicalSMILES)
         "InChI",
         "InChIKey",
         "MolecularFormula",
@@ -108,6 +114,17 @@ def get_props_by_cids(cids: list[int], **kwargs) -> list[dict]:
     url = f"{PUBCHEM_BASE}/compound/cid/{cid_str}/property/{props}/JSON"
     data = _get_json(url, cache_key=f"props__{cid_str}", **kwargs)
     return data.get("PropertyTable", {}).get("Properties", [])
+
+
+def _isomeric_smiles(prop: dict) -> str:
+    """Return the stereo-bearing SMILES from a PubChem property record.
+
+    PubChem's 2025 rename means the stereochemistry-carrying SMILES now arrives
+    under the ``SMILES`` key; older records/caches used ``IsomericSMILES``. We
+    prefer the current key and fall back to the legacy one, and never use
+    ``ConnectivitySMILES``/``CanonicalSMILES``, which drop stereochemistry.
+    """
+    return prop.get("SMILES") or prop.get("IsomericSMILES") or ""
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +280,61 @@ def resolve_with_fallback(
 # Table builder (Step 1)
 # ---------------------------------------------------------------------------
 
+# Column schema for the resolved molecule table. Kept explicit (and identical
+# for resolved/unresolved rows) so downstream consumers — download_sdfs (cid),
+# conformers.search_conformers (IsomericSMILES) — always see the same columns.
+MOLECULE_TABLE_COLUMNS = [
+    "name",
+    "pubchem_query",
+    "cid",
+    "IsomericSMILES",
+    "formula",
+    "iupac_name",
+    "title",
+    "status",
+    "warnings",
+]
+
+
+def _resolved_row(label: str, query: str, prop: dict | None, info: dict) -> dict:
+    """
+    Assemble one molecule-table row from a PubChem property record.
+
+    Pure (no network): given the label, the query, the best-scoring property
+    dict (or ``None`` when resolution failed), and the diagnostics ``info``,
+    return a row dict with the fixed :data:`MOLECULE_TABLE_COLUMNS` schema.
+
+    Carries the stereo-bearing SMILES (via :func:`_isomeric_smiles`; never the
+    stereo-free ``ConnectivitySMILES``/``CanonicalSMILES``) into an
+    ``IsomericSMILES`` column so the v2 conformer stage can embed from it.
+    Unresolved rows carry an empty ``IsomericSMILES`` so the column always exists.
+    """
+    warnings = "; ".join(info.get("warnings", []))
+    if prop is None:
+        return {
+            "name": label,
+            "pubchem_query": query,
+            "cid": None,
+            "IsomericSMILES": "",
+            "formula": None,
+            "iupac_name": None,
+            "title": None,
+            "status": info["status"],
+            "warnings": warnings,
+        }
+    return {
+        "name": label,
+        "pubchem_query": query,
+        "cid": prop.get("CID"),
+        "IsomericSMILES": _isomeric_smiles(prop),
+        "formula": prop.get("MolecularFormula"),
+        "iupac_name": prop.get("IUPACName"),
+        "title": prop.get("Title"),
+        "status": info["status"],
+        "warnings": warnings,
+    }
+
+
 def build_molecule_table(
     molecules: list[str],
     alias: dict[str, str] | None = None,
@@ -302,31 +374,9 @@ def build_molecule_table(
             **kwargs,
         )
         diagnostics.append(info)
+        rows.append(_resolved_row(label, query, prop, info))
 
-        if prop is None:
-            rows.append({
-                "name": label,
-                "pubchem_query": query,
-                "cid": None,
-                "formula": None,
-                "iupac_name": None,
-                "title": None,
-                "status": info["status"],
-                "warnings": "; ".join(info.get("warnings", [])),
-            })
-        else:
-            rows.append({
-                "name": label,
-                "pubchem_query": query,
-                "cid": prop.get("CID"),
-                "formula": prop.get("MolecularFormula"),
-                "iupac_name": prop.get("IUPACName"),
-                "title": prop.get("Title"),
-                "status": info["status"],
-                "warnings": "; ".join(info.get("warnings", [])),
-            })
-
-    return pd.DataFrame(rows), pd.DataFrame(diagnostics)
+    return pd.DataFrame(rows, columns=MOLECULE_TABLE_COLUMNS), pd.DataFrame(diagnostics)
 
 
 # ---------------------------------------------------------------------------

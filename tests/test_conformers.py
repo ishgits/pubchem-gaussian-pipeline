@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pipeline.conformers import select_top_n
+from pipeline.conformers import check_conformer_eligibility, select_top_n
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,44 @@ class TestSelectTopN:
 
     def test_single_conformer(self):
         assert select_top_n([42.0], 3) == [0]
+
+
+# Flexible sugar with UNspecified stereocenters (no @) — must be skipped.
+UNDEFINED_STEREO_SUGAR = "OC1OCC(O)C(O)C1O"
+
+
+# ---------------------------------------------------------------------------
+# B-01 — stereo/validity eligibility gate
+# ---------------------------------------------------------------------------
+
+class TestCheckEligibility:
+    def test_empty_smiles(self):
+        # Pure (no RDKit): empty/None short-circuits before parsing.
+        assert check_conformer_eligibility("") == "no IsomericSMILES"
+
+    def test_none_smiles(self):
+        assert check_conformer_eligibility(None) == "no IsomericSMILES"
+
+    def test_whitespace_smiles(self):
+        assert check_conformer_eligibility("   ") == "no IsomericSMILES"
+
+    def test_no_stereocenter_molecule_eligible(self):
+        pytest.importorskip("rdkit")
+        # Adenine / water have no stereo elements → eligible (not skipped).
+        assert check_conformer_eligibility("c1[nH]cnc2c1ncn2") is None
+        assert check_conformer_eligibility("O") is None
+
+    def test_defined_stereo_eligible(self):
+        pytest.importorskip("rdkit")
+        assert check_conformer_eligibility("C[C@@H](N)C(=O)O") is None
+
+    def test_undefined_stereo_skipped(self):
+        pytest.importorskip("rdkit")
+        assert check_conformer_eligibility(UNDEFINED_STEREO_SUGAR) == "undefined stereochemistry"
+
+    def test_unparseable_smiles(self):
+        pytest.importorskip("rdkit")
+        assert check_conformer_eligibility("not-a-smiles(") == "unparseable SMILES"
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +174,7 @@ class TestSearchConformers:
         for xyz_path in log["xyz_path"]:
             assert os.path.exists(xyz_path)
 
-    def test_missing_smiles_is_logged_not_skipped(self, tmp_path):
+    def test_missing_smiles_logged_no_isomericsmiles(self, tmp_path):
         pd = pytest.importorskip("pandas")
         pytest.importorskip("rdkit")
         from pipeline.conformers import search_conformers
@@ -145,9 +183,10 @@ class TestSearchConformers:
             {"name": "NoSmiles", "cid": None, "IsomericSMILES": None},
         ])
         failed_csv = tmp_path / "conformer_search_failed.csv"
+        xyz_dir = tmp_path / "conf_xyz"
         log = search_conformers(
             table,
-            xyz_dir=str(tmp_path / "conf_xyz"),
+            xyz_dir=str(xyz_dir),
             log_csv=str(tmp_path / "conformer_log.csv"),
             failed_csv=str(failed_csv),
         )
@@ -155,6 +194,37 @@ class TestSearchConformers:
         assert failed_csv.exists()
         fail_df = pd.read_csv(failed_csv)
         assert "NoSmiles" in set(fail_df["name"])
+        assert set(fail_df["error"]) == {"no IsomericSMILES"}
+        # No XYZ files written for a skipped molecule.
+        assert not any(os.scandir(xyz_dir)) if os.path.isdir(xyz_dir) else True
+
+    def test_undefined_stereo_is_skipped_and_logged(self, tmp_path):
+        pd = pytest.importorskip("pandas")
+        pytest.importorskip("rdkit")
+        from pipeline.conformers import search_conformers
+
+        table = pd.DataFrame([
+            {"name": "Adenine", "cid": 190, "IsomericSMILES": ADENINE_SMILES},
+            {"name": "UndefSugar", "cid": 1, "IsomericSMILES": UNDEFINED_STEREO_SUGAR},
+        ])
+        failed_csv = tmp_path / "conformer_search_failed.csv"
+        xyz_dir = tmp_path / "conf_xyz"
+        log = search_conformers(
+            table,
+            xyz_dir=str(xyz_dir),
+            log_csv=str(tmp_path / "conformer_log.csv"),
+            failed_csv=str(failed_csv),
+        )
+        # Adenine (no stereo) proceeds; the undefined-stereo sugar is skipped.
+        assert set(log["name"]) == {"Adenine"}
+        fail_df = pd.read_csv(failed_csv)
+        assert dict(zip(fail_df["name"], fail_df["error"])) == {
+            "UndefSugar": "undefined stereochemistry"
+        }
+        # No XYZ written for the skipped molecule.
+        written = [os.path.basename(p) for p in log["xyz_path"]]
+        assert all(name.startswith("adenine") for name in written)
+        assert not any("undefsugar" in f for f in os.listdir(xyz_dir))
 
     def test_resume_skips_completed(self, tmp_path):
         pytest.importorskip("rdkit")

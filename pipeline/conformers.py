@@ -77,6 +77,41 @@ def _rdkit_version() -> str:
     return rdkit.__version__
 
 
+def check_conformer_eligibility(smiles) -> str | None:
+    """
+    Decide whether *smiles* may enter the conformer search, or why it is skipped.
+
+    Returns ``None`` if the molecule is eligible, otherwise a short skip-reason
+    string (logged to ``conformer_search_failed.csv``). Skipping — never silent
+    auto-correction — is the safe failure mode for ambiguous chemistry.
+
+    Skip reasons:
+
+    - ``"no IsomericSMILES"`` — empty/missing SMILES; nothing to embed.
+    - ``"unparseable SMILES"`` — RDKit cannot parse the string.
+    - ``"undefined stereochemistry"`` — the molecule has ≥1 *unspecified* stereo
+      element (chiral center or double-bond geometry). Embedding would let RDKit
+      pick a stereoisomer arbitrarily, changing the chemistry silently, so we
+      skip instead. A molecule with **no** stereo elements (adenine, water) is
+      eligible and returns ``None``.
+    """
+    if smiles is None or (isinstance(smiles, float) and pd.isna(smiles)) or str(smiles).strip() == "":
+        return "no IsomericSMILES"
+
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        return "unparseable SMILES"
+
+    # FindPotentialStereo flags every stereogenic element and whether it is
+    # specified; any Unspecified element means the SMILES leaves stereo open.
+    for element in Chem.FindPotentialStereo(mol):
+        if element.specified == Chem.StereoSpecified.Unspecified:
+            return "undefined stereochemistry"
+    return None
+
+
 def _conf_coords(mol, conf_id: int) -> list[tuple[str, float, float, float]]:
     """Extract (element symbol, x, y, z) tuples for one conformer, in Ångström."""
     conf = mol.GetConformer(conf_id)
@@ -265,12 +300,16 @@ def search_conformers(
 
         smiles = row.get("IsomericSMILES")
         cid = row.get("cid")
-        if smiles is None or (isinstance(smiles, float) and pd.isna(smiles)) or str(smiles).strip() == "":
+
+        # Stereo/validity gate (remediation B-01, decision 2a): skip + log rather
+        # than let RDKit auto-assign stereo or embed an empty/unparseable SMILES.
+        skip_reason = check_conformer_eligibility(smiles)
+        if skip_reason is not None:
             failed.append({
                 "name": name,
                 "cid": cid,
                 "smiles": smiles,
-                "error": "missing IsomericSMILES",
+                "error": skip_reason,
             })
             continue
 
