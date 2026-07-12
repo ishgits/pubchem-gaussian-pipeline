@@ -90,5 +90,14 @@ PubChem, so it stays a local check, consistent with the no-network CI rule).
 ### Implementation evidence (fill in as fixes land — do NOT mark resolved on code change alone; run the verify step)
 | ID | Commit | Verification run | Result |
 |----|--------|------------------|--------|
-| B-01 | <hash> | `pytest tests/ -q`; offline 2-row end-to-end | pass/fail |
-| M-02 | <hash> | offline smoke test; manual notebook run | pass/fail |
+| B-01 | `6831e30` | `pytest tests/ -q` → 66 passed; `scripts/check_invariants.py` → passed; offline 2-row end-to-end (defined-stereo L-alanine → `l_alanine_c00.xyz` + `l_alanine_c00_F.com`; undefined-stereo sugar → logged `"undefined stereochemistry"`, no XYZ) | **pass** |
+| M-02 | `21dd80d` | offline smoke test `TestNotebookPathOffline` (search_conformers → write_gaussian_coms_from_conformers → per-conformer `_c{ii}_F.com`, Link1 + ΔE) in `pytest tests/ -q` → 66 passed; manual notebook run top-to-bottom on demo molecules (Water/Glycine/Adenine, from cache) → `adenine/glycine/water_c00_F.com` via the conformer path | **pass** |
+
+**B-01 note (deviation).** The plan's literal step 1 (`prop.get("IsomericSMILES", "")`)
+was insufficient: PubChem renamed its SMILES properties in 2025
+(`IsomericSMILES`→`SMILES`, `CanonicalSMILES`→`ConnectivitySMILES`), verified
+against live PubChem, so that key is now always empty and every molecule still
+dead-ended. The fix reads the stereo-bearing SMILES from the current `SMILES`
+key (legacy `IsomericSMILES` fallback; never the stereo-free
+`ConnectivitySMILES`). Faithful to B-01's intent; recorded in
+`docs/implementation-status-v2.md` §3.

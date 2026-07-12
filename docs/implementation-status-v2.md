@@ -3,8 +3,32 @@
 Maintained by the implementing agent (Claude Code). The reviewer (Codex) must
 verify these claims against the code, not trust them.
 
-**PR:** #<pending>   **Branch:** `feat/conformer-search-v2`   **Round:** 1
+**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 1 (+ round-01 remediation)
 Works against `docs/architecture-v2.md` and `docs/implementation-plan-v2.md`.
+
+## 0. Round-01 remediation (Codex findings B-01, M-02)
+
+Both findings from `docs/remediation-plan-round-01-v2.md` are addressed as
+separate commits. **Resolved only after the listed verify step passed** — not on
+code change alone.
+
+| ID | Commit | Verification run | Result |
+|----|--------|------------------|--------|
+| B-01 | `6831e30` | `pytest tests/ -q` → 66 passed; `check_invariants.py` → passed; offline 2-row end-to-end (defined-stereo → XYZ + `.com`; undefined-stereo → logged skip, no XYZ) | **Resolved** |
+| M-02 | `21dd80d` | offline `TestNotebookPathOffline` in `pytest tests/ -q` → 66 passed; manual notebook run top-to-bottom on demo molecules → per-conformer `_c00_F.com` via conformer path | **Resolved** |
+
+- **B-01** — the resolved molecule table now carries the stereo-bearing SMILES
+  into an `IsomericSMILES` column (pure `_resolved_row` helper), and
+  `search_conformers` runs `check_conformer_eligibility` before embedding:
+  empty/unparseable SMILES or **undefined stereochemistry** → skip + log to
+  `conformer_search_failed.csv` (never silent RDKit stereo auto-assignment);
+  no-stereocenter molecules proceed. See §3 for the PubChem key-rename deviation
+  that this fix had to absorb to actually produce inputs.
+- **M-02** — `notebooks/run_pipeline.ipynb` now runs the conformer path by
+  default (`build_molecule_table → search_conformers →
+  write_gaussian_coms_from_conformers → write_slurm_scripts`); the v1.1
+  single-geometry path is a commented-out labeled legacy appendix. README updated
+  to match; an offline test exercises the notebook's exact code path in CI.
 
 ## 1. What was implemented
 
@@ -43,8 +67,8 @@ Works against `docs/architecture-v2.md` and `docs/implementation-plan-v2.md`.
 - **Tests** — `tests/test_conformers.py` (new) and conformer cases added to
   `tests/test_gaussian.py`. See §4.
 
-Required checks locally green: `pytest tests/ -q` → **48 passed**;
-`python scripts/check_invariants.py` → **passed**.
+Required checks locally green after round-01 remediation: `pytest tests/ -q` →
+**66 passed**; `python scripts/check_invariants.py` → **passed**.
 
 ## 2. What was NOT implemented (and why)
 
@@ -52,11 +76,9 @@ Required checks locally green: `pytest tests/ -q` → **48 passed**;
   xTB/CREST, energy-window logic, Boltzmann/entropy weighting, solvent-aware
   search, changes to level of theory or the Link1 contract. Deliberately omitted
   per architecture-v2 "Out of scope for v2".
-- The notebook (`notebooks/run_pipeline.ipynb`) was **not** rewired to call the
-  conformer stage. The plan's "Files expected to change" list does not include
-  the notebook, and the module API + README are the deliverable surface. The new
-  functions are importable and documented; wiring the notebook end-to-end is left
-  as a follow-up to avoid scope creep. Flagged as a question in §6.
+- ~~The notebook was not rewired.~~ **Resolved in round-01 remediation (M-02,
+  commit `21dd80d`):** `notebooks/run_pipeline.ipynb` now runs the conformer path
+  by default; the v1.1 path is a labeled legacy appendix.
 
 ## 3. Deviations from architecture-v2.md / plan
 
@@ -76,6 +98,28 @@ Required checks locally green: `pytest tests/ -q` → **48 passed**;
   required provenance columns (it adds `cid`, `smiles`, `n_kept` for traceability
   name→CID→SMILES→conformer). No required column omitted.
 
+### Round-01 remediation deviations
+
+- **B-01 — PubChem SMILES property rename (deviation from the plan's literal
+  step).** The remediation plan (B-01 step 1) said to add
+  `prop.get("IsomericSMILES", "")`. Implementing exactly that still produced
+  **zero** conformers: PubChem renamed its SMILES properties in 2025
+  (`IsomericSMILES`→`SMILES`, `CanonicalSMILES`→`ConnectivitySMILES`), so
+  `prop.get("IsomericSMILES")` is now always empty and every molecule dead-ended
+  at `"no IsomericSMILES"`. **Verified against live PubChem** (CID 5950 L-alanine):
+  the stereo-bearing SMILES arrives under `"SMILES"` (`C[C@@H](N)C(=O)O`), while
+  `"ConnectivitySMILES"` drops stereo (`CC(N)C(=O)O`). The fix reads the
+  stereo-bearing SMILES via `_isomeric_smiles()` — prefer `"SMILES"`, fall back to
+  legacy `"IsomericSMILES"`, **never** `ConnectivitySMILES`/`CanonicalSMILES`.
+  `get_props_by_cids` now requests the current property names. This is faithful to
+  B-01's intent (get the stereo SMILES into resolved rows) and changes **no**
+  scientific assumption — stereochemistry is still preserved, not dropped. This is
+  the item the reviewer should scrutinize; see §6 Q5.
+- **B-01 — stereo skip gate.** `check_conformer_eligibility` skips (and logs)
+  molecules with undefined stereochemistry rather than letting RDKit assign a
+  stereoisomer. This is the plan's locked decision 2a, not a deviation, but it is
+  a deliberate **behavioral** choice: such molecules produce no inputs by design.
+
 No scientific invariant (§2 of AGENTS.md) was altered: route lines, units,
 charge/multiplicity handling, and the Link1 contract are unchanged. Conformer
 energies are labeled kcal/mol at every surface (CSV column name, XYZ comment,
@@ -93,11 +137,25 @@ energies are labeled kcal/mol at every surface (CSV column name, XYZ comment,
   - `TestSearchConformers::test_two_molecule_table` — adenine collapses to 1 row,
     ribose yields 1–3 rows, provenance columns populated, per-molecule min ΔE = 0
     and all ΔE ≥ 0, XYZ files exist.
-  - `TestSearchConformers::test_missing_smiles_is_logged_not_skipped` — missing
-    SMILES is recorded in the failed CSV, not silently dropped.
+  - `TestSearchConformers::test_missing_smiles_logged_no_isomericsmiles` — empty
+    SMILES → skipped + logged `"no IsomericSMILES"`, no XYZ written. **(B-01)**
+  - `TestSearchConformers::test_undefined_stereo_is_skipped_and_logged` —
+    undefined-stereo sugar → logged `"undefined stereochemistry"`, no XYZ, while a
+    no-stereo molecule in the same table proceeds. **(B-01)**
   - `TestSearchConformers::test_resume_skips_completed` — rerun appends nothing.
+  - `TestCheckEligibility::*` — empty/None/whitespace (pure), no-stereocenter and
+    defined-stereo eligible, undefined-stereo and unparseable skipped. **(B-01)**
   - `TestReproducibility::test_same_seed_same_selected_conformers` — same seed →
     identical `conformer_id` + `rel_energy_kcalmol` (validation ≠ "it ran").
+  - `TestNotebookPathOffline::test_conformer_path_produces_per_conformer_coms` —
+    the exact notebook code path → per-conformer `_c{ii}_F.com`, Link1 + ΔE.
+    **(M-02)**
+- `tests/test_pubchem.py` **(B-01)**
+  - `TestIsomericSmiles::*` — prefers current `"SMILES"` key, falls back to legacy
+    `"IsomericSMILES"`, never returns the stereo-free `ConnectivitySMILES`.
+  - `TestResolvedRow::*` — resolved rows carry stereo SMILES in the
+    `IsomericSMILES` column; unresolved rows carry an empty column; schema matches
+    `MOLECULE_TABLE_COLUMNS`; downstream-consumer columns present.
 - `tests/test_gaussian.py`
   - `TestWriteGaussianComConformer::*` — conformer filename/chk (`ribose_c00_F`),
     ΔE in title (`dE=1.2345 kcal/mol`), Link1 preserved, and `conformer_id=None`
@@ -120,19 +178,27 @@ still runs the pure tests; CI installs rdkit so they execute there.
 
 ## 6. Questions requiring scientific judgment  ← Ish reads this FIRST
 
-1. **Should the notebook be wired to the conformer stage in this PR, or in a
-   follow-up?** I kept the notebook unchanged (not in the plan's file list) and
-   delivered the module API + README. Confirm the intended integration surface.
-2. **`TOP_N=3` distinctness relies solely on `pruneRmsThresh=0.5 Å` at embed
+1. ~~Should the notebook be wired to the conformer stage?~~ **Resolved by M-02
+   (Ish decision 1a):** the notebook now runs the conformer path by default.
+2. **PubChem SMILES property rename (B-01) — please sanity-check the chemistry.**
+   PubChem's current `"SMILES"` property is the stereo-bearing SMILES we now
+   consume; `"ConnectivitySMILES"` is stereo-free and deliberately unused. I
+   verified this against live PubChem for L-alanine and D-glucose (both show `@`
+   in `"SMILES"`, none in `"ConnectivitySMILES"`). Confirm you are comfortable
+   treating PubChem `"SMILES"` as the stereochemistry source of record. If PubChem
+   ever emits a `"SMILES"` without stereo for a molecule that *has* stereocenters,
+   the eligibility gate will (correctly) skip it as "undefined stereochemistry"
+   rather than embed an arbitrary isomer.
+3. **`TOP_N=3` distinctness relies solely on `pruneRmsThresh=0.5 Å` at embed
    time.** After MMFF optimization, two kept conformers could in principle relax
    toward each other; v2 does not re-prune post-optimization (matches "no separate
    duplicate-removal code" in architecture-v2). Acceptable, or do you want a
    post-optimization RMSD check? (Would be new scope.)
-3. **UFF fallback energies vs MMFF94 energies are on different scales.** Both are
+4. **UFF fallback energies vs MMFF94 energies are on different scales.** Both are
    labeled kcal/mol and `method` is recorded per row, but ΔE values from a UFF
    molecule are not comparable to MMFF94 ΔE from another molecule. Confirm that
    per-molecule ΔE (never cross-molecule) is the only intended comparison.
-4. **Charge/multiplicity for conformers.** The conformer stage builds neutral
+5. **Charge/multiplicity for conformers.** The conformer stage builds neutral
    molecules from `IsomericSMILES` (RDKit default protonation). Non-default
    charge/multiplicity still must be passed to the Gaussian writer separately, as
    in v1.1. No per-molecule charge handling was added. Confirm this is expected.
