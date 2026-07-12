@@ -155,6 +155,36 @@ def _optimize_confs(mol, method: str, max_iters: int):
         )
     return AllChem.UFFOptimizeMoleculeConfs(mol, maxIters=max_iters)
 
+
+def _optimize_single_conf(mol, method: str, conf_id: int, max_iters: int):
+    """
+    Re-optimize a **single** conformer of *mol* in place and return its
+    ``(not_converged, energy_kcal)`` — the same shape as one row of
+    :func:`_optimize_confs`.
+
+    Used by the M-04 retry so only the conformers that failed the first pass are
+    touched (M-05): already-converged conformers keep their first-pass geometry
+    *and* energy, so the ranked energy always describes the coordinates that get
+    written. ``CalcEnergy`` returns the MMFF/UFF energy in kcal/mol, matching the
+    batch optimizer. Isolated at module level (lazy RDKit) so the retry path is
+    monkeypatchable in tests.
+    """
+    from rdkit.Chem import AllChem
+
+    if method == "MMFF94":
+        not_converged = AllChem.MMFFOptimizeMolecule(
+            mol, mmffVariant="MMFF94", maxIters=max_iters, confId=conf_id
+        )
+        props = AllChem.MMFFGetMoleculeProperties(mol)
+        ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=conf_id)
+    else:
+        not_converged = AllChem.UFFOptimizeMolecule(
+            mol, confId=conf_id, maxIters=max_iters
+        )
+        ff = AllChem.UFFGetMoleculeForceField(mol, confId=conf_id)
+    return not_converged, ff.CalcEnergy()
+
+
 def _rdkit_version() -> str:
     import rdkit
 
@@ -286,11 +316,22 @@ def generate_conformers(
             f"falling back to UFF (logged, not silent)."
         )
 
-    # First optimization pass; retry the whole ensemble once (more iterations)
-    # if any conformer failed to converge, then finalize per-conformer flags.
+    # First optimization pass over the whole ensemble. Then retry ONLY the
+    # conformers that failed, one at a time, with more iterations (M-04). Retrying
+    # just the failed conformers — rather than re-optimizing the whole molecule in
+    # place — is required so already-converged conformers keep their first-pass
+    # geometry AND energy: otherwise a whole-ensemble retry would move converged
+    # geometries while _finalize_convergence kept their first-pass energies,
+    # leaving ranked energies describing a different geometry than the XYZ/.com we
+    # write (Codex round-02 M-05).
     first = _optimize_confs(mol, method, FF_MAXITERS)
     if any(nc != 0 for nc, _ in first):
-        retry = _optimize_confs(mol, method, FF_MAXITERS_RETRY)
+        retry = list(first)
+        for i, (nc, _e) in enumerate(first):
+            if nc != 0:
+                retry[i] = _optimize_single_conf(
+                    mol, method, conf_ids[i], FF_MAXITERS_RETRY
+                )
         results = _finalize_convergence(first, retry)
     else:
         results = _finalize_convergence(first)

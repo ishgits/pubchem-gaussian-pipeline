@@ -401,6 +401,68 @@ class TestFinalizeConvergence:
         assert out == [(True, 1.0), (True, 1.5)]
 
 
+class TestRetryAlignment:
+    """M-05: the retry must re-optimize ONLY the failed conformers, so converged
+    conformers keep the first-pass energy that matches their (untouched) geometry
+    — ranked energy never describes a different geometry than the written XYZ."""
+
+    def test_retry_touches_only_failed_confs_and_keeps_energies_aligned(self, monkeypatch):
+        pytest.importorskip("rdkit")
+        import pipeline.conformers as C
+
+        state = {}
+
+        def fake_confs(mol, method, max_iters):
+            # First pass: every conformer converged except the last one.
+            conf_ids = [c.GetId() for c in mol.GetConformers()]
+            state["conf_ids"] = conf_ids
+            res = [(0, float(10 + i)) for i in range(len(conf_ids))]
+            res[-1] = (1, 999.0)  # last conf failed to converge
+            return res
+
+        retried = []
+
+        def fake_single(mol, method, conf_id, max_iters):
+            retried.append(conf_id)
+            return (0, 42.0)  # converges on retry with a distinctive energy
+
+        monkeypatch.setattr(C, "_optimize_confs", fake_confs)
+        monkeypatch.setattr(C, "_optimize_single_conf", fake_single)
+
+        coords, energies, method, converged = C.generate_conformers("CCCC", seed=1)
+        n = len(state["conf_ids"])
+        assert n >= 1
+
+        # Exactly one retry call, and only for the conformer that failed.
+        assert retried == [state["conf_ids"][-1]]
+        # The failed conformer carries its retry energy; every already-converged
+        # conformer keeps its first-pass energy (never re-optimized → geometry and
+        # energy stay in sync).
+        assert energies[-1] == 42.0
+        for i in range(n - 1):
+            assert energies[i] == float(10 + i)
+        assert all(converged)
+        assert len(coords) == n
+
+    def test_no_retry_when_all_converge(self, monkeypatch):
+        pytest.importorskip("rdkit")
+        import pipeline.conformers as C
+
+        def fake_confs(mol, method, max_iters):
+            return [(0, float(10 + i)) for i in range(mol.GetNumConformers())]
+
+        retried = []
+        monkeypatch.setattr(C, "_optimize_confs", fake_confs)
+        monkeypatch.setattr(
+            C, "_optimize_single_conf",
+            lambda *a, **k: retried.append(a) or (0, 0.0),
+        )
+        _, energies, _, converged = C.generate_conformers("CCCC", seed=1)
+        # No conformer failed → single-conf retry never called.
+        assert retried == []
+        assert all(converged)
+
+
 class TestConvergenceBatch:
     """M-04 batch behavior — RDKit stubbed out so this is synthetic/offline."""
 
