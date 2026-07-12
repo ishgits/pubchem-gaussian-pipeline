@@ -16,6 +16,7 @@ code change alone.
 |----|--------|------------------|--------|
 | M-03 | `5f635bd` | `pytest tests/ -q` → 68 passed (incl. `TestScoreCandidateCurrentSchema`); dead-key grep clean (only helper fallback + documented table-column read; no `CanonicalSMILES` reads); `check_invariants.py` → passed | **Resolved** |
 | M-04 | `016c197` | `pytest tests/ -q` → 79 passed (incl. the four convergence cases); `check_invariants.py` → passed; offline run — ribose top-3 all `converged=True` (unchanged vs round-01); mocked all-unconverged → one `converged=False` seed + warning + `UNCONVERGED_FF_SEED` in the `.com` title | **Resolved** |
+| M-05 | `c5a6974` | `pytest tests/ -q` → 81 passed (incl. `TestRetryAlignment`); `check_invariants.py` → passed; offline alignment run — forced single-conformer retry on ribose → every recorded energy equals the MMFF energy recomputed from the written coordinates (all 8 conformers, <1e-3 kcal/mol) | **Resolved** |
 
 - **M-03** — `score_candidate` now reads the stereo-bearing SMILES via
   `_isomeric_smiles(prop)` instead of the dead `IsomericSMILES` key, so ambiguous
@@ -31,6 +32,12 @@ code change alone.
   converge, exactly one lowest-energy best-effort seed is carried with
   `converged=False`, a warning, and an `UNCONVERGED_FF_SEED` marker in the `.com`
   title (2b). The unreliable FF energy stays labeled unreliable.
+- **M-05** — correctness follow-up to M-04's retry: the retry now re-optimizes
+  **only the conformers that failed** the first pass (`_optimize_single_conf`),
+  so already-converged conformers keep the first-pass energy that matches their
+  (untouched) geometry. Previously a whole-ensemble retry could move converged
+  geometries while retaining their first-pass energies, letting the ranked
+  `rel_energy_kcalmol` describe a different geometry than the written XYZ/`.com`.
 
 ## 0. Round-01 remediation (Codex findings B-01, M-02)
 
@@ -93,8 +100,9 @@ code change alone.
 - **Tests** — `tests/test_conformers.py` (new) and conformer cases added to
   `tests/test_gaussian.py`. See §4.
 
-Required checks locally green after round-02 remediation: `pytest tests/ -q` →
-**79 passed**; `python scripts/check_invariants.py` → **passed**.
+Required checks locally green after round-02 remediation (incl. M-05):
+`pytest tests/ -q` → **81 passed**; `python scripts/check_invariants.py` →
+**passed**.
 
 ## 2. What was NOT implemented (and why)
 
@@ -129,12 +137,20 @@ Required checks locally green after round-02 remediation: `pytest tests/ -q` →
 
 ### Round-02 remediation deviations
 
-- **M-04 — `generate_conformers` 4-tuple / retry re-optimizes the full ensemble.**
-  The convergence retry re-runs the FF optimizer over the whole ensemble (not just
-  the failed conformers) with more iterations; converged conformers sit at their
-  minima so this is idempotent for them and the merge (`_finalize_convergence`)
-  keeps first-pass energies for already-converged conformers. Implementation
-  detail, not a scientific change.
+- **M-04 — `generate_conformers` returns a 4-tuple.** The convergence retry
+  re-optimizes **only the conformers that failed** the first pass, one at a time
+  (`_optimize_single_conf`), so already-converged conformers are never disturbed
+  and `_finalize_convergence` keeps their first-pass energies consistent with
+  their first-pass geometry (see M-05 below). All-converged ensembles never retry
+  and are byte-identical to the pre-M-04 behavior. Implementation detail, not a
+  scientific change.
+- **M-05 — retry alignment (correctness fix, supersedes the earlier
+  whole-ensemble retry).** The initial M-04 retry re-optimized the whole molecule
+  in place, which could move already-converged geometries while their first-pass
+  energies were retained — leaving ranked `rel_energy_kcalmol` describing a
+  different geometry than the written XYZ/`.com`. Now only failed conformers are
+  retried, guaranteeing recorded energy ↔ written geometry alignment. Not a
+  scientific-assumption change; it removes a geometry/energy mismatch.
 - **M-04 — all-fail fallback carries an unminimized geometry (decision 2b).** When
   no conformer converges, one best-effort geometry is still handed to DFT. This is
   an intentional, **flagged** exception to "no placeholder science": it is a real
@@ -200,6 +216,9 @@ energies are labeled kcal/mol at every surface (CSV column name, XYZ comment,
   - `TestFinalizeConvergence::*` — first-pass converged kept; retry-converged
     included; still-unconverged-after-retry flagged False; mixed uses retry only
     for the failed conformer. (Pure.) **(M-04 retry)**
+  - `TestRetryAlignment::*` — the retry re-optimizes only the failed conformer id
+    (converged conformers keep first-pass energy/geometry); no retry call when all
+    converge. Guards recorded-energy ↔ written-geometry alignment. **(M-05)**
   - `TestConvergenceBatch::*` (RDKit stubbed): mixed batch keeps only converged
     (logged `converged=True`); all-unconverged logs one `converged=False` seed;
     all-unconverged carries exactly one row, emits a warning, and the `.com` title
