@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# scratch / temp
+tmp/
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# pipeline outputs (generated, not source)
+.pubchem_cache/
+gaussian_inputs/
+slurm_scripts/
+*_log.csv
+com_write_failed.csv
