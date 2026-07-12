@@ -298,6 +298,10 @@ def search_conformers(
         if name is None or str(name) in done_names:
             continue
 
+        # NB: this reads the molecule TABLE's own "IsomericSMILES" column
+        # (populated by pubchem._isomeric_smiles from the live "SMILES" key), not
+        # a PubChem property dict — so it carries real stereo SMILES, not the dead
+        # PubChem key. See MOLECULE_TABLE_COLUMNS.
         smiles = row.get("IsomericSMILES")
         cid = row.get("cid")
 

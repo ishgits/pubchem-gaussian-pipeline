@@ -149,7 +149,11 @@ def score_candidate(
     """
     score = 0
     formula = prop.get("MolecularFormula", "")
-    iso = prop.get("IsomericSMILES", "")
+    # Read the stereo-bearing SMILES via the helper — never the dead
+    # ``IsomericSMILES`` key directly (PubChem 2025 rename; see _isomeric_smiles).
+    # Otherwise ambiguous candidates never earn the stereo bonus and the resolver
+    # can pick the wrong CID (Codex round-02 M-03).
+    iso = _isomeric_smiles(prop)
     iupac = (prop.get("IUPACName") or "").lower()
     title = (prop.get("Title") or "").lower()
     cid = prop.get("CID", 999_999_999)

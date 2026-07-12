@@ -54,6 +54,39 @@ class TestScoreCandidate:
         assert isinstance(score, int)
 
 
+class TestScoreCandidateCurrentSchema:
+    """M-03: scoring must read stereo from the current PubChem ``SMILES`` key,
+    not the dead ``IsomericSMILES`` key. These records use the post-2025 schema
+    only (no legacy key), so they fail under the old ``prop.get("IsomericSMILES")``
+    read and pass once scoring routes through ``_isomeric_smiles``."""
+
+    def _prop(self, cid, smiles, formula="C5H10O5"):
+        return {
+            "CID": cid,
+            "MolecularFormula": formula,
+            "SMILES": smiles,                          # stereo-bearing (current)
+            "ConnectivitySMILES": smiles.replace("@", ""),  # flat (current)
+            "IUPACName": "",
+            "Title": "",
+        }
+
+    def test_stereo_bonus_from_current_smiles_key(self):
+        # D-ribose-like: stereo under "SMILES". With the dead-key bug both read
+        # "" and tie; via the helper the stereo record earns the +20 bonus.
+        stereo = self._prop(5793, "C1[C@H]([C@H](C(C(O1)O)O)O)O")
+        flat = self._prop(5793, "C1C(C(C(C(O1)O)O)O)O")
+        assert score_candidate(stereo) > score_candidate(flat)
+
+    def test_stereo_candidate_wins_tie_over_lower_cid_achiral(self):
+        # Correct chiral record (higher CID) vs a lower-CID achiral candidate,
+        # same formula. The stereo bonus (+20) must outweigh the low-CID bonus
+        # (+10) so the resolver picks the stereodefined CID — this is exactly the
+        # wrong-CID selection M-03 fixes.
+        chiral = self._prop(5793, "C1[C@H]([C@H](C(C(O1)O)O)O)O")
+        achiral_low_cid = self._prop(500, "C1C(C(C(C(O1)O)O)O)O")
+        assert score_candidate(chiral) > score_candidate(achiral_low_cid)
+
+
 class TestIsomericSmiles:
     """B-01: read the stereo-bearing SMILES across PubChem's 2025 key rename."""
 
