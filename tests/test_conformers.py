@@ -13,7 +13,13 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pipeline.conformers import check_conformer_eligibility, select_top_n
+from pipeline.conformers import (
+    UNCONVERGED_FF_SEED,
+    _finalize_convergence,
+    check_conformer_eligibility,
+    select_converged_top_n,
+    select_top_n,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -99,18 +105,21 @@ class TestGenerateConformers:
         pytest.importorskip("rdkit")
         from pipeline.conformers import generate_conformers
 
-        coords1, energies1, method1 = generate_conformers("CCCC", seed=42)
+        coords1, energies1, method1, converged1 = generate_conformers("CCCC", seed=42)
         # ≥1 conformer produced
         assert len(coords1) >= 1
         assert len(energies1) == len(coords1)
+        assert len(converged1) == len(coords1)
         assert method1 == "MMFF94"  # butane has full MMFF params
+        assert all(isinstance(c, bool) for c in converged1)
+        assert all(converged1)  # butane conformers converge under the FF
         # atom tuples look like (symbol, x, y, z), coords in Ångström
         sym, x, y, z = coords1[0][0]
         assert isinstance(sym, str)
         assert all(isinstance(v, float) for v in (x, y, z))
 
         # Deterministic lowest-energy index under the fixed seed.
-        coords2, energies2, _ = generate_conformers("CCCC", seed=42)
+        coords2, energies2, _, _ = generate_conformers("CCCC", seed=42)
         assert select_top_n(energies1, 1) == select_top_n(energies2, 1)
         assert energies1 == energies2
 
@@ -339,3 +348,131 @@ class TestNotebookPathOffline:
             assert "--Link1--" in text
             assert "Geom=AllChk Guess=Read" in text
             assert "kcal/mol" in text
+
+
+# ---------------------------------------------------------------------------
+# M-04 — FF convergence: reject/flag unconverged conformers
+# ---------------------------------------------------------------------------
+
+class TestSelectConvergedTopN:
+    """M-04 1a/2b selection logic — pure, no RDKit."""
+
+    def test_only_converged_are_eligible(self):
+        # idx1 and idx3 converged; ranked by energy among the converged set.
+        keep, all_failed = select_converged_top_n(
+            [5.0, 1.0, 2.0, 0.5], [False, True, False, True], 3
+        )
+        assert all_failed is False
+        assert keep == [3, 1]  # 0.5 then 1.0; unconverged idx0/idx2 excluded
+
+    def test_top_n_caps_converged(self):
+        keep, all_failed = select_converged_top_n(
+            [1.0, 2.0, 3.0], [True, True, True], 2
+        )
+        assert (keep, all_failed) == ([0, 1], False)
+
+    def test_all_unconverged_returns_one_best_effort(self):
+        keep, all_failed = select_converged_top_n(
+            [5.0, 3.0, 9.0], [False, False, False], 3
+        )
+        assert all_failed is True
+        assert keep == [1]  # single lowest-energy best-effort seed
+
+    def test_empty_input(self):
+        assert select_converged_top_n([], [], 3) == ([], True)
+
+
+class TestFinalizeConvergence:
+    """M-04 retry-merge logic — pure, no RDKit."""
+
+    def test_first_pass_converged_kept(self):
+        assert _finalize_convergence([(0, 3.0)]) == [(True, 3.0)]
+
+    def test_retry_converges_is_included(self):
+        # Unconverged first pass (nc=1), converged on retry (nc=0) → included.
+        assert _finalize_convergence([(1, 5.0)], retry=[(0, 4.2)]) == [(True, 4.2)]
+
+    def test_still_unconverged_after_retry(self):
+        assert _finalize_convergence([(1, 5.0)], retry=[(1, 4.9)]) == [(False, 4.9)]
+
+    def test_mixed_uses_retry_only_for_failed(self):
+        out = _finalize_convergence([(0, 1.0), (1, 2.0)], retry=[(0, 9.9), (0, 1.5)])
+        # idx0 kept first-pass energy (retry ignored); idx1 took retry result.
+        assert out == [(True, 1.0), (True, 1.5)]
+
+
+class TestConvergenceBatch:
+    """M-04 batch behavior — RDKit stubbed out so this is synthetic/offline."""
+
+    def _run(self, tmp_path, monkeypatch, energies, converged, top_n=3):
+        import pandas as pd
+
+        import pipeline.conformers as C
+
+        # Stub every RDKit touchpoint so we control convergence deterministically.
+        monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
+        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+        coords = [[("C", 0.0, 0.0, float(i))] for i in range(len(energies))]
+        monkeypatch.setattr(
+            C,
+            "generate_conformers",
+            lambda smiles, **kw: (coords, list(energies), "MMFF94", list(converged)),
+        )
+        table = pd.DataFrame([{"name": "Mol", "cid": 1, "IsomericSMILES": "C"}])
+        return C.search_conformers(
+            table,
+            xyz_dir=str(tmp_path / "xyz"),
+            log_csv=str(tmp_path / "conformer_log.csv"),
+            failed_csv=str(tmp_path / "fail.csv"),
+            top_n=top_n,
+        )
+
+    def test_mixed_keeps_only_converged_logged_true(self, tmp_path, monkeypatch):
+        # 4 confs, 2 converged → only the 2 converged are carried and logged True.
+        log = self._run(
+            tmp_path, monkeypatch,
+            energies=[1.0, 0.5, 2.0, 0.1], converged=[True, False, True, False],
+        )
+        assert len(log) == 2
+        assert all(bool(c) for c in log["converged"])
+
+    def test_unconverged_seed_logged_converged_false(self, tmp_path, monkeypatch):
+        # All-fail branch: the single carried seed is recorded converged=False.
+        log = self._run(
+            tmp_path, monkeypatch,
+            energies=[5.0, 3.0, 9.0], converged=[False, False, False],
+        )
+        assert len(log) == 1
+        assert bool(log.iloc[0]["converged"]) is False
+
+    def test_all_unconverged_one_flagged_seed_with_marker(self, tmp_path, monkeypatch, capsys):
+        from pipeline.gaussian import write_gaussian_coms_from_conformers
+
+        log = self._run(
+            tmp_path, monkeypatch,
+            energies=[5.0, 3.0, 9.0], converged=[False, False, False],
+        )
+        # (2b) exactly one best-effort geometry carried, not three.
+        assert len(log) == 1
+        row = log.iloc[0]
+        assert int(row["conformer_id"]) == 0
+        assert bool(row["converged"]) is False
+
+        # A warning was emitted naming the unconverged best-effort seed.
+        out = capsys.readouterr().out
+        assert "no conformer converged" in out
+        assert UNCONVERGED_FF_SEED in out
+
+        # The .com title carries the UNCONVERGED_FF_SEED marker on inspection.
+        com_log = write_gaussian_coms_from_conformers(
+            conformer_log_csv=str(tmp_path / "conformer_log.csv"),
+            outdir=str(tmp_path / "gaussian_inputs"),
+            log_csv=str(tmp_path / "com_write_log.csv"),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+        )
+        assert len(com_log) == 1
+        with open(com_log.iloc[0]["com_path"]) as f:
+            com_text = f.read()
+        assert UNCONVERGED_FF_SEED in com_text
+        assert "--Link1--" in com_text  # Link1 contract still intact

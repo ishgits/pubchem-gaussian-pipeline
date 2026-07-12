@@ -35,6 +35,16 @@ TOP_N = 3
 RMSD_PRUNE = 0.5  # Ångström
 SEED = 42
 
+# Force-field optimization iteration budgets (M-04). The first pass uses
+# FF_MAXITERS; any conformer still flagged not-converged is retried once with
+# FF_MAXITERS_RETRY before being judged failed.
+FF_MAXITERS = 2000
+FF_MAXITERS_RETRY = 10000
+
+# Marker written into a Gaussian .com title when a molecule's only carried
+# geometry is an unconverged best-effort FF seed (M-04 decision 2b).
+UNCONVERGED_FF_SEED = "UNCONVERGED_FF_SEED"
+
 
 # ---------------------------------------------------------------------------
 # Pure ranking helper (no RDKit) — Task 1
@@ -68,8 +78,82 @@ def select_top_n(energies_kcal, n: int) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+# Convergence handling (M-04) — pure helpers, no RDKit
+# ---------------------------------------------------------------------------
+
+def _finalize_convergence(first, retry=None):
+    """
+    Merge first-pass and (optional) retry FF results into per-conformer
+    ``(converged: bool, energy_kcal: float)`` tuples.
+
+    Each input is a sequence of RDKit ``(not_converged, energy)`` tuples aligned
+    by conformer index, where ``not_converged == 0`` means the optimization
+    converged. Where the first pass converged, its result is kept; where it did
+    not and a *retry* pass is supplied, the retry result is used (M-04 step 2).
+    """
+    out = []
+    for i, (nc1, e1) in enumerate(first):
+        if nc1 == 0 or retry is None:
+            out.append((nc1 == 0, float(e1)))
+        else:
+            nc2, e2 = retry[i]
+            out.append((nc2 == 0, float(e2)))
+    return out
+
+
+def select_converged_top_n(energies_kcal, converged, top_n: int):
+    """
+    Rank and select conformers, honoring convergence (M-04 decisions 1a / 2b).
+
+    Parameters
+    ----------
+    energies_kcal : sequence of float
+        FF energies (kcal/mol) for every conformer, aligned with *converged*.
+    converged : sequence of bool
+        Per-conformer convergence flag (from :func:`_finalize_convergence`).
+    top_n : int
+        Maximum number of converged conformers to keep.
+
+    Returns
+    -------
+    (kept_indices, all_failed)
+        ``kept_indices`` — indices into *energies_kcal*, lowest energy first.
+        When at least one conformer converged, only converged conformers are
+        eligible (1a). When **none** converged, exactly one best-effort geometry
+        — the lowest FF energy overall — is returned and ``all_failed`` is True
+        (2b); its energy is unreliable and the caller must flag it.
+    """
+    converged_idx = [i for i, c in enumerate(converged) if c]
+    if converged_idx:
+        conv_energies = [energies_kcal[i] for i in converged_idx]
+        keep_pos = select_top_n(conv_energies, top_n)
+        return [converged_idx[p] for p in keep_pos], False
+
+    # No conformer converged (2b): carry exactly one lowest-energy best effort.
+    if not list(energies_kcal):
+        return [], True
+    return select_top_n(energies_kcal, 1), True
+
+
+# ---------------------------------------------------------------------------
 # RDKit embed + rank core — Task 2
 # ---------------------------------------------------------------------------
+
+def _optimize_confs(mol, method: str, max_iters: int):
+    """
+    Force-field-optimize every conformer of *mol* in place, returning RDKit's
+    per-conformer ``(not_converged, energy_kcal)`` list.
+
+    Isolated at module level (with a lazy RDKit import) so the retry logic in
+    :func:`generate_conformers` can be exercised deterministically in tests.
+    """
+    from rdkit.Chem import AllChem
+
+    if method == "MMFF94":
+        return AllChem.MMFFOptimizeMoleculeConfs(
+            mol, mmffVariant="MMFF94", maxIters=max_iters
+        )
+    return AllChem.UFFOptimizeMoleculeConfs(mol, maxIters=max_iters)
 
 def _rdkit_version() -> str:
     import rdkit
@@ -147,18 +231,25 @@ def generate_conformers(
 
     Returns
     -------
-    (coords_list, energies_kcal, method)
+    (coords_list, energies_kcal, method, converged)
         ``coords_list`` — list (one per surviving conformer) of
         ``[(symbol, x, y, z), ...]`` atom tuples in Ångström.
         ``energies_kcal`` — force-field energies in kcal/mol, same order.
         ``method`` — ``"MMFF94"`` or ``"UFF"`` (the FF actually used).
+        ``converged`` — per-conformer ``bool`` FF-convergence flag after the
+        retry pass, same order (M-04).
 
     Notes
     -----
-    Returning ``method`` is a small, deliberate extension of the 2-tuple
-    signature in the plan: provenance requires recording which FF actually ran
-    (MMFF94 vs UFF fallback), and that decision is made here. Recorded as a
-    deviation in docs/implementation-status-v2.md.
+    Returning ``method`` and ``converged`` extends the 2-tuple signature in the
+    plan: provenance requires recording which FF ran (MMFF94 vs UFF fallback) and
+    whether each conformer's optimization actually converged — a log that implies
+    success when the optimizer did not converge would violate the provenance /
+    "ran ≠ validated" invariants. Recorded as a deviation in
+    docs/implementation-status-v2.md.
+
+    Any conformer flagged not-converged on the first pass is re-optimized once
+    with ``FF_MAXITERS_RETRY`` iterations before its flag is finalized (M-04).
 
     Raises
     ------
@@ -188,25 +279,31 @@ def generate_conformers(
     # MMFF94 preferred; UFF only if MMFF params are missing for this molecule.
     if AllChem.MMFFHasAllMoleculeParams(mol):
         method = "MMFF94"
-        results = AllChem.MMFFOptimizeMoleculeConfs(
-            mol, mmffVariant="MMFF94", maxIters=2000
-        )
     else:
         method = "UFF"
         print(
             f"WARNING: MMFF94 parameters unavailable for SMILES {smiles!r}; "
             f"falling back to UFF (logged, not silent)."
         )
-        results = AllChem.UFFOptimizeMoleculeConfs(mol, maxIters=2000)
 
-    # results: list of (not_converged, energy_kcal_per_mol), aligned with conf_ids.
+    # First optimization pass; retry the whole ensemble once (more iterations)
+    # if any conformer failed to converge, then finalize per-conformer flags.
+    first = _optimize_confs(mol, method, FF_MAXITERS)
+    if any(nc != 0 for nc, _ in first):
+        retry = _optimize_confs(mol, method, FF_MAXITERS_RETRY)
+        results = _finalize_convergence(first, retry)
+    else:
+        results = _finalize_convergence(first)
+
     coords_list = []
     energies_kcal = []
-    for conf_id, (_not_converged, energy) in zip(conf_ids, results):
+    converged = []
+    for conf_id, (conv, energy) in zip(conf_ids, results):
         coords_list.append(_conf_coords(mol, conf_id))
         energies_kcal.append(float(energy))
+        converged.append(bool(conv))
 
-    return coords_list, energies_kcal, method
+    return coords_list, energies_kcal, method, converged
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +342,7 @@ _LOG_COLUMNS = [
     "n_generated",
     "n_kept",
     "rmsd_prune",
+    "converged",
 ]
 
 
@@ -270,7 +368,16 @@ def search_conformers(
     lowest-energy distinct conformers (distinctness via ``pruneRmsThresh``),
     write ``{base}_c{ii}.xyz`` per conformer, and append one provenance row per
     kept conformer to *log_csv*. ``rel_energy_kcalmol`` is ΔE from that
-    molecule's lowest-energy conformer (so the minimum is 0.0), in kcal/mol.
+    molecule's lowest-energy carried conformer (so the minimum is 0.0), in
+    kcal/mol.
+
+    Convergence (M-04): only FF-converged conformers are eligible for the top-N
+    (decision 1a); each kept row records a ``converged`` bool. If **no** conformer
+    converges for a molecule (even after the retry pass in
+    :func:`generate_conformers`), exactly one lowest-energy best-effort geometry
+    is carried with ``converged=False`` and a logged warning (decision 2b); its
+    XYZ comment carries the ``UNCONVERGED_FF_SEED`` marker and its FF energy is
+    unreliable.
 
     Resume-safe: molecules already present in an existing *log_csv* are skipped.
 
@@ -320,7 +427,7 @@ def search_conformers(
         try:
             if rdkit_ver is None:
                 rdkit_ver = _rdkit_version()
-            coords_list, energies_kcal, method = generate_conformers(
+            coords_list, energies_kcal, method, converged = generate_conformers(
                 str(smiles),
                 n_generate=n_generate,
                 rmsd_prune=rmsd_prune,
@@ -336,20 +443,33 @@ def search_conformers(
             continue
 
         n_generated = len(energies_kcal)
-        keep = select_top_n(energies_kcal, top_n)
-        e_min = min(energies_kcal)  # ΔE reference for this molecule (kcal/mol)
+        # Rank/select only converged conformers (M-04 1a); if none converged,
+        # carry exactly one flagged best-effort seed (2b).
+        keep, all_failed = select_converged_top_n(energies_kcal, converged, top_n)
+        if all_failed:
+            print(
+                f"WARNING: no conformer converged for {name!r} after retry; "
+                f"carrying 1 best-effort {UNCONVERGED_FF_SEED} geometry — its FF "
+                f"energy is unreliable and it is an unminimized DFT start."
+            )
+        # ΔE reference is the lowest energy among the CARRIED conformers, so the
+        # kept minimum is 0.0 kcal/mol. (In the all-failed branch the single
+        # carried seed is trivially its own reference.)
+        e_min = min(energies_kcal[i] for i in keep) if keep else 0.0
         n_kept = len(keep)
         base = sanitize_basename(str(name))
 
         for ii, conf_idx in enumerate(keep):
             xyz_path = os.path.join(xyz_dir, f"{base}_c{ii:02d}.xyz")
             rel_e = energies_kcal[conf_idx] - e_min
+            is_converged = bool(converged[conf_idx])
+            unconv_tag = "" if is_converged else f" {UNCONVERGED_FF_SEED}"
             _write_xyz(
                 xyz_path,
                 coords_list[conf_idx],
                 comment=(
                     f"{base} c{ii:02d} dE={rel_e:.4f} kcal/mol "
-                    f"method={method} seed={seed}"
+                    f"method={method} seed={seed}{unconv_tag}"
                 ),
             )
             log_rows.append({
@@ -365,6 +485,7 @@ def search_conformers(
                 "n_generated": n_generated,
                 "n_kept": n_kept,
                 "rmsd_prune": rmsd_prune,
+                "converged": is_converged,
             })
 
     out_df = pd.DataFrame(log_rows, columns=_LOG_COLUMNS)

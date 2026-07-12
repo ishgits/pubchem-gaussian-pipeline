@@ -13,6 +13,7 @@ import os
 
 import pandas as pd
 
+from .conformers import UNCONVERGED_FF_SEED
 from .utils import ensure_dir, sanitize_basename
 
 
@@ -56,6 +57,7 @@ def write_gaussian_com(
     link1: bool = True,
     conformer_id: int | None = None,
     rel_energy_kcalmol: float | None = None,
+    unconverged: bool = False,
 ) -> str:
     """
     Write a Gaussian .com input file from an XYZ file.
@@ -94,6 +96,11 @@ def write_gaussian_com(
         Force-field ΔE (kcal/mol) of this conformer relative to the molecule's
         lowest-energy conformer. Recorded in the title line for traceability.
         Explicitly labeled kcal/mol so it is never mixed with DFT Hartree values.
+    unconverged : bool
+        If True, the starting geometry came from an FF optimization that did NOT
+        converge (M-04 decision 2b best-effort seed). An ``UNCONVERGED_FF_SEED``
+        marker is written into the title line so the unminimized start — and its
+        unreliable FF energy — are visible on inspection.
 
     Returns
     -------
@@ -113,6 +120,9 @@ def write_gaussian_com(
     if rel_energy_kcalmol is not None:
         # Units labeled explicitly; FF energy, never a DFT Hartree value.
         title = f"{title} dE={rel_energy_kcalmol:.4f} kcal/mol".strip()
+    if unconverged:
+        # Make the unconverged FF start explicit on the input itself (M-04 2b).
+        title = f"{title} {UNCONVERGED_FF_SEED}".strip()
 
     text = (
         f"%nprocshared={nproc}\n"
@@ -187,6 +197,8 @@ def write_gaussian_coms_from_conformers(
 
     Each row must carry ``name``, ``xyz_path``, and ``conformer_id``; the ΔE
     column (``rel_energy_kcalmol``) is recorded in the title line when present.
+    A ``converged`` column (M-04), when present and False, tags the title with
+    ``UNCONVERGED_FF_SEED`` so an unminimized best-effort start is visible.
     Files are written as ``{base}_c{ii}_F.com``. The Link1 opt→freq checkpoint
     contract is unchanged — every keyword argument is forwarded to
     :func:`write_gaussian_com`, exactly as :func:`write_gaussian_coms` does.
@@ -201,6 +213,15 @@ def write_gaussian_coms_from_conformers(
         conformer_id = int(row["conformer_id"])
         rel_e = row.get("rel_energy_kcalmol")
         rel_e = None if pd.isna(rel_e) else float(rel_e)
+        # Missing/NaN converged column → assume converged (backward compatible).
+        # Handle both native-bool and CSV string ("True"/"False") representations.
+        conv = row.get("converged")
+        if conv is None or (isinstance(conv, float) and pd.isna(conv)):
+            unconverged = False
+        elif isinstance(conv, str):
+            unconverged = conv.strip().lower() in ("false", "0", "no")
+        else:
+            unconverged = not bool(conv)
         try:
             com_path = write_gaussian_com(
                 name,
@@ -208,6 +229,7 @@ def write_gaussian_coms_from_conformers(
                 outdir=outdir,
                 conformer_id=conformer_id,
                 rel_energy_kcalmol=rel_e,
+                unconverged=unconverged,
                 **kwargs,
             )
             written.append({

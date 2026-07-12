@@ -27,9 +27,11 @@ from .pubchem import (
 )
 from .geometry import sdf_to_xyz, convert_sdfs_to_xyz
 from .conformers import (
+    UNCONVERGED_FF_SEED,
     check_conformer_eligibility,
     generate_conformers,
     search_conformers,
+    select_converged_top_n,
     select_top_n,
 )
 from .gaussian import (
