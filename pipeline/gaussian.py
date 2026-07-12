@@ -54,6 +54,8 @@ def write_gaussian_com(
     multiplicity: int = 1,
     nproc: int = 16,
     link1: bool = True,
+    conformer_id: int | None = None,
+    rel_energy_kcalmol: float | None = None,
 ) -> str:
     """
     Write a Gaussian .com input file from an XYZ file.
@@ -83,6 +85,15 @@ def write_gaussian_com(
     link1 : bool
         If True, append a --Link1-- section for the frequency job that reads
         geometry from the checkpoint file.
+    conformer_id : int, optional
+        Conformer index (v2 conformer stage). When given, the basename becomes
+        ``{base}_c{ii}`` so each conformer gets its own ``.com``/``.chk`` pair
+        (e.g. ``ribose_c00_F.com``), and the id is recorded in the title line for
+        traceability. When ``None`` the v1.1 single-geometry naming is preserved.
+    rel_energy_kcalmol : float, optional
+        Force-field ΔE (kcal/mol) of this conformer relative to the molecule's
+        lowest-energy conformer. Recorded in the title line for traceability.
+        Explicitly labeled kcal/mol so it is never mixed with DFT Hartree values.
 
     Returns
     -------
@@ -91,11 +102,17 @@ def write_gaussian_com(
     """
     ensure_dir(outdir)
     base = sanitize_basename(name)
+    if conformer_id is not None:
+        # Extend the basename per conformer (architecture v2): {base}_c{ii}.
+        base = f"{base}_c{conformer_id:02d}"
     chk_name = f"{base}_F.chk"
     com_path = os.path.join(outdir, f"{base}_F.com")
 
     coords = xyz_to_gaussian_coords(xyz_path)
     title = f"{base} {title_suffix}".strip()
+    if rel_energy_kcalmol is not None:
+        # Units labeled explicitly; FF energy, never a DFT Hartree value.
+        title = f"{title} dE={rel_energy_kcalmol:.4f} kcal/mol".strip()
 
     text = (
         f"%nprocshared={nproc}\n"
@@ -143,6 +160,69 @@ def write_gaussian_coms(
             written.append({"name": name, "xyz_path": xyz_path, "com_path": com_path})
         except Exception as e:
             failed.append({"name": name, "xyz_path": xyz_path, "error": repr(e)})
+
+    out_df = pd.DataFrame(written)
+    out_df.to_csv(log_csv, index=False)
+
+    if failed:
+        fail_df = pd.DataFrame(failed)
+        fail_df.to_csv("com_write_failed.csv", index=False)
+        print(f"WARNING: {len(failed)} .com writes failed — see com_write_failed.csv")
+    else:
+        print("All Gaussian .com files written successfully.")
+
+    print(f"Wrote: {log_csv}")
+    return out_df
+
+
+def write_gaussian_coms_from_conformers(
+    conformer_log_csv: str,
+    outdir: str = "gaussian_inputs",
+    log_csv: str = "com_write_log.csv",
+    **kwargs,
+) -> pd.DataFrame:
+    """
+    Batch-write one Gaussian ``.com`` per conformer from a ``conformer_log.csv``
+    (the v2 conformer stage output; multiple rows per molecule).
+
+    Each row must carry ``name``, ``xyz_path``, and ``conformer_id``; the ΔE
+    column (``rel_energy_kcalmol``) is recorded in the title line when present.
+    Files are written as ``{base}_c{ii}_F.com``. The Link1 opt→freq checkpoint
+    contract is unchanged — every keyword argument is forwarded to
+    :func:`write_gaussian_com`, exactly as :func:`write_gaussian_coms` does.
+    """
+    conf_log = pd.read_csv(conformer_log_csv)
+    written = []
+    failed = []
+
+    for _, row in conf_log.iterrows():
+        name = row["name"]
+        xyz_path = row["xyz_path"]
+        conformer_id = int(row["conformer_id"])
+        rel_e = row.get("rel_energy_kcalmol")
+        rel_e = None if pd.isna(rel_e) else float(rel_e)
+        try:
+            com_path = write_gaussian_com(
+                name,
+                xyz_path,
+                outdir=outdir,
+                conformer_id=conformer_id,
+                rel_energy_kcalmol=rel_e,
+                **kwargs,
+            )
+            written.append({
+                "name": name,
+                "conformer_id": conformer_id,
+                "xyz_path": xyz_path,
+                "com_path": com_path,
+            })
+        except Exception as e:
+            failed.append({
+                "name": name,
+                "conformer_id": conformer_id,
+                "xyz_path": xyz_path,
+                "error": repr(e),
+            })
 
     out_df = pd.DataFrame(written)
     out_df.to_csv(log_csv, index=False)

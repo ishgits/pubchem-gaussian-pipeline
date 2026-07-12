@@ -7,5 +7,6 @@ dependencies:
   - numpy
   - requests
   - openbabel
+  - rdkit
   - jupyterlab
   - pytest

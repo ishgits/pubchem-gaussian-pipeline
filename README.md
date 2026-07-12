@@ -110,9 +110,32 @@ PubChem 3D structures and Open Babel's `--gen3d --minimize` output provide reaso
 - If optimization doesn't converge, the starting geometry may be in a bad region of the potential energy surface. Inspect the `.xyz` file and adjust manually if needed.
 - For flexible molecules with many rotatable bonds, the PubChem geometry may not correspond to the **global minimum** conformation.
 
-### Conformer searching is not included
+### Conformer searching (v2)
 
-This pipeline does **not** perform a systematic conformer search (e.g., via RDKit ETKDG + MMFF/UFF). For small, rigid molecules (most nucleobases, amino acids, small heterocycles), the PubChem 3D geometry is typically adequate as a starting point for DFT optimization. For larger, flexible molecules (long-chain lipids, peptides, sugars with multiple ring conformations), you should consider running a conformer search separately before feeding geometries into this pipeline. Tools like [RDKit](https://www.rdkit.org/docs/GettingStartedInPython.html#working-with-3d-molecules), [CREST](https://crest-lab.github.io/crest-docs/), or [Confab](https://open-babel.readthedocs.io/en/latest/3DStructureGen/multipleconformers.html) can help identify the lowest-energy conformer prior to DFT.
+As of v2 the pipeline includes a simple RDKit conformer search
+(`pipeline/conformers.py`): for each molecule it embeds an ETKDGv3 ensemble
+(RMSD-pruned), MMFF94-optimizes and ranks it (UFF is a logged fallback only when
+MMFF parameters are unavailable), and carries the **top 3 lowest-energy, distinct**
+conformers forward as DFT starting geometries — one `.com` per conformer, each
+with its conformer id and relative energy recorded. Rigid molecules (most
+nucleobases) collapse to a single conformer on their own, so v1.1 behavior is
+preserved. Conformer energies are **MMFF94/UFF in kcal/mol** and are never mixed
+with the DFT Hartree energies computed downstream.
+
+Three limitations are retained honestly and **not** solved in v2:
+
+- **MMFF ranking is unreliable for intramolecular-H-bonding species** (sugars,
+  nucleosides): the force field over-stabilizes internal H-bonds, so the FF
+  ranking may not match the DFT ranking. Carrying the top 3 mitigates this; a
+  semi-empirical rerank (e.g. xTB) is a possible future addition.
+- **The force field is gas-phase; the DFT default is IEFPCM water.** The
+  FF-lowest conformer may not be the solution-phase minimum. Carrying the top 3
+  mitigates but does not eliminate this.
+- **Sampling is fixed at `N_GENERATE=20`**, which may under-sample very flexible
+  molecules.
+
+These are still force-field *starting* geometries, not optimized minima — the
+DFT step makes the final call among the carried candidates.
 
 ### PubChem rate limits
 

@@ -8,10 +8,14 @@ submission scripts from molecule names, PubChem CIDs, or SMILES strings.
 Pipeline steps
 --------------
 1. Resolve molecule names → PubChem CIDs + properties  (pubchem)
-2. Download 3D SDF files from PubChem                  (pubchem)
-3. Convert SDF → XYZ via Open Babel                    (geometry)
-4. Write Gaussian .com input files (opt + freq)        (gaussian)
-5. Generate SLURM .sh submission scripts               (slurm)
+2. Conformer search: RDKit ETKDGv3 + MMFF94 rank,
+   top-3 distinct conformers per molecule               (conformers)
+3. Write Gaussian .com input files (opt + freq),
+   one per conformer                                     (gaussian)
+4. Generate SLURM .sh submission scripts                (slurm)
+
+The v1.1 path (PubChem 3D SDF → Open Babel XYZ, via ``download_sdfs`` /
+``convert_sdfs_to_xyz``) remains available for single-geometry use.
 """
 
 from .pubchem import (
@@ -22,6 +26,16 @@ from .pubchem import (
     score_candidate,
 )
 from .geometry import sdf_to_xyz, convert_sdfs_to_xyz
-from .gaussian import xyz_to_gaussian_coords, write_gaussian_com, write_gaussian_coms
+from .conformers import (
+    generate_conformers,
+    search_conformers,
+    select_top_n,
+)
+from .gaussian import (
+    xyz_to_gaussian_coords,
+    write_gaussian_com,
+    write_gaussian_coms,
+    write_gaussian_coms_from_conformers,
+)
 from .slurm import write_slurm_script, write_slurm_scripts
 from .utils import sanitize_basename, ensure_dir, normalize_cid

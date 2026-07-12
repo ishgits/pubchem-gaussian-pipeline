@@ -21,7 +21,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests pytest
+          pip install pandas numpy requests pytest rdkit
 
       - name: Unit tests
         run: pytest tests/ -q
