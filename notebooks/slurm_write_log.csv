@@ -1,0 +1,4 @@
+jobname,com_path,sh_path,status
+adenine_F,gaussian_inputs/adenine_F.com,slurm_scripts/adenine_F.sh,OK
+glycine_F,gaussian_inputs/glycine_F.com,slurm_scripts/glycine_F.sh,OK
+water_F,gaussian_inputs/water_F.com,slurm_scripts/water_F.sh,OK

@@ -1,0 +1,4 @@
+name,xyz_path,com_path
+Water,pubchem_xyz/water.xyz,gaussian_inputs/water_F.com
+Glycine,pubchem_xyz/glycine.xyz,gaussian_inputs/glycine_F.com
+Adenine,pubchem_xyz/adenine.xyz,gaussian_inputs/adenine_F.com

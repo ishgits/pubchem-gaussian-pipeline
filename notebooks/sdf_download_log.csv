@@ -1,0 +1,4 @@
+name,cid,sdf_path,source_url
+Water,962,pubchem_sdf/water.sdf,https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/962/SDF?record_type=3d
+Glycine,750,pubchem_sdf/glycine.sdf,https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/750/SDF?record_type=3d
+Adenine,190,pubchem_sdf/adenine.sdf,https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/190/SDF?record_type=3d

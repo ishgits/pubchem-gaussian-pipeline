@@ -1,0 +1,4 @@
+name,pubchem_query,cid,formula,iupac_name,title,status,warnings
+Water,Water,962,H2O,oxidane,Water,OK,
+Glycine,Glycine,750,C2H5NO2,2-aminoacetic acid,Glycine,OK,
+Adenine,Adenine,190,C5H5N5,7H-purin-6-amine,Adenine,OK,
