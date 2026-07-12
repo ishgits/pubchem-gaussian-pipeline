@@ -122,6 +122,18 @@ nucleobases) collapse to a single conformer on their own, so v1.1 behavior is
 preserved. Conformer energies are **MMFF94/UFF in kcal/mol** and are never mixed
 with the DFT Hartree energies computed downstream.
 
+The `notebooks/run_pipeline.ipynb` walkthrough runs this conformer path by
+default (`build_molecule_table → search_conformers →
+write_gaussian_coms_from_conformers → write_slurm_scripts`); the v1.1 Open Babel
+single-geometry path is kept as a clearly labeled optional appendix.
+
+Molecules whose `IsomericSMILES` has **undefined stereochemistry** (one or more
+unspecified stereocenters) are **skipped and logged** to
+`conformer_search_failed.csv` (reason `"undefined stereochemistry"`) rather than
+letting RDKit pick a stereoisomer arbitrarily — silently guessing stereochemistry
+would change the chemistry. Molecules with no stereocenters (e.g. adenine) are
+processed normally.
+
 Three limitations are retained honestly and **not** solved in v2:
 
 - **MMFF ranking is unreliable for intramolecular-H-bonding species** (sugars,

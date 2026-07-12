@@ -282,3 +282,60 @@ class TestReproducibility:
         # Same seed → identical selected conformers (count + ΔE ranking).
         assert list(log_a["conformer_id"]) == list(log_b["conformer_id"])
         assert list(log_a["rel_energy_kcalmol"]) == list(log_b["rel_energy_kcalmol"])
+
+
+# ---------------------------------------------------------------------------
+# M-02 — notebook code path, exercised offline (no PubChem in CI)
+# ---------------------------------------------------------------------------
+
+class TestNotebookPathOffline:
+    """Runs the exact default-notebook path search_conformers →
+    write_gaussian_coms_from_conformers on a hardcoded defined-stereo SMILES,
+    proving per-conformer .com files without executing PubChem."""
+
+    def test_conformer_path_produces_per_conformer_coms(self, tmp_path):
+        pd = pytest.importorskip("pandas")
+        pytest.importorskip("rdkit")
+        from pipeline.conformers import search_conformers
+        from pipeline.gaussian import write_gaussian_coms_from_conformers
+
+        # Stand-in for the notebook's `df` (build_molecule_table output).
+        df = pd.DataFrame([
+            {"name": "Ribose", "cid": 5779, "IsomericSMILES": RIBOSE_SMILES},
+        ])
+        conf_log_csv = tmp_path / "conformer_log.csv"
+        conf_log = search_conformers(
+            df,
+            xyz_dir=str(tmp_path / "conformer_xyz"),
+            log_csv=str(conf_log_csv),
+            failed_csv=str(tmp_path / "conformer_search_failed.csv"),
+            n_generate=20,
+            top_n=3,
+            rmsd_prune=0.5,
+            seed=42,
+        )
+        n = len(conf_log)
+        assert 1 <= n <= 3  # ribose (flexible) → up to TOP_N distinct conformers
+
+        com_log = write_gaussian_coms_from_conformers(
+            conformer_log_csv=str(conf_log_csv),
+            outdir=str(tmp_path / "gaussian_inputs"),
+            log_csv=str(tmp_path / "com_write_log.csv"),
+            route_opt="# opt=(tight,calcfc) b3lyp/6-311++g(2df,2p) scrf=(iefpcm,solvent=water)",
+            route_freq="# freq b3lyp/6-311++g(2df,2p) scrf=(iefpcm,solvent=water) temperature=298 Geom=AllChk Guess=Read",
+            title_suffix="PCM 298 K 6-311++G(2df,2p)",
+            nproc=16,
+        )
+        assert len(com_log) == n
+
+        # One .com per conformer, named ribose_c{ii}_F.com contiguously from c00.
+        names = sorted(os.path.basename(p) for p in com_log["com_path"])
+        assert names == [f"ribose_c{ii:02d}_F.com" for ii in range(n)]
+
+        # Each file: intact Link1 opt→freq contract + ΔE (kcal/mol) in the title.
+        for com_path in com_log["com_path"]:
+            with open(com_path) as f:
+                text = f.read()
+            assert "--Link1--" in text
+            assert "Geom=AllChk Guess=Read" in text
+            assert "kcal/mol" in text
