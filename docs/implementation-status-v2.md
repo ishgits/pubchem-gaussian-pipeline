@@ -3,8 +3,34 @@
 Maintained by the implementing agent (Claude Code). The reviewer (Codex) must
 verify these claims against the code, not trust them.
 
-**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 1 (+ round-01 remediation)
+**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 1 (+ round-01 & round-02 remediation)
 Works against `docs/architecture-v2.md` and `docs/implementation-plan-v2.md`.
+
+## 0b. Round-02 remediation (Codex findings M-03, M-04)
+
+Both findings from `docs/remediation-plan-round-02-v2.md` are addressed as
+separate commits. **Resolved only after the listed verify step passed** — not on
+code change alone.
+
+| ID | Commit | Verification run | Result |
+|----|--------|------------------|--------|
+| M-03 | `5f635bd` | `pytest tests/ -q` → 68 passed (incl. `TestScoreCandidateCurrentSchema`); dead-key grep clean (only helper fallback + documented table-column read; no `CanonicalSMILES` reads); `check_invariants.py` → passed | **Resolved** |
+| M-04 | `016c197` | `pytest tests/ -q` → 79 passed (incl. the four convergence cases); `check_invariants.py` → passed; offline run — ribose top-3 all `converged=True` (unchanged vs round-01); mocked all-unconverged → one `converged=False` seed + warning + `UNCONVERGED_FF_SEED` in the `.com` title | **Resolved** |
+
+- **M-03** — `score_candidate` now reads the stereo-bearing SMILES via
+  `_isomeric_smiles(prop)` instead of the dead `IsomericSMILES` key, so ambiguous
+  candidates earn the stereo bonus and the resolver stops picking the wrong CID.
+  Repo swept: the property-fetch list already requested `SMILES,ConnectivitySMILES`
+  (round-01); the only other dead-key read (`score_candidate`) is fixed. The
+  molecule-table column keeps the name `IsomericSMILES` but holds real stereo
+  SMILES (from the live `SMILES` key); reading it is not a dead-key read.
+- **M-04** — FF convergence is now first-class: `generate_conformers` captures the
+  per-conformer `not_converged` flag, retries unconverged conformers once with
+  more iterations, and `conformer_log.csv` records a `converged` column.
+  `select_converged_top_n` ranks **only converged** conformers (1a); if none
+  converge, exactly one lowest-energy best-effort seed is carried with
+  `converged=False`, a warning, and an `UNCONVERGED_FF_SEED` marker in the `.com`
+  title (2b). The unreliable FF energy stays labeled unreliable.
 
 ## 0. Round-01 remediation (Codex findings B-01, M-02)
 
@@ -67,8 +93,8 @@ code change alone.
 - **Tests** — `tests/test_conformers.py` (new) and conformer cases added to
   `tests/test_gaussian.py`. See §4.
 
-Required checks locally green after round-01 remediation: `pytest tests/ -q` →
-**66 passed**; `python scripts/check_invariants.py` → **passed**.
+Required checks locally green after round-02 remediation: `pytest tests/ -q` →
+**79 passed**; `python scripts/check_invariants.py` → **passed**.
 
 ## 2. What was NOT implemented (and why)
 
@@ -82,21 +108,39 @@ Required checks locally green after round-01 remediation: `pytest tests/ -q` →
 
 ## 3. Deviations from architecture-v2.md / plan
 
-- **`generate_conformers` returns a 3-tuple, not the 2-tuple in the plan.** The
-  plan (Task 2) writes `-> (coords_list, energies_kcal)`. I added `method`
-  (`"MMFF94"`/`"UFF"`) as a third element because provenance (architecture-v2
-  "Units & provenance") requires recording *which* force field actually ran, and
-  that decision is made inside this function. No scientific assumption changed;
-  this is an API-shape deviation only. Documented in the function docstring.
+- **`generate_conformers` returns a 4-tuple, not the 2-tuple in the plan.** The
+  plan (Task 2) writes `-> (coords_list, energies_kcal)`. It now returns
+  `(coords_list, energies_kcal, method, converged)`: `method` (`"MMFF94"`/`"UFF"`)
+  was added in round-01 for FF provenance, and `converged` (per-conformer bool)
+  was added in **round-02 M-04** because the provenance / "ran ≠ validated"
+  invariants require recording whether each FF optimization actually converged.
+  API-shape deviation only; no scientific assumption changed. Documented in the
+  function docstring.
 - **XYZ output directory naming.** Architecture-v2 says "write XYZ per conformer"
   and the plan says `{base}_c{ii}.xyz` without pinning a directory. I default to
   `conformer_xyz/` (parameter `xyz_dir`, overridable), mirroring the existing
   `pubchem_xyz/` convention. Not a scientific change.
 - **`conformer_log.csv` column set.** Implemented columns:
   `name, cid, smiles, conformer_id, rel_energy_kcalmol, xyz_path, rdkit_version,
-  seed, method, n_generated, n_kept, rmsd_prune`. This is a superset of the plan's
-  required provenance columns (it adds `cid`, `smiles`, `n_kept` for traceability
-  name→CID→SMILES→conformer). No required column omitted.
+  seed, method, n_generated, n_kept, rmsd_prune, converged`. This is a superset of
+  the plan's required provenance columns (it adds `cid`, `smiles`, `n_kept` for
+  traceability name→CID→SMILES→conformer, and `converged` for M-04). No required
+  column omitted; the `converged` column is additive (round-02 M-04).
+
+### Round-02 remediation deviations
+
+- **M-04 — `generate_conformers` 4-tuple / retry re-optimizes the full ensemble.**
+  The convergence retry re-runs the FF optimizer over the whole ensemble (not just
+  the failed conformers) with more iterations; converged conformers sit at their
+  minima so this is idempotent for them and the merge (`_finalize_convergence`)
+  keeps first-pass energies for already-converged conformers. Implementation
+  detail, not a scientific change.
+- **M-04 — all-fail fallback carries an unminimized geometry (decision 2b).** When
+  no conformer converges, one best-effort geometry is still handed to DFT. This is
+  an intentional, **flagged** exception to "no placeholder science": it is a real
+  FF geometry (not fabricated), explicitly marked `converged=False` in the log,
+  warned at runtime, and tagged `UNCONVERGED_FF_SEED` in the `.com` title. The DFT
+  optimization is expected to refine it; the FF energy is labeled unreliable.
 
 ### Round-01 remediation deviations
 
@@ -150,12 +194,28 @@ energies are labeled kcal/mol at every surface (CSV column name, XYZ comment,
   - `TestNotebookPathOffline::test_conformer_path_produces_per_conformer_coms` —
     the exact notebook code path → per-conformer `_c{ii}_F.com`, Link1 + ΔE.
     **(M-02)**
-- `tests/test_pubchem.py` **(B-01)**
+  - `TestSelectConvergedTopN::*` — only converged conformers eligible; top-N caps;
+    all-unconverged → one best-effort seed + `all_failed=True`; empty input.
+    (Pure.) **(M-04 1a/2b)**
+  - `TestFinalizeConvergence::*` — first-pass converged kept; retry-converged
+    included; still-unconverged-after-retry flagged False; mixed uses retry only
+    for the failed conformer. (Pure.) **(M-04 retry)**
+  - `TestConvergenceBatch::*` (RDKit stubbed): mixed batch keeps only converged
+    (logged `converged=True`); all-unconverged logs one `converged=False` seed;
+    all-unconverged carries exactly one row, emits a warning, and the `.com` title
+    carries `UNCONVERGED_FF_SEED` (Link1 intact). **(M-04)**
+  - `TestGenerateConformers::test_butane_seeded_deterministic` also now asserts the
+    4th return value `converged` is an all-True bool list. **(M-04)**
+- `tests/test_pubchem.py` **(B-01, M-03)**
   - `TestIsomericSmiles::*` — prefers current `"SMILES"` key, falls back to legacy
-    `"IsomericSMILES"`, never returns the stereo-free `ConnectivitySMILES`.
+    `"IsomericSMILES"`, never returns the stereo-free `ConnectivitySMILES`. **(B-01)**
   - `TestResolvedRow::*` — resolved rows carry stereo SMILES in the
     `IsomericSMILES` column; unresolved rows carry an empty column; schema matches
-    `MOLECULE_TABLE_COLUMNS`; downstream-consumer columns present.
+    `MOLECULE_TABLE_COLUMNS`; downstream-consumer columns present. **(B-01)**
+  - `TestScoreCandidateCurrentSchema::*` — a current-schema record (stereo under
+    `"SMILES"`, no legacy key) earns the stereo bonus, and a chiral higher-CID
+    candidate outscores a lower-CID achiral one; both fail under the old dead-key
+    read. **(M-03)**
 - `tests/test_gaussian.py`
   - `TestWriteGaussianComConformer::*` — conformer filename/chk (`ribose_c00_F`),
     ΔE in title (`dE=1.2345 kcal/mol`), Link1 preserved, and `conformer_id=None`
