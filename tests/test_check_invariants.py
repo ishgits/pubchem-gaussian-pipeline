@@ -66,7 +66,7 @@ class TestStatusDocDriftGuard:
 
 
 class TestGaussianProvenanceGuard:
-    """M-14/M-16: the floor checks threading and input-boundary validation."""
+    """M-14/M-16/M-17: enforce provenance across batch and direct v2 paths."""
 
     @staticmethod
     def _source():
@@ -118,6 +118,41 @@ class TestGaussianProvenanceGuard:
         )
         problems = check_invariants._gaussian_provenance_problems(broken)
         assert any("does not validate required provenance" in p for p in problems)
+
+    def test_detects_missing_direct_boundary_validation(self):
+        broken = self._source().replace(
+            "    _validate_direct_conformer_provenance(\n",
+            "    _ignored_direct_conformer_provenance(\n",
+            1,
+        )
+        problems = check_invariants._gaussian_provenance_problems(broken)
+        assert any("does not validate direct conformer provenance" in p for p in problems)
+
+    def test_detects_direct_validation_without_conformer_condition(self):
+        broken = self._source().replace(
+            "    if conformer_id is None:\n", "    if False:\n", 1
+        )
+        problems = check_invariants._gaussian_provenance_problems(broken)
+        assert any("not conditional on conformer_id" in p for p in problems)
+
+    def test_detects_missing_direct_rdkit_requirement(self):
+        broken = self._source().replace(
+            "    if _optional_text(rdkit_version) is None:\n",
+            "    if False:\n",
+            1,
+        )
+        problems = check_invariants._gaussian_provenance_problems(broken)
+        assert any("does not require nonblank rdkit_version" in p for p in problems)
+
+    def test_detects_direct_validation_after_mutation(self):
+        marker = "    # M-17: `conformer_id` selects the v2 scientific-output path"
+        broken = self._source().replace(
+            marker,
+            "    ensure_dir(outdir)\n\n" + marker,
+            1,
+        )
+        problems = check_invariants._gaussian_provenance_problems(broken)
+        assert any("direct conformer provenance validation occurs after mutation" in p for p in problems)
 
 
 class TestAppendIntegrityGuard:

@@ -109,9 +109,11 @@ def check_status_doc() -> list[str]:
     ]
 
 
-# 4) V2 Gaussian provenance threading (M-14). Every conformer-derived COM must
-#    carry pipeline/commit/RDKit identity from its conformer-log row. Use the AST
-#    so this guard checks semantic structure without depending on formatting.
+# 4) V2 Gaussian provenance enforcement (M-14/M-16/M-17). Every
+#    conformer-derived COM must carry pipeline/commit/RDKit identity, whether it
+#    comes through the batch API or a direct conformer-specific writer call. Use
+#    the AST so this guard checks semantic structure without depending on
+#    formatting.
 _GAUSSIAN_PROVENANCE_FIELDS = (
     "pipeline_version",
     "pipeline_commit",
@@ -135,7 +137,7 @@ def _function_runtime_literals(function: ast.FunctionDef) -> str:
 
 
 def _gaussian_provenance_problems(text: str) -> list[str]:
-    """Return missing M-14/M-16 provenance semantics in Gaussian source text."""
+    """Return missing M-14/M-16/M-17 provenance semantics in Gaussian source."""
     try:
         tree = ast.parse(text)
     except SyntaxError as exc:
@@ -147,6 +149,7 @@ def _gaussian_provenance_problems(text: str) -> list[str]:
     writer = functions.get("write_gaussian_com")
     batch = functions.get("write_gaussian_coms_from_conformers")
     validator = functions.get("_validate_required_conformer_provenance")
+    direct_validator = functions.get("_validate_direct_conformer_provenance")
     problems = []
     if writer is None:
         problems.append("write_gaussian_com is missing")
@@ -169,6 +172,86 @@ def _gaussian_provenance_problems(text: str) -> list[str]:
     for token in ("provenance ", "pipeline=", "commit=", "rdkit="):
         if token not in literals:
             problems.append(f"write_gaussian_com title missing token {token!r}")
+
+    # M-17: a direct call with `conformer_id` is still a v2 scientific output and
+    # must not bypass the protected batch boundary. The helper must condition on
+    # that identifier, reject blank pipeline/RDKit values, and run before the
+    # writer creates its output directory or opens a file.
+    if direct_validator is None:
+        problems.append("_validate_direct_conformer_provenance is missing")
+    else:
+        direct_args = {
+            arg.arg
+            for arg in (
+                direct_validator.args.posonlyargs
+                + direct_validator.args.args
+                + direct_validator.args.kwonlyargs
+            )
+        }
+        for field in ("conformer_id", "pipeline_version", "rdkit_version"):
+            if field not in direct_args:
+                problems.append(
+                    f"direct conformer provenance validator missing parameter {field}"
+                )
+
+        conditional_on_conformer = any(
+            isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Name) and child.id == "conformer_id"
+                for child in ast.walk(node.test)
+            )
+            for node in ast.walk(direct_validator)
+        )
+        if not conditional_on_conformer:
+            problems.append(
+                "direct conformer provenance validation is not conditional on "
+                "conformer_id"
+            )
+
+        normalized_names = set()
+        for node in ast.walk(direct_validator):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_optional_text"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+            ):
+                continue
+            normalized_names.add(node.args[0].id)
+        for field in ("pipeline_version", "rdkit_version"):
+            if field not in normalized_names:
+                problems.append(
+                    f"direct conformer provenance does not require nonblank {field}"
+                )
+        if not any(isinstance(node, ast.Raise) for node in ast.walk(direct_validator)):
+            problems.append("direct conformer provenance validator never raises")
+
+    direct_validation_lines = []
+    direct_mutation_lines = []
+    for node in ast.walk(writer):
+        if not isinstance(node, ast.Call):
+            continue
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "_validate_direct_conformer_provenance"
+        ):
+            direct_validation_lines.append(node.lineno)
+            forwarded_names = {
+                arg.id for arg in node.args if isinstance(arg, ast.Name)
+            }
+            for field in ("conformer_id", "pipeline_version", "rdkit_version"):
+                if field not in forwarded_names:
+                    problems.append(
+                        f"write_gaussian_com does not pass {field} to direct "
+                        "provenance validation"
+                    )
+        if isinstance(node.func, ast.Name) and node.func.id in {"ensure_dir", "open"}:
+            direct_mutation_lines.append(node.lineno)
+    if not direct_validation_lines:
+        problems.append("write_gaussian_com does not validate direct conformer provenance")
+    elif direct_mutation_lines and min(direct_validation_lines) >= min(direct_mutation_lines):
+        problems.append("direct conformer provenance validation occurs after mutation")
 
     row_reads = set()
     forwarded = set()

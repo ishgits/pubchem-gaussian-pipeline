@@ -72,6 +72,13 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   conformer generation and are never inferred from the downstream writer's
   environment. Empty zero-job logs remain valid; an absent/blank source commit
   remains explicit in each COM as `commit=unavailable`.
+- **Required provenance for direct conformer COM writes (round-08 M-17).** A
+  direct `write_gaussian_com()` call with `conformer_id` now requires nonblank
+  `pipeline_version` and `rdkit_version` before output-directory creation or file
+  writing. This closes the direct-writer bypass around the protected batch path.
+  Legacy calls with `conformer_id=None` retain optional provenance and unchanged
+  v1.1 naming/text behavior; a missing conformer source commit remains explicit
+  as `commit=unavailable`.
 - **Notebook (round 01, M-02).** `notebooks/run_pipeline.ipynb` runs the
   conformer path by default; the v1.1 single-geometry path is a commented-out
   labeled legacy appendix.
@@ -146,7 +153,7 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   to a labeled legacy v1.1 section.
 
 Required checks locally green after round 08 (RDKit 2025.03.3):
-`pytest tests/ -q` → **204 passed**; `python scripts/check_invariants.py` →
+`pytest tests/ -q` → **215 passed**; `python scripts/check_invariants.py` →
 **passed**; `git diff --check` → **passed**;
 `git ls-files -ci --exclude-standard` → empty.
 
@@ -160,6 +167,11 @@ Required checks locally green after round 08 (RDKit 2025.03.3):
 - **M-16 — Resolved:** the conformer-to-Gaussian batch writer rejects nonempty
   logs with missing/blank pipeline or RDKit provenance before creating any COM.
   Missing source commits remain explicit as `commit=unavailable`.
+- **M-17 — Resolved:** direct `write_gaussian_com()` calls using
+  `conformer_id` now require nonblank pipeline and RDKit source versions before
+  output mutation. This closes the direct-writer bypass around the protected
+  conformer-log batch path. Legacy calls with `conformer_id=None` remain
+  unchanged; missing commits remain explicit as `commit=unavailable`.
 
 ## 2. What was NOT implemented (and why)
 
@@ -287,6 +299,12 @@ title) and never mixed with DFT Hartree values.
   source-version columns or containing blank/NaN values fail with row details
   before any output mutation; missing commits still emit
   `commit=unavailable`; empty logs and current valid logs still succeed (M-16).
+- `tests/test_gaussian.py` round-08 follow-up — direct conformer-specific calls
+  missing either/both pipeline and RDKit versions, or containing blank,
+  whitespace-only, or NaN versions, fail before creating the output directory.
+  Valid direct calls retain filename, ΔE, checkpoint, route, charge/multiplicity,
+  and Link1 behavior while adding the required provenance line; legacy calls
+  without `conformer_id` remain unchanged (M-17).
 - `tests/test_utils.py` — the offline provenance helper: git absent / non-zero /
   timeout give empty string, clean tree gives the SHA, dirty tree appends
   `.dirty` (`TestGitShortSha`, `TestPipelineProvenance`). No test asserts a
@@ -294,8 +312,9 @@ title) and never mixed with DFT Hartree values.
 - `tests/test_check_invariants.py` — the status-doc drift guard fires on a
   template and passes on a populated file (`TestStatusDocDriftGuard`); AST-based
   guards verify M-14 provenance threading/title tokens, M-16 required-version
-  validation before mutation, and M-15 complete/config/identity/provenance
-  carry-forward validation plus fail-before-mutation ordering.
+  batch validation before mutation, M-17 conditional direct-writer validation
+  before mutation, and M-15 complete/config/identity/provenance carry-forward
+  validation plus fail-before-mutation ordering.
 
 RDKit-dependent tests use `pytest.importorskip("rdkit")` so a bare environment
 still runs the pure tests; CI installs rdkit so they execute there.

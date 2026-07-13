@@ -77,6 +77,27 @@ def _validate_required_conformer_provenance(conf_log: pd.DataFrame) -> None:
         )
 
 
+def _validate_direct_conformer_provenance(
+    conformer_id: int | None,
+    pipeline_version,
+    rdkit_version,
+) -> None:
+    """Require source versions for direct conformer-specific COM writes (M-17)."""
+    if conformer_id is None:
+        return
+
+    missing = []
+    if _optional_text(pipeline_version) is None:
+        missing.append("pipeline_version")
+    if _optional_text(rdkit_version) is None:
+        missing.append("rdkit_version")
+    if missing:
+        raise ValueError(
+            "Conformer-specific Gaussian inputs require nonblank provenance: "
+            + ", ".join(missing)
+        )
+
+
 def xyz_to_gaussian_coords(xyz_path: str) -> str:
     """
     Read an XYZ file and return the coordinate block formatted for a
@@ -200,7 +221,9 @@ def write_gaussian_com(
         Conformer index (v2 conformer stage). When given, the basename becomes
         ``{base}_c{ii}`` so each conformer gets its own ``.com``/``.chk`` pair
         (e.g. ``ribose_c00_F.com``), and the id is recorded in the title line for
-        traceability. When ``None`` the v1.1 single-geometry naming is preserved.
+        traceability. Nonblank ``pipeline_version`` and ``rdkit_version`` are
+        required for this v2 path (M-17). When ``None`` the v1.1 single-geometry
+        naming and optional-provenance behavior are preserved.
     rel_energy_kcalmol : float, optional
         Force-field ΔE (kcal/mol) of this conformer relative to the molecule's
         lowest-energy conformer. Recorded in the title line for traceability.
@@ -211,20 +234,35 @@ def write_gaussian_com(
         marker is written into the title line so the unminimized start — and its
         unreliable FF energy — are visible on inspection.
     pipeline_version : str, optional
-        Pipeline version that produced the conformer. When supplied, recorded on
-        a separate ``provenance`` line in the Gaussian title section (M-14).
+        Pipeline version that produced the conformer. Required when
+        ``conformer_id`` is supplied; otherwise optional. When supplied, recorded
+        on a separate ``provenance`` line in the Gaussian title section (M-14/M-17).
     pipeline_commit : str, optional
         Source commit that produced the conformer. If missing while another
         provenance field is supplied, the title records ``commit=unavailable``.
     rdkit_version : str, optional
-        RDKit version that generated/ranked the starting geometry. When supplied,
-        recorded on the title-section provenance line.
+        RDKit version that generated/ranked the starting geometry. Required when
+        ``conformer_id`` is supplied; otherwise optional. When supplied, recorded
+        on the title-section provenance line.
 
     Returns
     -------
     str
         Path to the written .com file.
     """
+    # M-17: `conformer_id` selects the v2 scientific-output path even for direct
+    # calls that bypass the validated batch writer. Require its source versions
+    # before creating a directory or writing any file. Legacy v1.1 calls keep
+    # optional provenance exactly as before.
+    _validate_direct_conformer_provenance(
+        conformer_id,
+        pipeline_version,
+        rdkit_version,
+    )
+    pipeline_version = _optional_text(pipeline_version)
+    pipeline_commit = _optional_text(pipeline_commit)
+    rdkit_version = _optional_text(rdkit_version)
+
     ensure_dir(outdir)
     base = sanitize_basename(name)
     if conformer_id is not None:
@@ -245,9 +283,6 @@ def write_gaussian_com(
     # M-14: keep software provenance self-contained in the Gaussian title
     # section. It must never alter route lines, checkpoint directives,
     # charge/multiplicity, coordinates, or the Link1 frequency section.
-    pipeline_version = _optional_text(pipeline_version)
-    pipeline_commit = _optional_text(pipeline_commit)
-    rdkit_version = _optional_text(rdkit_version)
     provenance_parts = []
     if pipeline_version:
         provenance_parts.append(f"pipeline={pipeline_version}")

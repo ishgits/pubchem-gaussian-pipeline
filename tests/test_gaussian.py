@@ -223,6 +223,8 @@ class TestWriteGaussianComConformer:
                 route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
                 conformer_id=0,
                 rel_energy_kcalmol=0.0,
+                pipeline_version="2.0.0",
+                rdkit_version="2025.03.3",
             )
             assert com_path.endswith("ribose_c00_F.com")
             with open(com_path) as f:
@@ -230,6 +232,10 @@ class TestWriteGaussianComConformer:
             assert "%chk=ribose_c00_F.chk" in text
             assert text.count("%chk=ribose_c00_F.chk") == 2  # opt + Link1
             assert "--Link1--" in text  # Link1 contract preserved
+            assert (
+                "provenance pipeline=2.0.0 commit=unavailable rdkit=2025.03.3"
+                in text
+            )
 
     def test_conformer_delta_energy_in_title(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -241,11 +247,50 @@ class TestWriteGaussianComConformer:
                 route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
                 conformer_id=2,
                 rel_energy_kcalmol=1.2345,
+                pipeline_version="2.0.0",
+                rdkit_version="2025.03.3",
             )
             with open(com_path) as f:
                 text = f.read()
             assert "dE=1.2345 kcal/mol" in text
             assert "ribose_c02" in text  # id in title line
+            assert (
+                "provenance pipeline=2.0.0 commit=unavailable rdkit=2025.03.3"
+                in text
+            )
+
+    @pytest.mark.parametrize(
+        "pipeline_version,rdkit_version,missing",
+        [
+            (None, None, "pipeline_version, rdkit_version"),
+            (None, "2025.03.3", "pipeline_version"),
+            ("2.0.0", None, "rdkit_version"),
+            ("", "2025.03.3", "pipeline_version"),
+            ("   ", "2025.03.3", "pipeline_version"),
+            (float("nan"), "2025.03.3", "pipeline_version"),
+            ("2.0.0", float("nan"), "rdkit_version"),
+        ],
+    )
+    def test_missing_direct_provenance_fails_before_output_mutation(
+        self, tmp_path, pipeline_version, rdkit_version, missing
+    ):
+        outdir = tmp_path / "gaussian_inputs"
+
+        with pytest.raises(ValueError) as excinfo:
+            write_gaussian_com(
+                name="Ribose",
+                xyz_path=SAMPLE_XYZ,
+                outdir=str(outdir),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                conformer_id=0,
+                rel_energy_kcalmol=0.0,
+                pipeline_version=pipeline_version,
+                rdkit_version=rdkit_version,
+            )
+
+        assert missing in str(excinfo.value)
+        assert not outdir.exists()
 
     def test_provenance_is_stamped_only_in_title_section(self):
         route_opt = "# opt b3lyp/6-31g(d)"
