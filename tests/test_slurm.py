@@ -5,6 +5,7 @@ import sys
 import tempfile
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -158,6 +159,60 @@ class TestWriteSlurmScriptsLogDriven:
                 log_csv=os.path.join(tmpdir, "slurm_write_log.csv"),
             )
             assert sorted(df["jobname"]) == ["a_F", "b_F"]
+
+    @pytest.mark.parametrize(
+        "bad_path",
+        [None, "", "   ", "missing.com"],
+    )
+    def test_invalid_logged_com_path_fails_before_directory_creation(
+        self, tmp_path, bad_path
+    ):
+        com_log = tmp_path / "com_write_log.csv"
+        pd.DataFrame([{
+            "name": "bad",
+            "xyz_path": "x.xyz",
+            "com_path": bad_path,
+        }]).to_csv(com_log, index=False)
+        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_log = tmp_path / "slurm_write_log.csv"
+
+        with pytest.raises(ValueError, match="invalid COM log entries"):
+            write_slurm_scripts(
+                com_log_csv=str(com_log),
+                slurm_dir=str(slurm_dir),
+                log_csv=str(slurm_log),
+            )
+
+        assert not slurm_dir.exists()
+        assert not slurm_log.exists()
+
+    def test_one_missing_logged_com_preserves_all_prior_outputs(self, tmp_path):
+        com_dir = tmp_path / "gaussian_inputs"
+        com_dir.mkdir()
+        valid_com = com_dir / "water_F.com"
+        valid_com.write_text("")
+        missing_com = com_dir / "missing_F.com"
+        com_log = tmp_path / "com_write_log.csv"
+        self._make_log(tmp_path, [str(valid_com), str(missing_com)])
+
+        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_dir.mkdir()
+        prior_script = slurm_dir / "prior_F.sh"
+        prior_script.write_bytes(b"prior script\n")
+        slurm_log = tmp_path / "slurm_write_log.csv"
+        slurm_log.write_bytes(b"prior log\n")
+
+        with pytest.raises(ValueError, match="missing com_path at row 1"):
+            write_slurm_scripts(
+                com_log_csv=str(com_log),
+                slurm_dir=str(slurm_dir),
+                log_csv=str(slurm_log),
+            )
+
+        assert prior_script.read_bytes() == b"prior script\n"
+        assert slurm_log.read_bytes() == b"prior log\n"
+        assert {path.name for path in slurm_dir.glob("*.sh")} == {"prior_F.sh"}
+        assert not (slurm_dir / "water_F.sh").exists()
 
 
 class TestWriteSlurmScriptsOverwrite:

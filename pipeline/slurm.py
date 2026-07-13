@@ -47,6 +47,31 @@ g16 "$(basename "$COM_PATH")"
 """
 
 
+def _validated_logged_com_paths(com_log: pd.DataFrame) -> list[str]:
+    """Return valid logged COM paths or raise before SLURM output mutation (M-18)."""
+    if "com_path" not in com_log.columns:
+        raise ValueError("COM write log is missing required column: com_path")
+
+    com_paths = []
+    problems = []
+    for index, value in com_log["com_path"].items():
+        if value is None or pd.isna(value) or str(value).strip() == "":
+            problems.append(f"blank com_path at row {int(index)}")
+            continue
+        com_path = str(value)
+        if not os.path.isfile(com_path):
+            problems.append(f"missing com_path at row {int(index)}: {com_path!r}")
+            continue
+        com_paths.append(com_path)
+
+    if problems:
+        raise ValueError(
+            "Cannot write SLURM scripts from invalid COM log entries: "
+            + "; ".join(problems)
+        )
+    return com_paths
+
+
 def write_slurm_script(
     jobname: str,
     outdir: str,
@@ -131,17 +156,22 @@ def write_slurm_scripts(
     directives (account, resources) must not leave a stale script behind. The
     log's ``status`` column reports ``WROTE`` for a new file and ``OVERWROTE``
     when a non-empty script was replaced. A zero-job run writes a header-only log
-    and leaves no ``.sh`` files (M-11).
+    and leaves no ``.sh`` files (M-11). In log-driven mode, every ``com_path``
+    must be nonblank and identify an existing file; an invalid entry aborts before
+    creating/pruning scripts or rewriting the SLURM log (M-18).
     """
-    ensure_dir(slurm_dir)
-
     if com_dir is not None:
         # Legacy explicit mode: every .com on disk becomes a job.
         com_paths = sorted(glob.glob(os.path.join(com_dir, "*.com")))
     else:
         # Default: consume the current run's com_write_log.csv.
         com_log = pd.read_csv(com_log_csv)
-        com_paths = [str(p) for p in com_log["com_path"]]
+        com_paths = _validated_logged_com_paths(com_log)
+
+    # M-18 validation above intentionally completes before this first mutation.
+    # A stale/damaged COM log must not prune good scripts, create a directory, or
+    # overwrite the prior SLURM write log with jobs that cannot run.
+    ensure_dir(slurm_dir)
 
     expected_scripts = {
         os.path.normcase(os.path.abspath(os.path.join(

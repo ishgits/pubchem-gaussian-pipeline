@@ -134,6 +134,12 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   rerun, so the documented submission glob agrees with `slurm_write_log.csv`.
   Each script resolves its `.com` relative to its own location and runs `g16` on
   the basename, so `sbatch` works from any directory.
+- **Validated log-driven SLURM inputs (round-08 M-18).** Before creating the
+  SLURM directory, pruning stale scripts, or rewriting `slurm_write_log.csv`, the
+  default log-driven path now requires every `com_path` to be nonblank and point
+  to an existing file. A damaged/stale COM log fails with row-level details
+  rather than reporting `WROTE` for a job that cannot start. The explicit legacy
+  `com_dir` glob remains unchanged.
 - **Stable zero-result schemas (round-05 M-11).** Both the legacy and conformer
   Gaussian batch writers emit header-only, readable COM logs when zero files are
   written (including all-write-failure batches). The SLURM writer likewise emits
@@ -153,7 +159,7 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   to a labeled legacy v1.1 section.
 
 Required checks locally green after round 08 (RDKit 2025.03.3):
-`pytest tests/ -q` → **215 passed**; `python scripts/check_invariants.py` →
+`pytest tests/ -q` → **220 passed**; `python scripts/check_invariants.py` →
 **passed**; `git diff --check` → **passed**;
 `git ls-files -ci --exclude-standard` → empty.
 
@@ -172,6 +178,10 @@ Required checks locally green after round 08 (RDKit 2025.03.3):
   output mutation. This closes the direct-writer bypass around the protected
   conformer-log batch path. Legacy calls with `conformer_id=None` remain
   unchanged; missing commits remain explicit as `commit=unavailable`.
+- **M-18 — Resolved:** log-driven SLURM generation now rejects blank or missing
+  `com_path` entries before output-directory creation, stale-script pruning, or
+  SLURM-log rewrites. This prevents fresh scripts and `WROTE` records that point
+  to absent Gaussian inputs; the explicit legacy glob path remains unchanged.
 
 ## 2. What was NOT implemented (and why)
 
@@ -283,6 +293,10 @@ title) and never mixed with DFT Hartree values.
   (`TestWriteSlurmScriptsOverwrite`); smaller reruns prune prior scripts and a
   zero-job rerun removes all `.sh` files while keeping the fixed log schema
   (`TestWriteSlurmScriptsCurrentRunCleanup`).
+- `tests/test_slurm.py` round-08 follow-up — blank, whitespace-only, NaN/empty,
+  and nonexistent logged COM paths fail before directory/log creation. A mixed
+  valid/missing log preserves prior scripts and `slurm_write_log.csv`
+  byte-for-byte and writes no partial new job (M-18).
 - `tests/test_pubchem.py` — SMILES key handling (`TestIsomericSmiles`), resolved-row
   schema (`TestResolvedRow`), and current-schema scoring with the stereo bonus
   (`TestScoreCandidateCurrentSchema`), including `/` and backslash-only E/Z
