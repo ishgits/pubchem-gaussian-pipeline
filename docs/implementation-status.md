@@ -59,12 +59,19 @@ verification evidence (commit hashes, verify runs) lives in
 - **Canonical status doc + drift guard (round 03, M-07).** This file is populated
   and synced from `implementation-status-v2.md`; `scripts/check_invariants.py`
   gained a guard that fails when this file still contains template markers.
+- **Config-validated resume (M-09).** `search_conformers` records the requested
+  `n_generate` and `top_n` per row and, on rerun, skips a molecule only when all
+  its existing rows match this run's config (`seed`, `n_generate`, `top_n`,
+  `rmsd_prune`, `pipeline_version`). Rows from a different config, or a
+  pre-provenance log, are treated as stale, dropped, and regenerated with a
+  warning, so downstream Gaussian inputs are never built on outdated conformers.
+  Molecules present in the log but not in the current table are left untouched.
 - **Env / CI / README.** `rdkit` added to `environment.yml` and the
   review-readiness CI install step; README documents the conformer stage, the
   skip-on-undefined-stereo rule, and the retained limitations.
 
-Required checks locally green after round 03: `pytest tests/ -q` → **91 passed**;
-`python scripts/check_invariants.py` → **passed**.
+Required checks locally green after round 03 + M-09: `pytest tests/ -q` →
+**110 passed**; `python scripts/check_invariants.py` → **passed**.
 
 ## 2. What was NOT implemented (and why)
 
@@ -96,11 +103,14 @@ Required checks locally green after round 03: `pytest tests/ -q` → **91 passed
   versions" and "ran is not validated" invariants. API-shape only.
 - **`conformer_log.csv` column set is a superset of the plan.** Columns:
   `name, cid, smiles, conformer_id, rel_energy_kcalmol, xyz_path, rdkit_version,
-  pipeline_version, pipeline_commit, seed, method, n_generated, n_kept,
-  rmsd_prune, converged`. `converged` (M-04) and `pipeline_version` /
-  `pipeline_commit` (M-06) are additive; existing columns, ordering, ΔE values,
-  and the top-3 selection are unchanged versus round 02. The XYZ comment format
-  is likewise extended with `pver=`/`pcommit=` tokens (M-06).
+  pipeline_version, pipeline_commit, seed, n_generate, top_n, method, n_generated,
+  n_kept, rmsd_prune, converged`. `converged` (M-04), `pipeline_version` /
+  `pipeline_commit` (M-06), and the requested `n_generate` / `top_n` (M-09) are
+  additive; existing columns and the top-3 selection for a given config are
+  unchanged. The XYZ comment format is likewise extended with `pver=`/`pcommit=`
+  tokens (M-06). `n_generate` and `top_n` record the *requested* search knobs
+  (distinct from the result columns `n_generated` / `n_kept`) so a resumed run can
+  validate that stale rows match the current config (M-09).
 - **All-fail best-effort seed (M-04 decision 2b).** When no conformer converges,
   one real (not fabricated) FF geometry is still handed to DFT, explicitly flagged
   `converged=False`, warned at runtime, and tagged `UNCONVERGED_FF_SEED`. An
@@ -123,8 +133,12 @@ title) and never mixed with DFT Hartree values.
   (`TestNotebookPathOffline`); convergence selection and retry-merge
   (`TestSelectConvergedTopN`, `TestFinalizeConvergence`); retry alignment so
   recorded energy matches written geometry (`TestRetryAlignment`); batch
-  convergence incl. the flagged best-effort seed (`TestConvergenceBatch`); and
-  version/commit provenance in the log and XYZ header (`TestProvenanceLogging`).
+  convergence incl. the flagged best-effort seed (`TestConvergenceBatch`);
+  version/commit provenance in the log and XYZ header (`TestProvenanceLogging`);
+  and config-validated resume — matching config resumes, a changed
+  seed/`top_n`/pre-provenance log regenerates stale rows with a warning, and an
+  unrequested molecule is preserved (`TestRowConfigMatches`, `TestResumePartition`,
+  `TestResumeConfigValidationBatch`).
 - `tests/test_pubchem.py` — SMILES key handling (`TestIsomericSmiles`), resolved-row
   schema (`TestResolvedRow`), and current-schema scoring with the stereo bonus
   (`TestScoreCandidateCurrentSchema`).

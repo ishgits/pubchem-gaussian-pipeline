@@ -133,9 +133,16 @@ code change alone.
   and synced from this file; `scripts/check_invariants.py` gained a drift guard
   that fails when the canonical file still contains template markers; `WORKFLOW.md`
   records the sync step.
+- **M-09** — config-validated resume. `search_conformers` records the requested
+  `n_generate` and `top_n` per row and, on rerun, skips a molecule only when all
+  its rows match this run's config (`seed`, `n_generate`, `top_n`, `rmsd_prune`,
+  `pipeline_version`). Config/version drift, or a pre-provenance log, drops the
+  stale rows and regenerates them with a warning; molecules not in the current
+  table are left untouched. Prevents downstream Gaussian inputs from being built
+  on outdated conformers after a settings change.
 
-Required checks locally green after round-03 remediation (incl. M-06/M-07):
-`pytest tests/ -q` → **91 passed**; `python scripts/check_invariants.py` →
+Required checks locally green after round-03 remediation (incl. M-06/M-07/M-09):
+`pytest tests/ -q` → **110 passed**; `python scripts/check_invariants.py` →
 **passed**.
 
 ## 2. What was NOT implemented (and why)
@@ -164,10 +171,13 @@ Required checks locally green after round-03 remediation (incl. M-06/M-07):
   `pubchem_xyz/` convention. Not a scientific change.
 - **`conformer_log.csv` column set.** Implemented columns:
   `name, cid, smiles, conformer_id, rel_energy_kcalmol, xyz_path, rdkit_version,
-  seed, method, n_generated, n_kept, rmsd_prune, converged`. This is a superset of
-  the plan's required provenance columns (it adds `cid`, `smiles`, `n_kept` for
-  traceability name→CID→SMILES→conformer, and `converged` for M-04). No required
-  column omitted; the `converged` column is additive (round-02 M-04).
+  pipeline_version, pipeline_commit, seed, n_generate, top_n, method, n_generated,
+  n_kept, rmsd_prune, converged`. A superset of the plan's required provenance
+  columns: `cid` / `smiles` / `n_kept` for traceability
+  name→CID→SMILES→conformer, `converged` for M-04, `pipeline_version` /
+  `pipeline_commit` for M-06, and the requested `n_generate` / `top_n` for M-09
+  (the config a resumed run validates against; distinct from the result columns
+  `n_generated` / `n_kept`). All additive; no required column omitted.
 
 ### Round-02 remediation deviations
 
@@ -206,6 +216,16 @@ Required checks locally green after round-03 remediation (incl. M-06/M-07):
   flag makes this visible rather than hiding it. An empty `pipeline_commit`
   (no git) falls back to `pipeline_version`, which is only as precise as manual
   bumping. A recorded commit is therefore **not** a guarantee of exact code.
+- **M-09 — config-validated resume (behavioral change to resume-safety).** Resume
+  previously skipped any molecule already in the log. It now skips only when the
+  recorded config (`seed`, `n_generate`, `top_n`, `rmsd_prune`, `pipeline_version`)
+  matches this run; otherwise the stale rows are dropped and the molecule is
+  regenerated (with a warning). This means a rerun with changed settings now does
+  real work where it previously no-oped — the point of the fix, so downstream
+  inputs are never built on outdated conformers. `pipeline_version` (not the
+  per-commit `pipeline_commit`) is the code-change signal used, since commit is
+  empty without git; a `.dirty` edit that changes generation logic without a
+  version bump is therefore not auto-detected (bump `__version__` to force it).
 
 ### Round-01 remediation deviations
 
@@ -289,6 +309,14 @@ energies are labeled kcal/mol at every surface (CSV column name, XYZ comment,
     `pipeline.__version__` on every row, `pipeline_commit` present and a `str`
     (never a concrete SHA asserted), and the XYZ comment carries `pver=`/`pcommit=`
     tokens. **(M-06)**
+  - `TestRowConfigMatches::*` / `TestResumePartition::*` — pure config-match and
+    partition logic: seed/`n_generate`/`top_n`/`rmsd_prune`/`pipeline_version`
+    mismatch (and a missing column) count as drift; all rows of a molecule must
+    match; unrequested molecules are carried forward. **(M-09)**
+  - `TestResumeConfigValidationBatch::*` — batch (RDKit stubbed): matching config
+    resumes without regenerating; changed seed / `top_n` and a pre-provenance log
+    regenerate stale rows with a warning; a molecule absent from the current table
+    is preserved. **(M-09)**
 - `tests/test_utils.py` **(M-06)**
   - `TestGitShortSha::*` — `""` when git is absent / non-zero / times out; the SHA
     on a clean tree; SHA + `.dirty` on a mocked dirty tree. Offline (subprocess
