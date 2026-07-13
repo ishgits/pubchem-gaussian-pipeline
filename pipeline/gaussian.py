@@ -390,13 +390,21 @@ def write_gaussian_com(
         if bool(unconverged) == bool(conformer_record["converged"]):
             raise ValueError("Direct COM convergence marker disagrees with run manifest.")
 
-    ensure_dir(outdir)
     base = sanitize_basename(name)
     if conformer_id is not None:
         # Extend the basename per conformer (architecture v2): {base}_c{ii}.
         base = f"{base}_c{conformer_id:02d}"
     chk_name = f"{base}_F.chk"
     com_path = os.path.join(outdir, f"{base}_F.com")
+
+    if conformer_id is not None:
+        # B-01: preflight the COM destination against the run package before any
+        # filesystem mutation. relative_artifact_path() raises ValueError on an
+        # out-of-package path, so the direct v2 entry point fails before
+        # ensure_dir()/open() can leave an external artifact behind.
+        relative_artifact_path(com_path, manifest_path)
+
+    ensure_dir(outdir)
 
     coords = xyz_to_gaussian_coords(xyz_path)
     title = f"{base} {title_suffix}".strip()

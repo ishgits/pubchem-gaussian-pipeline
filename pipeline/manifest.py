@@ -586,8 +586,12 @@ def load_manifest(path: str = "run_manifest.json") -> dict:
 
 def relative_artifact_path(path: str, manifest_path: str) -> str:
     """Return a portable POSIX path relative to the manifest package root."""
-    package_root = os.path.dirname(os.path.abspath(manifest_path))
-    absolute_path = os.path.abspath(path)
+    # M-01: resolve symlinks before the containment check. os.path.abspath only
+    # normalizes text, so a symlink inside the package that targets an external
+    # directory would pass commonpath while the bytes land outside the package.
+    # realpath here must stay symmetric with artifact_abspath() below.
+    package_root = os.path.realpath(os.path.dirname(os.path.abspath(manifest_path)))
+    absolute_path = os.path.realpath(path)
     if os.path.commonpath((package_root, absolute_path)) != package_root:
         raise ValueError("Artifact path must stay inside the run package.")
     relative = os.path.relpath(absolute_path, package_root)
@@ -598,9 +602,11 @@ def artifact_abspath(manifest_path: str, relative_path: str) -> str:
     """Resolve a stored relative artifact path against the package root."""
     if os.path.isabs(relative_path):
         raise ValueError("Manifest artifact paths must be relative.")
-    return os.path.normpath(
-        os.path.join(os.path.dirname(os.path.abspath(manifest_path)), relative_path)
-    )
+    # M-01: resolve symlinks so this stays symmetric with relative_artifact_path();
+    # otherwise a stored path (relative to the resolved root) would round-trip
+    # against an unresolved root under a symlinked package.
+    package_root = os.path.realpath(os.path.dirname(os.path.abspath(manifest_path)))
+    return os.path.realpath(os.path.join(package_root, relative_path))
 
 
 def find_artifact(manifest: dict, artifact_id: str) -> dict:
