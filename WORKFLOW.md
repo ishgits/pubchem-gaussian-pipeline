@@ -15,11 +15,11 @@ Cowork  ▼                                             │
 Claude  ▼  prompts/implementer.md
 Code     branch → implement → run floor → status doc → open PR
         │
-CI      ▼  review-readiness.yml  (tests + invariants)   ← objective floor
+CI      ▼  review-readiness.yml  (tests + invariants + repo hygiene)  ← floor
         │        green?  ──no──► fix; not review-ready
         │        yes
-Codex   ▼  codex-review.yml  (prompt: full taxonomy, stable IDs)
-         posts review comment + artifact  → review-round-NN
+Codex   ▼  native `@codex review` on the PR (reads AGENTS.md §6)
+         posts findings → review-round-NN
         │
         ├──────────────── HUMAN GATE 2 ───────────────┐
         │  Ish reviews substantive findings           │
@@ -39,38 +39,33 @@ Code     push → CI floor reruns → Codex diff-based re-review (round NN+1)
 - `AGENTS.md` — source of truth: objective, scientific invariants, dev rules,
   required checks, definition of done, Codex review guidelines.
 - `CLAUDE.md` — thin pointer + Claude-Code implementer role.
-- `docs/architecture.md` / `implementation-plan.md` — the two gate-1 artifacts.
+- `docs/architecture.md` / `implementation-plan.md` — the two gate-1 artifacts
+  (canonical v2). Earlier drafts and per-round history live under
+  `docs/review-history/v2/`.
 - `docs/implementation-status.md` — implementer's self-report and the AGENTS.md
   §5 **merge gate** (reviewer verifies, never trusts). §6 "questions requiring
-  scientific judgment" is what Ish reads first. **Each remediation round, sync it
-  from the working file `docs/implementation-status-v2.md`** so the canonical gate
-  never goes stale — `scripts/check_invariants.py` fails the floor if this file
-  still holds template placeholders.
-- `docs/implementation-status-v2.md` — the working status file for the v2
-  conformer track; carries the per-round evidence tables (commit + verification).
-  Sync its content into `docs/implementation-status.md` before opening/updating
-  the PR.
+  scientific judgment" is what Ish reads first. It must never sit as the empty
+  template — `scripts/check_invariants.py` fails the floor if this file still
+  holds template placeholders. The full per-round evidence (commit hashes, verify
+  runs) is archived in `docs/review-history/v2/`.
 - `reviews/*-template.md` — the review and remediation artifact formats.
 - `prompts/*.md` — the versioned brief each agent gets, so handoffs are identical
   every time (kills "no universal handoff format" + "context trapped in chats").
 - `scripts/check_invariants.py` — the mechanical floor.
-- `.github/workflows/review-readiness.yml` — runs the floor on every PR.
-- `.github/workflows/codex-review.yml` — runs Codex review after the floor is green.
-- `.github/codex/prompts/review.md` — the live reviewer prompt Codex runs.
+- `.github/workflows/review-readiness.yml` — runs the floor on every PR
+  (tests + scientific-invariant checks + repo-hygiene: no tracked generated files).
 
-## Two ways to run the Codex review
+## Running the Codex review (native, no secrets)
 
-1. **Native (5-min, no secrets):** turn on Code review for this repo in Codex
-   settings, then comment `@codex review` on a PR. Codex reads `AGENTS.md` review
-   guidelines. Fast, but posts P0/P1 inline comments only — taxonomy collapses,
-   no committed artifact. Good for proving the loop.
-2. **Structured (this kit's `codex-review.yml`):** Codex runs the custom prompt,
-   emits the full Blocker→Verified-Strength taxonomy with stable IDs + code
-   anchors, posts a review comment, and uploads the review as an artifact.
-   Requires the `OPENAI_API_KEY` repo secret. This is what your round-2
-   diff-based re-review depends on.
+Turn on Code review for this repo in Codex settings, then comment `@codex review`
+on the PR. Codex reads the review guidelines in `AGENTS.md` §6 (full
+Blocker→Verified-Strength taxonomy, stable IDs, code anchors) and posts its
+findings on the PR. No API key, no extra workflow, and no third-party secret is
+required — the review runs entirely through Codex's native GitHub integration
+against the same `AGENTS.md`, so there is no separate setup to keep in sync.
 
-Both read the same `AGENTS.md`, so no wasted setup.
+On a re-review Codex does a diff-based pass and classifies each prior finding
+Resolved / Partial / Unresolved / Rejected(justif.) / Regressed.
 
 ## A lightweight path (don't over-ceremony small PRs)
 

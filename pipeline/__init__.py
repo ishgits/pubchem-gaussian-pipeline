@@ -19,10 +19,12 @@ The v1.1 path (PubChem 3D SDF → Open Babel XYZ, via ``download_sdfs`` /
 """
 
 # Pipeline version for provenance (M-06). Bump manually when the code that
-# produces scientific outputs changes; the v2 conformer track starts at 0.2.0.
-# Recorded in conformer_log.csv alongside a best-effort git commit so two runs
-# from different revisions are distinguishable.
-__version__ = "0.2.0"
+# produces scientific outputs changes. The v2 conformer pathway is the released
+# default at 2.0.0 (MOD-01). Recorded in conformer_log.csv alongside a
+# best-effort git commit so two runs from different revisions are
+# distinguishable; changing this string deliberately changes the
+# pipeline_version stamped into provenance logs going forward.
+__version__ = "2.0.0"
 
 from .pubchem import (
     build_molecule_table,

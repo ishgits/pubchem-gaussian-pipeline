@@ -1,7 +1,8 @@
 # Reviewer brief (Codex) — reference copy
 
-The live copy Codex runs in CI is `.github/codex/prompts/review.md`. This is the
-human-readable reference.
+Codex runs its **native** `@codex review` on the PR and reads the review
+guidelines in `AGENTS.md` §6 (no API key, no custom workflow). This file is the
+human-readable reference for what that review should cover.
 
 Independently audit the PR against `docs/architecture.md`,
 `docs/implementation-plan.md`, and the scientific invariants in `AGENTS.md` §2.

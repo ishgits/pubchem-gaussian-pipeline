@@ -7,10 +7,14 @@ truth. `CLAUDE.md` and the `prompts/` briefs point back here.
 ## 1. Project objective
 
 Generate Gaussian input files (`.com`) and SLURM submission scripts (`.sh`) from
-molecule names, via PubChem lookup → 3D SDF → Open Babel XYZ → Gaussian opt+freq
-(Link1 pattern). The pipeline produces *inputs* to quantum-chemistry jobs; it
-does not run Gaussian. Correctness means the generated inputs faithfully encode
-the intended chemistry and are fully reproducible from recorded configuration.
+molecule names. The **primary (v2) pathway** is: PubChem lookup → stereo
+`IsomericSMILES` → RDKit ETKDGv3 conformer search + MMFF94/UFF rank → top-N
+distinct conformers → Gaussian opt+freq (Link1 pattern) → run-scoped SLURM
+scripts. A **legacy v1.1 pathway** (PubChem 3D SDF → Open Babel XYZ → one
+geometry) is retained but is no longer the default. The pipeline produces
+*inputs* to quantum-chemistry jobs; it does not run Gaussian. Correctness means
+the generated inputs faithfully encode the intended chemistry and are fully
+reproducible from recorded configuration.
 
 ## 2. Scientific invariants (never violate silently)
 
@@ -33,9 +37,11 @@ quietly.
 - **The Link1 opt→freq contract holds.** The frequency job must read geometry
   from the optimization checkpoint (`Geom=AllChk Guess=Read`). Do not decouple
   opt and freq without a recorded deviation.
-- **Starting geometries are approximate, and the code must say so.** PubChem +
-  Open Babel geometries are DFT-*starting* points, not optimized minima. Do not
-  add claims of geometric optimality.
+- **Starting geometries are approximate, and the code must say so.** RDKit/MMFF
+  conformers (v2) and PubChem + Open Babel geometries (legacy v1.1) are
+  DFT-*starting* points, not optimized minima. Conformer force-field energies are
+  kcal/mol and must never be mixed with DFT Hartree values. Do not add claims of
+  geometric optimality.
 
 ## 3. Development rules
 
@@ -44,9 +50,11 @@ quietly.
   placeholders.
 - Every generated scientific output must record the configuration that produced
   it (route lines, charge/mult, nproc) and the relevant software versions
-  (pipeline version, Open Babel version).
+  (pipeline version, RDKit version on the v2 path; Open Babel version on the
+  legacy path).
 - Generated outputs must be traceable to their inputs (molecule name → CID →
-  SDF → XYZ → .com, via the log CSVs).
+  SMILES → conformer XYZ → .com, via the log CSVs; legacy: name → CID → SDF →
+  XYZ → .com).
 - Do not claim validation based only on successful execution. "It ran" ≠ "it is
   correct." Validation requires checking the output against an expected value or
   reference.
@@ -61,7 +69,9 @@ agent review begins:
 
 - `pytest tests/ -q` passes.
 - `python scripts/check_invariants.py` passes (placeholder-sentinel scan +
-  route-line physics-token check).
+  route-line physics-token check + canonical status-doc drift guard).
+- Repo hygiene: `git ls-files -ci --exclude-standard` is empty (no generated
+  output tracked, so a fresh clone ships no stale `.com`/`.sdf`/`.xyz`).
 
 If the floor is red, the change is not review-ready. Do not request review.
 

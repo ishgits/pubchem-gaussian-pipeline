@@ -48,7 +48,18 @@ Verified with `git ls-files -ci --exclude-standard` → empty and
 
 ### Commit 3 — docs + versioning (MOD-01..MOD-04, MIN-01; MOD-05 PR body)
 
-_Pending — recorded on landing._
+| ID | What changed |
+|----|--------------|
+| MOD-01 | `pipeline.__version__ = "2.0.0"`; PubChem UA → `gaussian-input-pipeline/2.0 (research use)`. Deliberately changes the `pipeline_version` stamped into provenance logs (call 5a). |
+| MOD-02 | `docs/architecture.md`, `docs/implementation-plan.md`, `docs/implementation-status.md` are now the authoritative v2 files (no template placeholders); the `-v2` architecture/plan/status drafts and every `remediation-plan-round-0N-v2.md` moved under `docs/review-history/v2/`. `check_invariants.py` drift-guard message updated to the canonical file. |
+| MOD-03 | README rewritten around the RDKit conformer flow as primary (names → CID+stereo SMILES → ETKDGv3 → MMFF94/UFF rank → top-N XYZ → Gaussian opt→freq → run-scoped SLURM); RDKit added to requirements, `conformers.py` in the tree; Open Babel demoted to a labeled Legacy v1.1 section. |
+| MOD-04 | `WORKFLOW.md` rewritten for the native Codex review (no `codex-review.yml`/`review.md`/API-key path); `AGENTS.md` §1 makes the v2 conformer pathway primary. No `OPENAI_API_KEY` path introduced. |
+| MIN-01 | Pinned/locked env shipped for v2.0.0 (`environment-lock.yml`); `numpy` removed from explicit deps after confirming it is unused outside `pipeline/`. |
+| MOD-05 | PR #3 body rewritten last to match the final diff (test count, rewired notebook, changelog; stray `EOF`/`)` removed). |
+
+This is the final working snapshot for the v2.0.0 release; archived under
+`docs/review-history/v2/`. The canonical `docs/implementation-status.md` is the
+live merge-gate doc going forward.
 
 ## 0c. Round-03 remediation (Codex findings M-06, M-07)
 

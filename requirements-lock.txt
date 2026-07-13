@@ -1,0 +1,17 @@
+# Pinned dependency stack for the v2.0.0 release (MIN-01).
+#
+# These are the exact versions the v2.0.0 test suite was run against
+# (pytest tests/ -q -> 143 passed, offline). RDKit's ETKDGv3 + MMFF embedding is
+# version-sensitive, so pinning it makes conformer geometries reproducible; the
+# resume logic also invalidates cached geometries when rdkit_version changes.
+#
+# Reproduce with:  python -m pip install -r requirements-lock.txt
+# numpy is intentionally not pinned as a direct dependency (unused outside
+# pipeline/); it is pulled in transitively by pandas and rdkit.
+#
+# Tested on CPython 3.13.3 (also supported: >=3.11).
+
+pandas==3.0.3
+requests==2.34.2
+rdkit==2025.09.3
+pytest==9.1.1

@@ -80,6 +80,7 @@ def check_route_constants() -> list[str]:
 #    empty template while the real status lives in implementation-status-v2.md, so
 #    reviewers/maintainers following the mandated gate can't miss v2 deviations.
 #    This turns "canonical went stale" from a reviewer catch into a floor failure.
+#    (The v2 working-history drafts are archived under docs/review-history/v2/.)
 def _status_doc_problems(text: str) -> list[str]:
     """Return template-marker problems in a status-doc string (pure, testable)."""
     problems = []
@@ -100,7 +101,7 @@ def check_status_doc() -> list[str]:
     text = STATUS_DOC.read_text(encoding="utf-8", errors="replace")
     return [
         f"[status-doc] docs/implementation-status.md still has {p} "
-        f"(sync it from implementation-status-v2.md — AGENTS.md §5 gate)"
+        f"(populate the canonical merge-gate doc — AGENTS.md §5 gate)"
         for p in _status_doc_problems(text)
     ]
 

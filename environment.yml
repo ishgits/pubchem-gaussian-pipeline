@@ -2,11 +2,13 @@ name: gaussian-pipeline
 channels:
   - conda-forge
 dependencies:
-  - python>=3.10
+  - python>=3.11
   - pandas
-  - numpy
   - requests
-  - openbabel
-  - rdkit
+  - rdkit           # v2 conformer search (primary path)
+  - openbabel       # legacy v1.1 single-geometry path only
   - jupyterlab
   - pytest
+# numpy is NOT an explicit dependency: it is unused outside pipeline/ (verified)
+# and pulled in transitively by pandas/rdkit. For a reproducible v2.0.0 stack,
+# install the pinned versions in requirements-lock.txt.

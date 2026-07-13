@@ -1,18 +1,18 @@
 # implementation-status.md
 
-> **Synced each remediation round** from `docs/implementation-status-v2.md` (the
-> working file). AGENTS.md §5 names *this* file as the merge gate, so it must
-> always reflect the real current status — `scripts/check_invariants.py` fails
-> the objective floor if this file ever drifts back to the empty template.
+> Canonical status doc — the AGENTS.md §5 merge gate, so it must always reflect
+> the real current status; `scripts/check_invariants.py` fails the objective
+> floor if this file ever drifts back to the empty template. The full per-round
+> working history (commit hashes, verify runs) is archived under
+> `docs/review-history/v2/` (`implementation-status-v2.md` and each
+> `remediation-plan-round-0N-v2.md`).
 
 Maintained by the implementing agent (Claude Code). The reviewer (Codex) must
 verify these claims against the code, not trust them.
 
-**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 3
-(v2 conformer search + remediation rounds 01–03). Works against
-`docs/architecture-v2.md` and `docs/implementation-plan-v2.md`. The per-round
-verification evidence (commit hashes, verify runs) lives in
-`implementation-status-v2.md` and each `docs/remediation-plan-round-0N-v2.md`.
+**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 4
+(v2 conformer search + remediation rounds 01–04; released as v2.0.0). Works
+against `docs/architecture.md` and `docs/implementation-plan.md`.
 
 ## 1. What was implemented
 
@@ -42,7 +42,7 @@ verification evidence (commit hashes, verify runs) lives in
   `converged=False`, a warning, and an `UNCONVERGED_FF_SEED` marker in the `.com`
   title. `conformer_log.csv` records a `converged` column.
 - **Version + commit provenance (round 03, M-06).** `pipeline.__version__` is
-  `"0.2.0"`; `pipeline_provenance()` returns that version plus a best-effort git
+  `"2.0.0"` (round-04 MOD-01); `pipeline_provenance()` returns that version plus a best-effort git
   short SHA (`.dirty` suffix on an uncommitted tree, empty string when git is
   absent). `search_conformers` records `pipeline_version` and `pipeline_commit`
   on every `conformer_log.csv` row and appends `pver=`/`pcommit=` tokens to each
@@ -59,19 +59,43 @@ verification evidence (commit hashes, verify runs) lives in
 - **Canonical status doc + drift guard (round 03, M-07).** This file is populated
   and synced from `implementation-status-v2.md`; `scripts/check_invariants.py`
   gained a guard that fails when this file still contains template markers.
-- **Config-validated resume (M-09).** `search_conformers` records the requested
-  `n_generate` and `top_n` per row and, on rerun, skips a molecule only when all
-  its existing rows match this run's config (`seed`, `n_generate`, `top_n`,
-  `rmsd_prune`, `pipeline_version`). Rows from a different config, or a
-  pre-provenance log, are treated as stale, dropped, and regenerated with a
-  warning, so downstream Gaussian inputs are never built on outdated conformers.
-  Molecules present in the log but not in the current table are left untouched.
-- **Env / CI / README.** `rdkit` added to `environment.yml` and the
-  review-readiness CI install step; README documents the conformer stage, the
-  skip-on-undefined-stereo rule, and the retained limitations.
+- **Identity/config-validated resume (M-09 + round-04 B-02).** `search_conformers`
+  skips a molecule only when all its existing rows match this run's run-level
+  config (`seed`, `n_generate`, `top_n`, `rmsd_prune`, `pipeline_version`,
+  **`rdkit_version`**) *and* the requested per-molecule identity (**`cid`**,
+  **`smiles`**), and every recorded **`xyz_path` exists and is non-empty**. Rows
+  from a different config/identity, a stale RDKit build, a missing geometry, or a
+  pre-provenance log are dropped and regenerated with a warning, so downstream
+  Gaussian inputs are never built on outdated or wrong-structure conformers. By
+  default (round-04 M-02) the log holds exactly the molecules requested this run;
+  `append=True` retains unrequested molecules' rows.
+- **Physical-line XYZ parsing (round-04 B-01).** `xyz_to_gaussian_coords` reads
+  line 1 = atom count, line 2 = comment (may be empty), then exactly that many
+  coordinate rows; a count mismatch or malformed row raises `ValueError` instead
+  of silently dropping an atom — an empty comment line no longer truncates the
+  geometry sent to Gaussian.
+- **Run-scoped, submission-independent SLURM (round-04 B-03, M-01, M-03).**
+  `write_slurm_scripts` defaults to the current run's `com_write_log.csv` (stale
+  `.com` files are never picked up; a `com_dir` glob is the explicit legacy mode)
+  and overwrites `.sh` files (reporting `WROTE`/`OVERWROTE`) so a rerun cannot
+  leave stale SBATCH directives. Each script resolves its `.com` relative to its
+  own location and runs `g16` on the basename, so `sbatch` works from any
+  directory.
+- **Early parameter validation + stale-log hygiene (round-04 MIN-03, MIN-02).**
+  `search_conformers` rejects `n_generate<1`, `top_n<1`, `rmsd_prune<0`, duplicate
+  molecule labels, and empty sanitized filenames at entry; it and the Gaussian
+  writers clear a stale `*_failed.csv` at stage start.
+- **Repo hygiene + release versioning (round-04 B-04, MOD-01).** Generated
+  outputs are untracked and gitignored (`git ls-files -ci --exclude-standard`
+  empty), enforced by a new `review-readiness.yml` step; `pipeline.__version__ =
+  "2.0.0"` and the PubChem User-Agent is `gaussian-input-pipeline/2.0`.
+- **Env / CI / README.** `rdkit` in `environment.yml` and the review-readiness CI
+  install step; README leads with the RDKit conformer flow, with Open Babel demoted
+  to a labeled legacy v1.1 section.
 
-Required checks locally green after round 03 + M-09: `pytest tests/ -q` →
-**110 passed**; `python scripts/check_invariants.py` → **passed**.
+Required checks locally green after round 04 (rdkit 2025.09.3): `pytest tests/ -q`
+→ **143 passed**; `python scripts/check_invariants.py` → **passed**;
+`git ls-files -ci --exclude-standard` → empty.
 
 ## 2. What was NOT implemented (and why)
 
@@ -84,6 +108,11 @@ Required checks locally green after round 03 + M-09: `pytest tests/ -q` →
   tracked as a next-round candidate, not a silent omission.
 - Post-optimization RMSD re-pruning is not added; distinctness relies on
   `pruneRmsThresh` at embed time (see §6).
+- **Round-04 deferrals (recorded, not silent):** the per-study `runs/`
+  run-directory redesign; a fuller resume key (`pipeline_commit` in-key, `n_rows
+  == n_kept` reconcile, duplicate-label re-keying by identity); and extending
+  version/commit provenance to `com_write_log.csv` / `sdf_download_log.csv`. All
+  logged for a later round per `docs/review-history/v2/remediation-plan-round-04-v2.md`.
 
 ## 3. Deviations from architecture / plan
 
@@ -135,10 +164,20 @@ title) and never mixed with DFT Hartree values.
   recorded energy matches written geometry (`TestRetryAlignment`); batch
   convergence incl. the flagged best-effort seed (`TestConvergenceBatch`);
   version/commit provenance in the log and XYZ header (`TestProvenanceLogging`);
-  and config-validated resume — matching config resumes, a changed
-  seed/`top_n`/pre-provenance log regenerates stale rows with a warning, and an
-  unrequested molecule is preserved (`TestRowConfigMatches`, `TestResumePartition`,
-  `TestResumeConfigValidationBatch`).
+  and identity/config-validated resume — matching config resumes; a changed
+  seed/`top_n`/`cid`/`smiles`/RDKit-version, a deleted XYZ, or a pre-provenance log
+  regenerates stale rows with a warning; unrequested molecules are dropped by
+  default and retained with `append=True`
+  (`TestRowConfigMatches`, `TestRowIdentityAndXyz`, `TestResumePartition`,
+  `TestResumeConfigValidationBatch`, `TestPreserveUnrequestedBatch`);
+  early parameter validation (`TestParameterValidation`) and stale-`*_failed.csv`
+  clearing (`TestStaleFailedCsvCleared`).
+- `tests/test_gaussian.py` — physical-line XYZ parsing: empty comment keeps all
+  atoms, count-mismatch (either direction) and malformed/non-integer rows raise,
+  trailing blank tolerated (`TestXyzParsingByPhysicalLine`).
+- `tests/test_slurm.py` — script resolves its `.com` from a sibling directory
+  (`TestSlurmScriptResolvesInput`); log-driven default vs legacy glob
+  (`TestWriteSlurmScriptsLogDriven`); overwrite-on-rerun (`TestWriteSlurmScriptsOverwrite`).
 - `tests/test_pubchem.py` — SMILES key handling (`TestIsomericSmiles`), resolved-row
   schema (`TestResolvedRow`), and current-schema scoring with the stereo bonus
   (`TestScoreCandidateCurrentSchema`).
@@ -193,10 +232,10 @@ still runs the pure tests; CI installs rdkit so they execute there.
 
 ## Provenance
 
-- pipeline version: `0.2.0` (`pipeline.__version__`; recorded per row in
+- pipeline version: `2.0.0` (`pipeline.__version__`; recorded per row in
   `conformer_log.csv` `pipeline_version`, and best-effort git commit in
-  `pipeline_commit`). Branch `feat/conformer-search-v2`; base v1.1
-  (Zenodo 10.5281/zenodo.18894724).
+  `pipeline_commit`). PubChem User-Agent `gaussian-input-pipeline/2.0`. Branch
+  `feat/conformer-search-v2`; base v1.1 (Zenodo 10.5281/zenodo.18894724).
 - RDKit version used for local test runs: 2025.09.3 (recorded per row in
   `conformer_log.csv` `rdkit_version` at runtime).
 - Conformer stage config: `N_GENERATE=20`, `TOP_N=3`, `RMSD_PRUNE=0.5 Å`,

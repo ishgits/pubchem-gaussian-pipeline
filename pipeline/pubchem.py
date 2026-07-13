@@ -24,7 +24,7 @@ from .utils import ensure_dir, normalize_cid, sanitize_basename
 # ---------------------------------------------------------------------------
 PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 _DEFAULT_HEADERS = {
-    "User-Agent": "gaussian-input-pipeline/1.0 (research use)"
+    "User-Agent": "gaussian-input-pipeline/2.0 (research use)"
 }
 
 
