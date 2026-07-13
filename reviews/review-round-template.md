@@ -1,37 +1,71 @@
 # review-round-NN.md
 
-**PR:** #<n>   **Head SHA:** <sha>   **Reviewer:** Codex (<model>)   **Round:** NN
+**PR:** number
+**Head SHA:** SHA
+**Reviewer:** Codex model
+**Round:** NN
+**Frozen contract:** `docs/release-contract-v2.0.md`
 
-> Reviewer inspected the diff and code directly, not implementation-status.md.
+> The reviewer inspected the base-to-head diff and implementation directly.
 
-## Summary
-<2–3 sentences: overall state, is it mergeable, biggest risks>
+## Merge assessment
+
+State whether any frozen-contract Blocker or Major remains. Distinguish future
+contract proposals from current release violations.
+
+## Holistic coverage
+
+Record which areas were inspected:
+
+```text
+scientific invariants
+identity
+complete groups
+manifest and hashes
+artifact linkage
+one-to-one paths
+failure before mutation
+resume and append
+zero-job behavior
+clean archive
+```
 
 ## Findings
 
-Each finding: stable ID, severity, location (file:line-range or function),
-evidence, consequence, required remediation.
+Every finding must include:
+
+- stable ID and severity;
+- location;
+- evidence;
+- consequence;
+- required remediation;
+- verification;
+- contract mapping: exact section or `Future contract proposal`.
 
 ### Blockers
-- **B-01** — `pipeline/<file>.py:L<a>-L<b>`
-  - Evidence: <what in the code>
-  - Consequence: <why it matters scientifically or operationally>
-  - Remediation: <what must change>
-  - Verify by: <the specific test/check that proves it fixed>
 
-### Major
-- **M-01** — ...
+### Majors
 
-### Moderate
-- **MOD-01** — ...
+### Moderates
 
-### Minor
-- **MIN-01** — ...
+### Minors
 
 ### Verified strengths
-- <things that are correct and worth keeping — prevents regressions>
 
-## Re-review classification (Round ≥ 2 only)
-| Finding | Status | Note |
-|---------|--------|------|
-| B-01 | Resolved / Partial / Unresolved / Rejected(justif.) / Regressed | |
+## Future contract proposals
+
+List useful recommendations that do not violate the frozen v2.0 contract. These
+are deferred unless Ish explicitly expands the release scope.
+
+## Re-review classification
+
+| Finding | Status | Contract basis | Verification |
+|---|---|---|---|
+| ID | Resolved / Partially resolved / Unresolved / Rejected with justification / Regressed | section | command or test |
+
+## Final statement
+
+State one of:
+
+- frozen-contract Blocker/Major remains;
+- no frozen-contract Blocker/Major remains; ready for Ish's merge decision.

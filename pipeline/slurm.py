@@ -12,10 +12,23 @@ import os
 
 import pandas as pd
 
+from .manifest import (
+    assert_stage_configuration,
+    find_artifact,
+    record_child_artifact,
+    relative_artifact_path,
+    remove_artifacts_by_kind,
+    sha256_file,
+    slurm_template_identity,
+    stable_record_id,
+)
 from .utils import ensure_dir
 
 
-_SLURM_LOG_COLUMNS = ["jobname", "com_path", "sh_path", "status"]
+_SLURM_LOG_COLUMNS = [
+    "run_id", "artifact_id", "config_hash", "jobname", "com_artifact_id",
+    "com_path", "com_sha256", "sh_path", "sh_sha256", "status",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -47,13 +60,24 @@ g16 "$(basename "$COM_PATH")"
 """
 
 
-def _validated_logged_com_paths(com_log: pd.DataFrame) -> list[str]:
+def _validated_logged_com_paths(
+    com_log: pd.DataFrame, manifest_path: str, manifest: dict
+) -> list[dict]:
     """Return valid logged COM paths or raise before SLURM output mutation (M-18)."""
-    if "com_path" not in com_log.columns:
-        raise ValueError("COM write log is missing required column: com_path")
+    required = {
+        "run_id", "artifact_id", "config_hash", "conformer_record_id",
+        "com_path", "com_sha256",
+    }
+    missing = sorted(required - set(com_log.columns))
+    if missing and not com_log.empty:
+        raise ValueError(
+            "COM write log is missing required column(s): " + ", ".join(missing)
+        )
 
-    com_paths = []
+    prepared = []
     problems = []
+    seen_sources = set()
+    seen_artifacts = set()
     for index, value in com_log["com_path"].items():
         if value is None or pd.isna(value) or str(value).strip() == "":
             problems.append(f"blank com_path at row {int(index)}")
@@ -62,14 +86,42 @@ def _validated_logged_com_paths(com_log: pd.DataFrame) -> list[str]:
         if not os.path.isfile(com_path):
             problems.append(f"missing com_path at row {int(index)}: {com_path!r}")
             continue
-        com_paths.append(com_path)
+        if os.path.getsize(com_path) == 0:
+            problems.append(f"zero-byte com_path at row {int(index)}: {com_path!r}")
+            continue
+        normalized = os.path.normcase(os.path.abspath(os.path.realpath(com_path)))
+        if normalized in seen_sources:
+            problems.append(f"duplicate normalized com_path at row {int(index)}: {com_path!r}")
+            continue
+        seen_sources.add(normalized)
+        try:
+            if str(com_log.at[index, "run_id"]) != manifest["run_id"] or str(com_log.at[index, "config_hash"]) != manifest["config_hash"]:
+                raise ValueError("run/config identity mismatch")
+            artifact_id = str(com_log.at[index, "artifact_id"])
+            if artifact_id in seen_artifacts:
+                raise ValueError("duplicate COM artifact record")
+            seen_artifacts.add(artifact_id)
+            artifact = find_artifact(manifest, artifact_id)
+            if artifact["kind"] != "com":
+                raise ValueError("referenced artifact is not COM")
+            if artifact.get("conformer_record_id") != str(com_log.at[index, "conformer_record_id"]):
+                raise ValueError("conformer lineage mismatch")
+            if relative_artifact_path(com_path, manifest_path) != artifact["relative_path"]:
+                raise ValueError("COM path mismatch")
+            actual_hash = sha256_file(com_path)
+            if str(com_log.at[index, "com_sha256"]) != artifact["sha256"] or actual_hash != artifact["sha256"]:
+                raise ValueError("COM hash mismatch")
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            problems.append(f"manifest mismatch at row {int(index)}: {exc}")
+            continue
+        prepared.append({"com_path": com_path, "artifact": artifact})
 
     if problems:
         raise ValueError(
             "Cannot write SLURM scripts from invalid COM log entries: "
             + "; ".join(problems)
         )
-    return com_paths
+    return prepared
 
 
 def write_slurm_script(
@@ -81,6 +133,10 @@ def write_slurm_script(
     cpus: int = 16,
     mem: str = "32G",
     time: str = "24:00:00",
+    run_id: str | None = None,
+    artifact_id: str | None = None,
+    source_com_relative_path: str | None = None,
+    source_com_sha256: str | None = None,
 ) -> str:
     """
     Write a single SLURM submission script for a Gaussian job.
@@ -125,6 +181,24 @@ def write_slurm_script(
         time=time,
         com_relpath=com_relpath,
     )
+    linkage = (run_id, artifact_id, source_com_relative_path, source_com_sha256)
+    if any(value is not None for value in linkage):
+        if any(value is None or not str(value).strip() for value in linkage):
+            raise ValueError(
+                "Linked SLURM scripts require run_id, artifact_id, source COM "
+                "relative path, and source COM SHA-256."
+            )
+        header = (
+            f"# run_id={run_id}\n"
+            f"# artifact_id={artifact_id}\n"
+            f"# source_com_relative_path={source_com_relative_path}\n"
+            f"# source_com_sha256={source_com_sha256}\n"
+        )
+        if text.startswith("#!") and "\n" in text:
+            shebang, remainder = text.split("\n", 1)
+            text = f"{shebang}\n{header}{remainder}"
+        else:
+            text = header + text
 
     with open(sh_path, "w") as f:
         f.write(text)
@@ -137,6 +211,7 @@ def write_slurm_scripts(
     slurm_dir: str = "slurm_scripts",
     log_csv: str = "slurm_write_log.csv",
     com_dir: str | None = None,
+    manifest_path: str = "run_manifest.json",
     **kwargs,
 ) -> pd.DataFrame:
     """
@@ -163,15 +238,65 @@ def write_slurm_scripts(
     if com_dir is not None:
         # Legacy explicit mode: every .com on disk becomes a job.
         com_paths = sorted(glob.glob(os.path.join(com_dir, "*.com")))
+        prepared = [{"com_path": path, "artifact": None} for path in com_paths]
+        manifest = None
     else:
         # Default: consume the current run's com_write_log.csv.
         com_log = pd.read_csv(com_log_csv)
-        com_paths = _validated_logged_com_paths(com_log)
+        slurm_config = {
+            "account": kwargs.get("account", "myaccount"),
+            "cpus": kwargs.get("cpus", 16),
+            "mem": kwargs.get("mem", "32G"),
+            "time": kwargs.get("time", "24:00:00"),
+            "template_sha256": slurm_template_identity(
+                kwargs.get("template", DEFAULT_TEMPLATE)
+            ),
+        }
+        manifest = assert_stage_configuration(
+            manifest_path, "slurm", slurm_config
+        )
+        prepared = _validated_logged_com_paths(com_log, manifest_path, manifest)
+        com_paths = [item["com_path"] for item in prepared]
+
+    # Prove one-to-one source→destination mapping and validate the template for
+    # every job before pruning/creating any file or rewriting either log.
+    destinations = {}
+    basenames = {}
+    for item in prepared:
+        com_path = item["com_path"]
+        jobname = os.path.splitext(os.path.basename(com_path))[0]
+        destination = os.path.normcase(
+            os.path.abspath(os.path.join(slurm_dir, f"{jobname}.sh"))
+        )
+        if jobname in basenames:
+            raise ValueError(
+                f"Two COM inputs collapse to script basename {jobname!r}: "
+                f"{basenames[jobname]!r} and {com_path!r}."
+            )
+        if destination in destinations:
+            raise ValueError(
+                f"Duplicate SLURM destination {destination!r} for "
+                f"{destinations[destination]!r} and {com_path!r}."
+            )
+        basenames[jobname] = com_path
+        destinations[destination] = com_path
+        template = kwargs.get("template", DEFAULT_TEMPLATE)
+        template.format(
+            jobname=jobname,
+            account=kwargs.get("account", "myaccount"),
+            cpus=kwargs.get("cpus", 16),
+            mem=kwargs.get("mem", "32G"),
+            time=kwargs.get("time", "24:00:00"),
+            com_relpath=os.path.relpath(com_path, slurm_dir),
+        )
 
     # M-18 validation above intentionally completes before this first mutation.
     # A stale/damaged COM log must not prune good scripts, create a directory, or
     # overwrite the prior SLURM write log with jobs that cannot run.
     ensure_dir(slurm_dir)
+
+    if manifest is not None:
+        remove_artifacts_by_kind(manifest_path, "sh")
 
     expected_scripts = {
         os.path.normcase(os.path.abspath(os.path.join(
@@ -185,16 +310,48 @@ def write_slurm_scripts(
             os.remove(stale_path)
 
     rows = []
-    for com_path in com_paths:
+    for item in prepared:
+        com_path = item["com_path"]
+        com_artifact = item["artifact"]
         jobname = os.path.splitext(os.path.basename(com_path))[0]
         sh_path = os.path.join(slurm_dir, f"{jobname}.sh")
 
         existed = os.path.exists(sh_path) and os.path.getsize(sh_path) > 0
-        write_slurm_script(jobname, slurm_dir, com_path=com_path, **kwargs)
+        linked_kwargs = {}
+        sh_artifact_id = ""
+        if manifest is not None:
+            sh_artifact_id = stable_record_id(
+                manifest["run_id"], "sh", com_artifact["artifact_id"]
+            )
+            linked_kwargs = {
+                "run_id": manifest["run_id"],
+                "artifact_id": sh_artifact_id,
+                "source_com_relative_path": com_artifact["relative_path"],
+                "source_com_sha256": com_artifact["sha256"],
+            }
+        write_slurm_script(
+            jobname, slurm_dir, com_path=com_path, **linked_kwargs, **kwargs
+        )
+        sh_digest = ""
+        if manifest is not None:
+            sh_digest = record_child_artifact(
+                manifest_path,
+                kind="sh",
+                artifact_id=sh_artifact_id,
+                parent_artifact_id=com_artifact["artifact_id"],
+                conformer_record_id=com_artifact["conformer_record_id"],
+                path=sh_path,
+            )
         rows.append({
+            "run_id": "" if manifest is None else manifest["run_id"],
+            "artifact_id": sh_artifact_id,
+            "config_hash": "" if manifest is None else manifest["config_hash"],
             "jobname": jobname,
+            "com_artifact_id": "" if com_artifact is None else com_artifact["artifact_id"],
             "com_path": com_path,
+            "com_sha256": "" if com_artifact is None else com_artifact["sha256"],
             "sh_path": sh_path,
+            "sh_sha256": sh_digest,
             "status": "OVERWROTE" if existed else "WROTE",
         })
 

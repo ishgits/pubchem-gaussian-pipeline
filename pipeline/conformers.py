@@ -28,6 +28,18 @@ import os
 
 import pandas as pd
 
+from .manifest import (
+    assert_stage_configuration,
+    find_artifact,
+    find_conformer_record,
+    load_manifest,
+    molecule_identity_hash,
+    record_conformer_xyz,
+    relative_artifact_path,
+    remove_conformer_lineage,
+    sha256_file,
+    stable_record_id,
+)
 from .utils import ensure_dir, normalize_cid, pipeline_provenance, sanitize_basename
 
 # Locked defaults (docs/implementation-plan.md v2 — confirm at approval).
@@ -35,6 +47,7 @@ N_GENERATE = 20
 TOP_N = 3
 RMSD_PRUNE = 0.5  # Ångström
 SEED = 42
+METHOD_POLICY = "MMFF94 preferred; UFF recorded fallback"
 
 # Force-field optimization iteration budgets (M-04). The first pass uses
 # FF_MAXITERS; any conformer still flagged not-converged is retried once with
@@ -372,12 +385,16 @@ def _write_xyz(
 
 # Column order for conformer_log.csv (one row per kept conformer).
 _LOG_COLUMNS = [
+    "run_id",
+    "artifact_id",
+    "config_hash",
     "name",
     "cid",
     "smiles",
     "conformer_id",
     "rel_energy_kcalmol",
     "xyz_path",
+    "xyz_sha256",
     "rdkit_version",
     "pipeline_version",
     "pipeline_commit",
@@ -425,8 +442,8 @@ def _row_config_matches(row: dict, config: dict) -> bool:
     (seed/n_generate/top_n) and strings (`pipeline_version`, `rdkit_version`) are
     compared exactly. When both source commits are available they must also match;
     a dirty commit on either side always invalidates reuse because the marker does
-    not identify the uncommitted content (M-20). If either commit is unavailable,
-    the documented pipeline-version fallback remains. Per-molecule identity
+    not identify the uncommitted content (M-20). Either unavailable commit also
+    disables reuse; there is no version-only fallback. Per-molecule identity
     (`cid`/`smiles`) is validated by the caller, not here.
     """
     try:
@@ -445,11 +462,62 @@ def _row_config_matches(row: dict, config: dict) -> bool:
 
     row_commit = _commit_key(row.get("pipeline_commit"))
     config_commit = _commit_key(config.get("pipeline_commit"))
+    if not row_commit or not config_commit:
+        return False
     if row_commit.endswith(".dirty") or config_commit.endswith(".dirty"):
         return False
-    if row_commit and config_commit and row_commit != config_commit:
+    if row_commit != config_commit:
         return False
     return True
+
+
+def _row_manifest_matches(row: dict, manifest_path: str, manifest: dict) -> bool:
+    """Validate one retained XYZ row against exact manifest identity and bytes."""
+    try:
+        if str(row["run_id"]) != manifest["run_id"]:
+            return False
+        if str(row["config_hash"]) != manifest["config_hash"]:
+            return False
+        artifact_id = str(row["artifact_id"])
+        artifact = find_artifact(manifest, artifact_id)
+        if artifact["kind"] != "xyz":
+            return False
+        molecule, conformer = find_conformer_record(
+            manifest, artifact["conformer_record_id"]
+        )
+        if str(row.get("name")) != molecule["molecule_name"]:
+            return False
+        if not _row_identity_matches(
+            row, molecule["CID"], molecule["IsomericSMILES"]
+        ):
+            return False
+        if _integer_key(row.get("conformer_id")) != conformer["conformer_id"]:
+            return False
+        if str(row.get("method")) != conformer["method"]:
+            return False
+        if _integer_key(row.get("n_generated")) != conformer["n_generated"]:
+            return False
+        if _integer_key(row.get("n_kept")) != conformer["n_kept"]:
+            return False
+        if not math.isclose(
+            float(row.get("rel_energy_kcalmol")),
+            float(conformer["relative_energy_kcalmol"]),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            return False
+        converged_value = row.get("converged")
+        if isinstance(converged_value, str):
+            converged_value = converged_value.strip().lower() in {"true", "1", "yes"}
+        if bool(converged_value) != conformer["converged"]:
+            return False
+        if str(row["xyz_sha256"]) != artifact["sha256"]:
+            return False
+        if relative_artifact_path(str(row["xyz_path"]), manifest_path) != artifact["relative_path"]:
+            return False
+        return sha256_file(str(row["xyz_path"])) == artifact["sha256"]
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
 
 
 def _cid_key(x):
@@ -503,7 +571,9 @@ def _integer_key(value):
     return int(number)
 
 
-def _resume_group_is_complete(rows: list[dict]) -> bool:
+def _resume_group_is_complete(
+    rows: list[dict], manifest_path: str | None = None, manifest: dict | None = None
+) -> bool:
     """
     Validate that one molecule's resume rows form a complete conformer set.
 
@@ -536,7 +606,13 @@ def _resume_group_is_complete(rows: list[dict]) -> bool:
         if not _row_xyz_present(row):
             return False
         xyz_paths.append(os.path.normcase(os.path.abspath(str(row["xyz_path"]))))
-    return len(set(xyz_paths)) == len(xyz_paths)
+    if len(set(xyz_paths)) != len(xyz_paths):
+        return False
+    if manifest_path is not None:
+        manifest = manifest or load_manifest(manifest_path)
+        if not all(_row_manifest_matches(row, manifest_path, manifest) for row in rows):
+            return False
+    return True
 
 
 def _group_identity_is_consistent(rows: list[dict]) -> bool:
@@ -556,10 +632,15 @@ def _group_identity_is_consistent(rows: list[dict]) -> bool:
     )
 
 
-def _carry_forward_group_is_valid(rows: list[dict], config: dict) -> bool:
+def _carry_forward_group_is_valid(
+    rows: list[dict],
+    config: dict,
+    manifest_path: str | None = None,
+    manifest: dict | None = None,
+) -> bool:
     """Validate an unrequested group before append-mode carry-forward (M-15)."""
     return (
-        _resume_group_is_complete(rows)
+        _resume_group_is_complete(rows, manifest_path, manifest)
         and _group_identity_is_consistent(rows)
         and all(_row_config_matches(row, config) for row in rows)
         # The commit is best-effort and may be blank, but the field itself must
@@ -600,7 +681,12 @@ def validate_unique_output_basenames(labels: list[str]) -> None:
 
 
 def _resume_partition(
-    existing, config: dict, requested: dict, preserve_unrequested: bool = False
+    existing,
+    config: dict,
+    requested: dict,
+    preserve_unrequested: bool = False,
+    manifest_path: str | None = None,
+    manifest: dict | None = None,
 ):
     """
     Split an existing conformer_log into resumable, carry-forward, and stale sets.
@@ -640,7 +726,9 @@ def _resume_partition(
     for name, rows in groups.items():
         if name not in requested:
             if preserve_unrequested:
-                if _carry_forward_group_is_valid(rows, config):
+                if _carry_forward_group_is_valid(
+                    rows, config, manifest_path, manifest
+                ):
                     kept_rows.extend(rows)
                 else:
                     invalid_retained[name] = (
@@ -650,7 +738,7 @@ def _resume_partition(
             continue
         cid = requested[name].get("cid")
         smiles = requested[name].get("smiles")
-        if _resume_group_is_complete(rows) and all(
+        if _resume_group_is_complete(rows, manifest_path, manifest) and all(
             _row_config_matches(r, config)
             and _row_identity_matches(r, cid, smiles)
             for r in rows
@@ -672,6 +760,7 @@ def search_conformers(
     rmsd_prune: float = RMSD_PRUNE,
     seed: int = SEED,
     append: bool = False,
+    manifest_path: str = "run_manifest.json",
 ) -> pd.DataFrame:
     """
     Generate, rank, and record the top-*top_n* distinct conformers per molecule.
@@ -773,6 +862,7 @@ def search_conformers(
 
     # This run's conformer-search configuration; resumed rows must match it.
     run_config = {
+        "method_policy": METHOD_POLICY,
         "seed": seed,
         "n_generate": n_generate,
         "top_n": top_n,
@@ -781,6 +871,22 @@ def search_conformers(
         "pipeline_commit": pipeline_commit,
         "rdkit_version": rdkit_ver,
     }
+    manifest_config = {
+        key: run_config[key]
+        for key in ("method_policy", "seed", "n_generate", "top_n", "rmsd_prune")
+    }
+    manifest = assert_stage_configuration(
+        manifest_path, "conformer", manifest_config
+    )
+    for field, actual in (
+        ("pipeline_version", pipeline_version),
+        ("pipeline_commit", pipeline_commit),
+        ("rdkit_version", rdkit_ver),
+    ):
+        if str(manifest[field]) != str(actual):
+            raise ValueError(
+                f"Runtime {field} disagrees with run manifest; create a new manifest."
+            )
     # Per-molecule identity requested this run (B-02): name → {cid, smiles}. Resume
     # matches recorded rows against the requested molecule's identity, so a
     # corrected CID/SMILES under an unchanged name regenerates instead of reusing
@@ -793,6 +899,28 @@ def search_conformers(
         for _, row in molecule_table.iterrows()
         if row.get("name") is not None
     }
+    requested_manifest_records = [
+        {
+            "molecule_name": name,
+            "CID": _cid_key(identity["cid"]),
+            "IsomericSMILES": _smiles_key(identity["smiles"]),
+            "molecule_identity_hash": molecule_identity_hash(
+                name, identity["cid"], identity["smiles"]
+            ),
+        }
+        for name, identity in requested.items()
+    ]
+    configured_records = manifest["configuration"]["molecules"]
+    configured_identities = {
+        record["molecule_identity_hash"] for record in configured_records
+    }
+    requested_identities = {
+        record["molecule_identity_hash"] for record in requested_manifest_records
+    }
+    if not requested_identities.issubset(configured_identities):
+        raise ValueError(
+            "Runtime molecule identities disagree with run manifest; create a new manifest."
+        )
 
     # Resume-safe (M-09 / B-02 / M-15): only skip a requested molecule whose
     # existing rows were
@@ -805,7 +933,12 @@ def search_conformers(
         if existing is None:
             existing = pd.read_csv(log_csv)
         done_names, log_rows, stale_names, invalid_retained = _resume_partition(
-            existing, run_config, requested, preserve_unrequested=append
+            existing,
+            run_config,
+            requested,
+            preserve_unrequested=append,
+            manifest_path=manifest_path,
+            manifest=manifest,
         )
         if invalid_retained:
             details = "; ".join(
@@ -830,6 +963,18 @@ def search_conformers(
     else:
         done_names = set()
         log_rows = []
+
+    # A molecule being regenerated replaces its complete prior lineage in this
+    # same immutable run.  This happens only after all append/resume validation.
+    names_to_replace = set(current_labels) - set(done_names)
+    if not append:
+        names_to_replace.update(
+            molecule["molecule_name"]
+            for molecule in manifest["molecules"]
+            if molecule["molecule_name"] not in done_names
+        )
+    remove_conformer_lineage(manifest_path, names_to_replace)
+    manifest = load_manifest(manifest_path)
 
     # All append validation above is intentionally complete before the first
     # output mutation (M-15). An invalid retained group must leave the prior log,
@@ -906,22 +1051,51 @@ def search_conformers(
             rel_e = energies_kcal[conf_idx] - e_min
             is_converged = bool(converged[conf_idx])
             unconv_tag = "" if is_converged else f" {UNCONVERGED_FF_SEED}"
+            molecule_hash = molecule_identity_hash(name, cid, smiles)
+            conformer_record_id = stable_record_id(
+                manifest["run_id"], "conformer", f"{molecule_hash}:{ii}"
+            )
+            artifact_id = stable_record_id(
+                manifest["run_id"], "xyz", conformer_record_id
+            )
             _write_xyz(
                 xyz_path,
                 coords_list[conf_idx],
                 comment=(
-                    f"{base} c{ii:02d} dE={rel_e:.4f} kcal/mol "
-                    f"method={method} rdkit={rdkit_ver} seed={seed} "
-                    f"pver={pipeline_version} pcommit={pipeline_commit}{unconv_tag}"
+                    f"run_id={manifest['run_id']} artifact_id={artifact_id} "
+                    f"config_hash={manifest['config_hash']} conformer_id={ii} "
+                    f"relative_energy_kcalmol={rel_e:.6f} method={method} "
+                    f"pipeline_version={pipeline_version} rdkit_version={rdkit_ver}"
+                    f"{unconv_tag}"
                 ),
             )
+            recorded_conformer_id, xyz_digest = record_conformer_xyz(
+                manifest_path,
+                name=str(name),
+                cid=cid,
+                smiles=str(smiles),
+                conformer_id=ii,
+                method=method,
+                n_generated=n_generated,
+                n_kept=n_kept,
+                relative_energy_kcalmol=round(rel_e, 6),
+                converged=is_converged,
+                xyz_path=xyz_path,
+                artifact_id=artifact_id,
+            )
+            if recorded_conformer_id != conformer_record_id:
+                raise ValueError("Manifest conformer ID changed during XYZ recording.")
             log_rows.append({
+                "run_id": manifest["run_id"],
+                "artifact_id": artifact_id,
+                "config_hash": manifest["config_hash"],
                 "name": name,
                 "cid": cid,
                 "smiles": smiles,
                 "conformer_id": ii,
                 "rel_energy_kcalmol": round(rel_e, 6),
                 "xyz_path": xyz_path,
+                "xyz_sha256": xyz_digest,
                 "rdkit_version": rdkit_ver,
                 "pipeline_version": pipeline_version,
                 "pipeline_commit": pipeline_commit,

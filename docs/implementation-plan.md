@@ -1,74 +1,187 @@
 # implementation-plan.md
 
-> Canonical v2 plan. Approved by Ish before implementation; works against
-> `architecture.md` (v2). The original draft and the per-round remediation plans
-> are archived under `docs/review-history/v2/`.
+> Frozen v2.0 release-completion plan approved by Ish on 2026-07-13. It
+> supersedes the earlier open-ended provenance interpretation while preserving
+> the implemented conformer science. Historical plans remain under
+> `docs/review-history/v2/`.
 
 ## Objective
 
-Add a simple RDKit conformer-search stage: generate an ensemble, MMFF-rank it,
-carry the top 3 distinct conformers per molecule into Gaussian input generation,
-with recorded provenance. No gating, no xTB, no energy-window logic. Ship it as
-the released v2.0.0 default alongside run-scoped, submission-independent SLURM
-scripts and identity/config-aware resume.
+Complete v2.0.0 against the manifest-centric contract in
+`docs/release-contract-v2.0.md`, close the remaining one-to-one SLURM mapping
+gap, remove unverifiable no-git cache reuse, and run one holistic final audit.
 
-## Locked defaults
+The goal is not to place every conformer-search knob inside every artifact. The
+goal is a complete authoritative manifest plus stable artifact linkage.
 
-`N_GENERATE=20`, `TOP_N=3`, `RMSD_PRUNE=0.5` Å, `SEED=42`, ranking=MMFF94
-(UFF logged fallback). Energy units kcal/mol throughout the conformer stage.
+## Locked scientific defaults
 
-## Tasks (ordered, each independently verifiable)
+```text
+N_GENERATE=20
+TOP_N=3
+RMSD_PRUNE=0.5 Å
+SEED=42
+MMFF94 preferred
+UFF recorded fallback
+force-field energy unit=kcal/mol
+```
 
-1. **`pipeline/conformers.py` — pure ranking helper.** `select_top_n(energies_kcal,
-   n)` returns lowest-energy-first indices. Acceptance: unit test on a synthetic
-   list; no RDKit needed.
-2. **RDKit embed + rank core.** `generate_conformers(smiles, n_generate,
-   rmsd_prune, seed)`: ETKDGv3 `EmbedMultipleConfs(pruneRmsThresh, randomSeed)`,
-   MMFF94 optimize + score, UFF fallback with a logged warning. Acceptance: a
-   seeded n-butane test asserts ≥1 conformer and a deterministic lowest-energy
-   index.
-3. **Batch `search_conformers(molecule_table, ...)`.** Per row: read
-   `IsomericSMILES`, generate, rank, keep top 3 distinct, write `{base}_c{ii}.xyz`,
-   append provenance rows to `conformer_log.csv`; failures →
-   `conformer_search_failed.csv`. Acceptance: a 2-molecule run (adenine, ribose)
-   — adenine collapses to 1 row, ribose ≤3 rows, provenance populated, ΔE kcal/mol.
-4. **Extend `gaussian.py` to consume conformers.** Write one `.com` per row as
-   `{base}_c{ii}_F.com`, preserve the Link1 section, write conformer id + ΔE into
-   the title. Acceptance: 3 rows → 3 distinct `.com` files, intact Link1.
-5. **Reproducibility check.** Validation = same seed reproduces the same selected
-   conformers (not "embedding succeeded"). Acceptance: rerun-with-same-seed test.
-6. **Environment + CI.** Add `rdkit` to `environment.yml` and the CI install step.
-   Acceptance: `review-readiness` stays green.
-7. **Release hardening (v2.0.0).** XYZ parsing is by physical line (never drops an
-   atom); resume is identity/config/RDKit-version aware and XYZ-existence checked;
-   SLURM scripts resolve their `.com` relative to their own location and default
-   to the current run's `com_write_log.csv`, overwriting stale scripts; parameters
-   are validated at entry; generated outputs are untracked and gitignored.
-   Acceptance: the round-04 verify gate (see `implementation-status.md`).
-8. **Docs + status + versioning.** `pipeline.__version__ = "2.0.0"`, PubChem UA
-   `gaussian-input-pipeline/2.0`; README leads with the RDKit flow (Open Babel
-   demoted to a labeled legacy section); `implementation-status.md` current.
+Approved judgments: PubChem stereo SMILES is authoritative; undefined stereo is
+skipped; no post-optimization RMSD re-pruning; force-field ΔE is compared only
+within one molecule and one method; Gaussian charge/multiplicity remains
+explicit.
 
-## Explicitly out of scope
+## Ordered release tasks
 
-Rotatable-bond gating; xTB/CREST; energy-window logic; Boltzmann/entropy
-weighting; solvent-aware search; running or parsing Gaussian; changing the level
-of theory or the Link1 contract; the `runs/<study>/` directory redesign; a fuller
-resume key (`pipeline_commit` in-key, row-count reconcile, duplicate-label
-re-keying); version/commit provenance in `com_write_log.csv` /
-`sdf_download_log.csv`.
+### 1. Canonical manifest utilities
 
-## Files expected to change
+Implement `run_manifest.json` with:
 
-- `pipeline/conformers.py` (new), `pipeline/gaussian.py`, `pipeline/slurm.py`,
-  `pipeline/pubchem.py`, `pipeline/__init__.py`.
-- `environment.yml`, `.github/workflows/review-readiness.yml`, `.gitignore`.
-- `tests/test_conformers.py` (new), `tests/test_gaussian.py`, `tests/test_slurm.py`.
-- `notebooks/run_pipeline.ipynb`, `README.md`, `WORKFLOW.md`, `AGENTS.md`,
-  `docs/architecture.md`, `docs/implementation-plan.md`,
-  `docs/implementation-status.md`.
+- schema version, immutable `run_id`, and deterministic `config_hash`;
+- complete run, molecule, conformer, Gaussian, and SLURM configuration;
+- artifact lineage, relative paths, and SHA-256 file hashes;
+- canonical JSON serialization that excludes timestamps, absolute
+  machine-specific paths, and output file hashes from `config_hash`.
 
-## Escalate, don't decide
+Acceptance:
 
-If MMFF params are missing for a target species, record whether UFF-fallback was
-used or the molecule was skipped — never silently substitute chemistry.
+- identical canonical configuration yields the same `config_hash`;
+- scientifically relevant configuration changes alter it;
+- ordering-only differences do not alter it;
+- duplicate IDs or records are rejected.
+
+### 2. Conformer-stage manifest linkage
+
+Generate stable conformer and XYZ artifact IDs. Write the required XYZ metadata:
+
+```text
+run_id artifact_id config_hash conformer_id relative_energy_kcalmol
+method pipeline_version rdkit_version
+```
+
+Record the complete search configuration and XYZ SHA-256 in the manifest.
+Maintain `conformer_log.csv` as a manifest-consistent operational index.
+
+Acceptance:
+
+- every conformer row has one unique XYZ artifact;
+- manifest and CSV identity/config values agree;
+- XYZ file hash verifies;
+- the full search configuration is present in the manifest, not necessarily
+  duplicated in the XYZ comment.
+
+### 3. Gaussian-stage manifest linkage
+
+Require and forward run/artifact/config identity for every conformer-derived COM.
+Write the required COM title metadata:
+
+```text
+run_id artifact_id config_hash conformer_id relative_energy_kcalmol
+pipeline_version rdkit_version
+```
+
+Record parent XYZ artifact ID, full Gaussian configuration, relative COM path,
+and COM SHA-256 in the manifest and `com_write_log.csv`.
+
+Acceptance:
+
+- a COM cannot be generated without valid manifest linkage;
+- route lines, charge/multiplicity, coordinates, checkpoint names, and Link1 are
+  unchanged;
+- absence of duplicated `n_generate`, `top_n`, or `rmsd_prune` in the COM is
+  allowed because the manifest contains them.
+
+### 4. SLURM one-to-one mapping and linkage
+
+Before mutation, validate every log-driven COM input:
+
+- nonblank, existing regular file, and size greater than zero;
+- unique normalized source path;
+- unique destination SH path;
+- no two COM basenames collapse to one script;
+- COM hash agrees with the manifest.
+
+Write `run_id`, SH `artifact_id`, source COM relative path, and source COM hash in
+each script header. Record the SH hash in the manifest.
+
+Acceptance:
+
+- two different `same.com` paths fail before mutation;
+- duplicate source paths fail;
+- zero-byte COM fails;
+- valid N COM inputs create N unique SH files and N unique log/manifest records;
+- failing validation preserves existing scripts and logs byte-for-byte.
+
+### 5. Strict reuse policy
+
+Remove version-only resume and append fallback. Reuse requires the same clean,
+nonblank pipeline commit on both the retained record and current run, plus all
+existing identity/config/group/file/hash checks.
+
+Acceptance:
+
+- matching clean commit may reuse;
+- changed commit regenerates;
+- dirty commit regenerates;
+- missing commit regenerates;
+- source ZIP or no-git execution never reuses cached conformers.
+
+### 6. Notebook and user documentation
+
+Update the notebook and README so users:
+
+- generate the manifest before artifacts and finalize it with file hashes;
+- transfer/archive the complete run package;
+- understand that isolated artifacts require the matching manifest;
+- understand that legacy v1.1 is exempt from v2 guarantees;
+- understand that no-git execution disables reuse.
+
+### 7. Mechanical invariants and tests
+
+Add offline tests and invariant guards for:
+
+- manifest schema, canonical hash, IDs, lineage, and file hashes;
+- required XYZ/COM/SH linkage fields;
+- one-to-one mappings and destination collisions;
+- zero-byte inputs;
+- failure before mutation;
+- no-clean-commit regeneration;
+- zero-job manifest behavior;
+- clean-archive reproducibility.
+
+The invariant checker should enforce the frozen matrix, not an ever-expanding
+requirement to duplicate all manifest fields into every artifact.
+
+### 8. Status, finding disposition, and final review
+
+Update `docs/implementation-status.md` with verified evidence.
+
+- M-21 and M-22 are **rejected as written** because they require duplicating the
+  full search configuration inside each COM/XYZ, contrary to the approved
+  manifest-centric contract. Their underlying traceability concern is accepted
+  and resolved only when tasks 1–3 are complete.
+- The SLURM basename collision and zero-byte behavior are accepted and must be
+  fixed under task 4.
+- Recommendations outside the frozen contract are recorded for v2.1.
+
+Run one holistic base-to-head audit and one final re-review under the stop rule.
+
+## Required verification
+
+```bash
+pytest tests/ -q
+python scripts/check_invariants.py
+git diff --check
+test -z "$(git ls-files -ci --exclude-standard)"
+```
+
+Repeat tests and invariants from a clean `git archive`. Before tagging, test the
+actual pinned dependency stack or change the lock-file wording so it does not
+claim an unperformed verification.
+
+## Explicitly deferred to v2.1
+
+`runs/<study>/<run_id>/`, automatic collision-proof filenames, xTB/CREST,
+energy-window selection, post-optimization RMSD re-pruning, solvent-aware search,
+Gaussian execution/parsing, and upgrading the legacy Open Babel path to the v2
+manifest contract.

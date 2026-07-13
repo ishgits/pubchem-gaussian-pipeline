@@ -105,8 +105,8 @@ class TestGaussianProvenanceGuard:
 
     def test_detects_missing_required_source_version(self):
         broken = self._source().replace(
-            '    "rdkit_version",\n)\n\n\ndef _optional_text',
-            ')\n\n\ndef _optional_text',
+            '    "rdkit_version",\n    "xyz_sha256",',
+            '    "xyz_sha256",',
             1,
         )
         problems = check_invariants._gaussian_provenance_problems(broken)
@@ -167,7 +167,7 @@ class TestAppendIntegrityGuard:
 
     def test_detects_missing_complete_group_check(self):
         broken = self._source().replace(
-            "        _resume_group_is_complete(rows)\n",
+            "        _resume_group_is_complete(rows, manifest_path, manifest)\n",
             "        True\n",
             1,
         )
@@ -198,6 +198,15 @@ class TestAppendIntegrityGuard:
         problems = check_invariants._append_integrity_problems(broken)
         assert any("omits dirty-commit rejection" in p for p in problems)
 
+    def test_detects_missing_blank_commit_rejection(self):
+        broken = self._source().replace(
+            "    if not row_commit or not config_commit:\n        return False\n",
+            "",
+            1,
+        )
+        problems = check_invariants._append_integrity_problems(broken)
+        assert any("permits a missing commit" in p for p in problems)
+
     def test_detects_missing_commit_in_run_config(self):
         broken = self._source().replace(
             '        "pipeline_commit": pipeline_commit,\n', "", 1
@@ -207,9 +216,42 @@ class TestAppendIntegrityGuard:
 
     def test_detects_missing_rdkit_xyz_token(self):
         broken = self._source().replace(
-            'f"method={method} rdkit={rdkit_ver} seed={seed} "',
-            'f"method={method} seed={seed} "',
+            'f"pipeline_version={pipeline_version} rdkit_version={rdkit_ver}"',
+            'f"pipeline_version={pipeline_version}"',
             1,
         )
         problems = check_invariants._append_integrity_problems(broken)
-        assert any("XYZ provenance omits rdkit=" in p for p in problems)
+        assert any("XYZ provenance omits rdkit_version=" in p for p in problems)
+
+
+class TestFrozenManifestMatrixGuard:
+    @staticmethod
+    def _sources():
+        root = SCRIPT.parents[1] / "pipeline"
+        return tuple(
+            (root / name).read_text()
+            for name in ("manifest.py", "conformers.py", "gaussian.py", "slurm.py")
+        )
+
+    def test_current_sources_pass(self):
+        assert check_invariants._frozen_matrix_problems(*self._sources()) == []
+
+    def test_detects_missing_xyz_linkage_field(self):
+        manifest, conformers, gaussian, slurm = self._sources()
+        conformers = conformers.replace(
+            'f"relative_energy_kcalmol={rel_e:.6f} method={method} "',
+            'f"relative_energy={rel_e:.6f} method={method} "',
+            1,
+        )
+        problems = check_invariants._frozen_matrix_problems(
+            manifest, conformers, gaussian, slurm
+        )
+        assert any("XYZ linkage omits" in problem for problem in problems)
+
+    def test_detects_missing_zero_byte_guard(self):
+        manifest, conformers, gaussian, slurm = self._sources()
+        slurm = slurm.replace("zero-byte com_path", "empty input", 1)
+        problems = check_invariants._frozen_matrix_problems(
+            manifest, conformers, gaussian, slurm
+        )
+        assert any("zero-byte com_path" in problem for problem in problems)

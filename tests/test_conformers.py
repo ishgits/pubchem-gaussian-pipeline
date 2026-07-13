@@ -13,6 +13,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from manifest_helpers import ensure_manifest
+
 from pipeline.conformers import (
     UNCONVERGED_FF_SEED,
     _carry_forward_group_is_valid,
@@ -161,11 +163,13 @@ class TestSearchConformers:
         from pipeline.conformers import search_conformers
 
         table = self._table()
+        manifest_path = ensure_manifest(tmp_path, table)
         log = search_conformers(
             table,
             xyz_dir=str(tmp_path / "conf_xyz"),
             log_csv=str(tmp_path / "conformer_log.csv"),
             failed_csv=str(tmp_path / "conformer_search_failed.csv"),
+            manifest_path=manifest_path,
         )
 
         # Adenine (rigid) collapses to a single conformer row.
@@ -200,11 +204,13 @@ class TestSearchConformers:
         ])
         failed_csv = tmp_path / "conformer_search_failed.csv"
         xyz_dir = tmp_path / "conf_xyz"
+        manifest_path = ensure_manifest(tmp_path, table)
         log = search_conformers(
             table,
             xyz_dir=str(xyz_dir),
             log_csv=str(tmp_path / "conformer_log.csv"),
             failed_csv=str(failed_csv),
+            manifest_path=manifest_path,
         )
         assert len(log) == 0
         assert failed_csv.exists()
@@ -225,11 +231,13 @@ class TestSearchConformers:
         ])
         failed_csv = tmp_path / "conformer_search_failed.csv"
         xyz_dir = tmp_path / "conf_xyz"
+        manifest_path = ensure_manifest(tmp_path, table)
         log = search_conformers(
             table,
             xyz_dir=str(xyz_dir),
             log_csv=str(tmp_path / "conformer_log.csv"),
             failed_csv=str(failed_csv),
+            manifest_path=manifest_path,
         )
         # Adenine (no stereo) proceeds; the undefined-stereo sugar is skipped.
         assert set(log["name"]) == {"Adenine"}
@@ -253,12 +261,19 @@ class TestSearchConformers:
         log_csv = tmp_path / "conformer_log.csv"
         xyz_dir = tmp_path / "conf_xyz"
         table = self._table()
+        manifest_path = ensure_manifest(
+            tmp_path,
+            table,
+            pipeline_version="2.0.0",
+            pipeline_commit="test-clean-commit",
+        )
 
         first = C.search_conformers(
             table,
             xyz_dir=str(xyz_dir),
             log_csv=str(log_csv),
             failed_csv=str(tmp_path / "fail.csv"),
+            manifest_path=manifest_path,
         )
         # Rerun with the same table: nothing new appended (both already done).
         second = C.search_conformers(
@@ -266,6 +281,7 @@ class TestSearchConformers:
             xyz_dir=str(xyz_dir),
             log_csv=str(log_csv),
             failed_csv=str(tmp_path / "fail.csv"),
+            manifest_path=manifest_path,
         )
         assert len(second) == len(first)
 
@@ -279,24 +295,33 @@ class TestReproducibility:
         pytest.importorskip("rdkit")
         from pipeline.conformers import search_conformers
 
-        table_kwargs = dict(
-            xyz_dir=str(tmp_path / "xyz_a"),
-            failed_csv=str(tmp_path / "fail_a.csv"),
-        )
         import pandas as pd
         table = pd.DataFrame([
             {"name": "Ribose", "cid": 5779, "IsomericSMILES": RIBOSE_SMILES},
         ])
 
+        run_a = tmp_path / "run_a"
+        run_b = tmp_path / "run_b"
+        run_a.mkdir()
+        run_b.mkdir()
+        manifest_a = ensure_manifest(run_a, table)
+        manifest_b = ensure_manifest(run_b, table)
+
         log_a = search_conformers(
-            table, log_csv=str(tmp_path / "log_a.csv"), seed=42, **table_kwargs
+            table,
+            xyz_dir=str(run_a / "xyz"),
+            log_csv=str(run_a / "log.csv"),
+            failed_csv=str(run_a / "fail.csv"),
+            seed=42,
+            manifest_path=manifest_a,
         )
         log_b = search_conformers(
             table,
-            xyz_dir=str(tmp_path / "xyz_b"),
-            log_csv=str(tmp_path / "log_b.csv"),
-            failed_csv=str(tmp_path / "fail_b.csv"),
+            xyz_dir=str(run_b / "xyz"),
+            log_csv=str(run_b / "log.csv"),
+            failed_csv=str(run_b / "fail.csv"),
             seed=42,
+            manifest_path=manifest_b,
         )
 
         # Same seed → identical selected conformers (count + ΔE ranking).
@@ -324,6 +349,15 @@ class TestNotebookPathOffline:
             {"name": "Ribose", "cid": 5779, "IsomericSMILES": RIBOSE_SMILES},
         ])
         conf_log_csv = tmp_path / "conformer_log.csv"
+        route_opt = "# opt=(tight,calcfc) b3lyp/6-311++g(2df,2p) scrf=(iefpcm,solvent=water)"
+        route_freq = "# freq b3lyp/6-311++g(2df,2p) scrf=(iefpcm,solvent=water) temperature=298 Geom=AllChk Guess=Read"
+        manifest_path = ensure_manifest(
+            tmp_path,
+            df,
+            route_opt=route_opt,
+            route_freq=route_freq,
+            title_suffix="PCM 298 K 6-311++G(2df,2p)",
+        )
         conf_log = search_conformers(
             df,
             xyz_dir=str(tmp_path / "conformer_xyz"),
@@ -333,6 +367,7 @@ class TestNotebookPathOffline:
             top_n=3,
             rmsd_prune=0.5,
             seed=42,
+            manifest_path=manifest_path,
         )
         n = len(conf_log)
         assert 1 <= n <= 3  # ribose (flexible) → up to TOP_N distinct conformers
@@ -341,10 +376,11 @@ class TestNotebookPathOffline:
             conformer_log_csv=str(conf_log_csv),
             outdir=str(tmp_path / "gaussian_inputs"),
             log_csv=str(tmp_path / "com_write_log.csv"),
-            route_opt="# opt=(tight,calcfc) b3lyp/6-311++g(2df,2p) scrf=(iefpcm,solvent=water)",
-            route_freq="# freq b3lyp/6-311++g(2df,2p) scrf=(iefpcm,solvent=water) temperature=298 Geom=AllChk Guess=Read",
+            route_opt=route_opt,
+            route_freq=route_freq,
             title_suffix="PCM 298 K 6-311++G(2df,2p)",
             nproc=16,
+            manifest_path=manifest_path,
         )
         assert len(com_log) == n
 
@@ -492,12 +528,20 @@ class TestConvergenceBatch:
             lambda smiles, **kw: (coords, list(energies), "MMFF94", list(converged)),
         )
         table = pd.DataFrame([{"name": "Mol", "cid": 1, "IsomericSMILES": "C"}])
+        manifest_path = ensure_manifest(
+            tmp_path,
+            table,
+            top_n=top_n,
+            rdkit_version="test-rdkit",
+        )
+        self._manifest_path = manifest_path
         return C.search_conformers(
             table,
             xyz_dir=str(tmp_path / "xyz"),
             log_csv=str(tmp_path / "conformer_log.csv"),
             failed_csv=str(tmp_path / "fail.csv"),
             top_n=top_n,
+            manifest_path=manifest_path,
         )
 
     def test_mixed_keeps_only_converged_logged_true(self, tmp_path, monkeypatch):
@@ -543,6 +587,7 @@ class TestConvergenceBatch:
             log_csv=str(tmp_path / "com_write_log.csv"),
             route_opt="# opt b3lyp/6-31g(d)",
             route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            manifest_path=self._manifest_path,
         )
         assert len(com_log) == 1
         with open(com_log.iloc[0]["com_path"]) as f:
@@ -571,11 +616,17 @@ class TestProvenanceLogging:
             lambda smiles, **kw: (coords, [1.23], "MMFF94", [True]),
         )
         table = pd.DataFrame([{"name": "Water", "cid": 962, "IsomericSMILES": "O"}])
+        manifest_path = ensure_manifest(
+            tmp_path,
+            table,
+            rdkit_version="test-rdkit",
+        )
         return C.search_conformers(
             table,
             xyz_dir=str(tmp_path / "xyz"),
             log_csv=str(tmp_path / "conformer_log.csv"),
             failed_csv=str(tmp_path / "fail.csv"),
+            manifest_path=manifest_path,
         )
 
     def test_pipeline_version_on_every_row(self, tmp_path, monkeypatch):
@@ -596,9 +647,12 @@ class TestProvenanceLogging:
         log = self._run(tmp_path, monkeypatch)
         with open(log.iloc[0]["xyz_path"]) as f:
             comment = f.read().splitlines()[1]  # line 2 of an XYZ file is the comment
-        assert "pver=" in comment
-        assert "pcommit=" in comment
-        assert "rdkit=test-rdkit" in comment
+        for token in (
+            "run_id=", "artifact_id=", "config_hash=", "conformer_id=",
+            "relative_energy_kcalmol=", "method=", "pipeline_version=",
+            "rdkit_version=test-rdkit",
+        ):
+            assert token in comment
 
 
 # ---------------------------------------------------------------------------
@@ -642,10 +696,10 @@ class TestRowConfigMatches:
             self._row(pipeline_commit="def5678"), _CFG
         ) is False
 
-    def test_missing_pipeline_commit_uses_version_fallback(self):
+    def test_missing_pipeline_commit_disables_reuse(self):
         row = self._row()
         del row["pipeline_commit"]
-        assert _row_config_matches(row, _CFG) is True
+        assert _row_config_matches(row, _CFG) is False
 
     @pytest.mark.parametrize(
         ("row_commit", "config_commit"),
@@ -890,11 +944,11 @@ class TestCarryForwardGroupValidation:
             del row["pipeline_commit"]
         assert _carry_forward_group_is_valid(rows, _CFG) is False
 
-    def test_blank_commit_value_is_allowed(self, tmp_path):
+    def test_blank_commit_value_disables_reuse(self, tmp_path):
         rows = self._rows(tmp_path)
         for row in rows:
             row["pipeline_commit"] = ""
-        assert _carry_forward_group_is_valid(rows, _CFG) is True
+        assert _carry_forward_group_is_valid(rows, _CFG) is False
 
     def test_dirty_commit_group_is_not_reusable(self, tmp_path):
         rows = self._rows(tmp_path)
@@ -921,6 +975,8 @@ class TestResumeConfigValidationBatch:
         monkeypatch.setattr(
             C, "pipeline_provenance", lambda: ("2.0.0", pipeline_commit)
         )
+        self._rdkit_version = rdkit_version
+        self._pipeline_commit = pipeline_commit
 
         def gen(smiles, **kw):
             calls.append(smiles)
@@ -934,7 +990,7 @@ class TestResumeConfigValidationBatch:
 
         return pd.DataFrame([{"name": name, "cid": cid, "IsomericSMILES": smiles}])
 
-    def _kw(self, tmp_path, **over):
+    def _kw(self, tmp_path, manifest_table=None, **over):
         kw = dict(
             xyz_dir=str(tmp_path / "xyz"),
             log_csv=str(tmp_path / "conformer_log.csv"),
@@ -942,6 +998,18 @@ class TestResumeConfigValidationBatch:
             seed=42, n_generate=20, top_n=3, rmsd_prune=0.5,
         )
         kw.update(over)
+        table = self._table() if manifest_table is None else manifest_table
+        kw["manifest_path"] = ensure_manifest(
+            tmp_path,
+            table,
+            seed=kw["seed"],
+            n_generate=kw["n_generate"],
+            top_n=kw["top_n"],
+            rmsd_prune=kw["rmsd_prune"],
+            pipeline_version="2.0.0",
+            pipeline_commit=self._pipeline_commit,
+            rdkit_version=self._rdkit_version,
+        )
         return kw
 
     def test_matching_config_skips_regeneration(self, tmp_path, monkeypatch):
@@ -971,8 +1039,10 @@ class TestResumeConfigValidationBatch:
         # B-02: same name + knobs but a corrected CID must NOT reuse the geometry.
         calls = []
         C = self._patch(monkeypatch, calls)
-        C.search_conformers(self._table(cid=1), **self._kw(tmp_path))
-        log2 = C.search_conformers(self._table(cid=2), **self._kw(tmp_path))
+        first_table = self._table(cid=1)
+        second_table = self._table(cid=2)
+        C.search_conformers(first_table, **self._kw(tmp_path, manifest_table=first_table))
+        log2 = C.search_conformers(second_table, **self._kw(tmp_path, manifest_table=second_table))
         assert len(calls) == 2
         assert set(log2[log2["name"] == "Water"]["cid"].astype(int)) == {2}
 
@@ -980,8 +1050,10 @@ class TestResumeConfigValidationBatch:
         # B-02: same name + knobs but a corrected SMILES must regenerate.
         calls = []
         C = self._patch(monkeypatch, calls)
-        C.search_conformers(self._table(smiles="O"), **self._kw(tmp_path))
-        C.search_conformers(self._table(smiles="[OH2]"), **self._kw(tmp_path))
+        first_table = self._table(smiles="O")
+        second_table = self._table(smiles="[OH2]")
+        C.search_conformers(first_table, **self._kw(tmp_path, manifest_table=first_table))
+        C.search_conformers(second_table, **self._kw(tmp_path, manifest_table=second_table))
         assert len(calls) == 2
 
     def test_changed_rdkit_version_regenerates(self, tmp_path, monkeypatch):
@@ -1008,14 +1080,14 @@ class TestResumeConfigValidationBatch:
         C.search_conformers(self._table(), **self._kw(tmp_path))
         assert len(calls) == 2
 
-    def test_missing_pipeline_commit_keeps_version_fallback(
+    def test_missing_pipeline_commit_regenerates(
         self, tmp_path, monkeypatch
     ):
         calls = []
         C = self._patch(monkeypatch, calls, pipeline_commit="")
         C.search_conformers(self._table(), **self._kw(tmp_path))
         C.search_conformers(self._table(), **self._kw(tmp_path))
-        assert len(calls) == 1
+        assert len(calls) == 2
 
     def test_deleted_xyz_regenerates(self, tmp_path, monkeypatch):
         # B-02: identity + config match, but the recorded XYZ is gone → regenerate.
@@ -1085,6 +1157,9 @@ class TestPreserveUnrequestedBatch:
         return C
 
     def _kw(self, tmp_path, **over):
+        import pandas as pd
+
+        manifest_table = over.pop("manifest_table", None)
         kw = dict(
             xyz_dir=str(tmp_path / "xyz"),
             log_csv=str(tmp_path / "conformer_log.csv"),
@@ -1092,6 +1167,19 @@ class TestPreserveUnrequestedBatch:
             seed=42, n_generate=20, top_n=3, rmsd_prune=0.5,
         )
         kw.update(over)
+        if manifest_table is None:
+            manifest_table = pd.concat([self._two(), self._one()], ignore_index=True)
+        kw["manifest_path"] = ensure_manifest(
+            tmp_path,
+            manifest_table,
+            seed=kw["seed"],
+            n_generate=kw["n_generate"],
+            top_n=kw["top_n"],
+            rmsd_prune=kw["rmsd_prune"],
+            pipeline_version="2.0.0",
+            pipeline_commit="test-clean-commit",
+            rdkit_version="test-rdkit",
+        )
         return kw
 
     def _two(self):
@@ -1225,7 +1313,6 @@ class TestPreserveUnrequestedBatch:
 
         calls = []
         C = self._patch(monkeypatch, calls)
-        kw = self._kw(tmp_path)
         first = pd.DataFrame([{
             "name": prior_label,
             "cid": 1,
@@ -1236,6 +1323,10 @@ class TestPreserveUnrequestedBatch:
             "cid": 2,
             "IsomericSMILES": "N",
         }])
+        kw = self._kw(
+            tmp_path,
+            manifest_table=pd.concat([first, second], ignore_index=True),
+        )
         first_log = C.search_conformers(first, **kw)
         log_path = tmp_path / "conformer_log.csv"
         xyz_paths = [
@@ -1309,9 +1400,11 @@ class TestStaleFailedCsvCleared:
 
         # First run fails eligibility → a failure log is written.
         monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: "no IsomericSMILES")
-        C.search_conformers(
-            pd.DataFrame([{"name": "Bad", "cid": 1, "IsomericSMILES": None}]), **kw
-        )
+        bad_table = pd.DataFrame([{"name": "Bad", "cid": 1, "IsomericSMILES": None}])
+        bad_kw = dict(kw, manifest_path=ensure_manifest(
+            tmp_path / "bad_run", bad_table, rdkit_version="test-rdkit"
+        ))
+        C.search_conformers(bad_table, **bad_kw)
         assert failed_csv.exists()
 
         # Second run is clean → the stale failure log is cleared, not left behind.
@@ -1320,9 +1413,12 @@ class TestStaleFailedCsvCleared:
             C, "generate_conformers",
             lambda smiles, **k: ([[("O", 0.0, 0.0, 0.0)]], [0.0], "MMFF94", [True]),
         )
-        C.search_conformers(
-            pd.DataFrame([{"name": "Good", "cid": 2, "IsomericSMILES": "O"}]), **kw
-        )
+        good_table = pd.DataFrame([{"name": "Good", "cid": 2, "IsomericSMILES": "O"}])
+        good_kw = dict(kw, manifest_path=ensure_manifest(
+            tmp_path / "good_run", good_table, rdkit_version="test-rdkit"
+        ))
+        good_kw["xyz_dir"] = str(tmp_path / "good_run" / "xyz")
+        C.search_conformers(good_table, **good_kw)
         assert not failed_csv.exists()
 
 
@@ -1414,7 +1510,11 @@ class TestParameterValidation:
             {"name": "Water", "cid": 1, "IsomericSMILES": "O"},
             {"name": "Ammonia", "cid": 2, "IsomericSMILES": "N"},
         ])
-        out = C.search_conformers(table, **self._kw(tmp_path))
+        kw = self._kw(tmp_path)
+        kw["manifest_path"] = ensure_manifest(
+            tmp_path, table, rdkit_version="test-rdkit"
+        )
+        out = C.search_conformers(table, **kw)
         assert {os.path.basename(path) for path in out["xyz_path"]} == {
             "water_c00.xyz",
             "ammonia_c00.xyz",

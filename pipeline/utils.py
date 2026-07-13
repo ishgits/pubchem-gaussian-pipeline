@@ -11,7 +11,7 @@ import pandas as pd
 
 def git_short_sha(cwd: str | None = None) -> str:
     """
-    Best-effort short git SHA of the pipeline code's HEAD, for provenance (M-06).
+    Best-effort full git SHA of the pipeline code's HEAD, for provenance (M-06).
 
     Appends ``.dirty`` when the working tree has uncommitted changes (so an output
     produced from a modified tree is visibly *not* reproducible from the commit
@@ -30,7 +30,7 @@ def git_short_sha(cwd: str | None = None) -> str:
     root = cwd or os.path.dirname(os.path.abspath(__file__))
     try:
         rev = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
             cwd=root, capture_output=True, text=True, timeout=5,
         )
         if rev.returncode != 0:
@@ -55,7 +55,8 @@ def pipeline_provenance(cwd: str | None = None) -> tuple[str, str]:
     Return ``(pipeline_version, git_commit)`` for provenance logging (M-06).
 
     ``pipeline_version`` is ``pipeline.__version__`` (a manually bumped string);
-    ``git_commit`` is :func:`git_short_sha` (best-effort, possibly ``""``). Read
+    ``git_commit`` is :func:`git_short_sha` (the legacy helper name now returns
+    the full SHA; best-effort, possibly ``""``). Read
     the version lazily to avoid an import cycle with the package ``__init__``.
     """
     from . import __version__

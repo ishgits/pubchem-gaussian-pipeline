@@ -23,6 +23,8 @@ PIPELINE = ROOT / "pipeline"
 STATUS_DOC = ROOT / "docs" / "implementation-status.md"
 GAUSSIAN = PIPELINE / "gaussian.py"
 CONFORMERS = PIPELINE / "conformers.py"
+MANIFEST = PIPELINE / "manifest.py"
+SLURM = PIPELINE / "slurm.py"
 
 # 1) Placeholder science: real API results / coordinates / energies must never
 #    be replaced by hardcoded, illustrative, random, or mocked values in a
@@ -119,6 +121,7 @@ _GAUSSIAN_PROVENANCE_FIELDS = (
     "pipeline_commit",
     "rdkit_version",
 )
+_GAUSSIAN_LINKAGE_FIELDS = ("run_id", "artifact_id", "config_hash")
 
 
 def _function_runtime_literals(function: ast.FunctionDef) -> str:
@@ -164,7 +167,7 @@ def _gaussian_provenance_problems(text: str) -> list[str]:
             writer.args.posonlyargs + writer.args.args + writer.args.kwonlyargs
         )
     }
-    for field in _GAUSSIAN_PROVENANCE_FIELDS:
+    for field in _GAUSSIAN_PROVENANCE_FIELDS + _GAUSSIAN_LINKAGE_FIELDS:
         if field not in writer_args:
             problems.append(f"write_gaussian_com missing parameter {field}")
 
@@ -188,7 +191,11 @@ def _gaussian_provenance_problems(text: str) -> list[str]:
                 + direct_validator.args.kwonlyargs
             )
         }
-        for field in ("conformer_id", "pipeline_version", "rdkit_version"):
+        for field in (
+            "conformer_id", "pipeline_version", "rdkit_version",
+            "run_id", "artifact_id", "config_hash", "manifest_path",
+            "parent_artifact_id", "conformer_record_id",
+        ):
             if field not in direct_args:
                 problems.append(
                     f"direct conformer provenance validator missing parameter {field}"
@@ -219,7 +226,11 @@ def _gaussian_provenance_problems(text: str) -> list[str]:
             ):
                 continue
             normalized_names.add(node.args[0].id)
-        for field in ("pipeline_version", "rdkit_version"):
+        for field in (
+            "pipeline_version", "rdkit_version", "run_id", "artifact_id",
+            "config_hash", "manifest_path", "parent_artifact_id",
+            "conformer_record_id",
+        ):
             if field not in normalized_names:
                 problems.append(
                     f"direct conformer provenance does not require nonblank {field}"
@@ -240,7 +251,11 @@ def _gaussian_provenance_problems(text: str) -> list[str]:
             forwarded_names = {
                 arg.id for arg in node.args if isinstance(arg, ast.Name)
             }
-            for field in ("conformer_id", "pipeline_version", "rdkit_version"):
+            for field in (
+                "conformer_id", "pipeline_version", "rdkit_version",
+                "run_id", "artifact_id", "config_hash", "manifest_path",
+                "parent_artifact_id", "conformer_record_id",
+            ):
                 if field not in forwarded_names:
                     problems.append(
                         f"write_gaussian_com does not pass {field} to direct "
@@ -299,7 +314,10 @@ def _gaussian_provenance_problems(text: str) -> list[str]:
                 for elt in node.value.elts
                 if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
             }
-    for field in ("pipeline_version", "rdkit_version"):
+    for field in (
+        "run_id", "artifact_id", "config_hash", "pipeline_version",
+        "rdkit_version", "xyz_sha256",
+    ):
         if field not in required_columns:
             problems.append(f"required conformer provenance omits {field}")
 
@@ -405,6 +423,16 @@ def _append_integrity_problems(text: str) -> list[str]:
     }
     if not {"row", "config"}.issubset(commit_getters):
         problems.append("resume config matching omits pipeline_commit")
+    blank_commit_guards = {
+        node.operand.id
+        for node in ast.walk(config_match)
+        if isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.Not)
+        and isinstance(node.operand, ast.Name)
+        and node.operand.id in {"row_commit", "config_commit"}
+    }
+    if blank_commit_guards != {"row_commit", "config_commit"}:
+        problems.append("resume config matching permits a missing commit")
     if ".dirty" not in config_literals:
         problems.append("resume config matching omits dirty-commit rejection")
 
@@ -424,8 +452,8 @@ def _append_integrity_problems(text: str) -> list[str]:
         problems.append("carry-forward validation omits pipeline_commit field presence")
 
     search_literals = _function_runtime_literals(search)
-    if "rdkit=" not in search_literals:
-        problems.append("generated XYZ provenance omits rdkit= token")
+    if "rdkit_version=" not in search_literals:
+        problems.append("generated XYZ provenance omits rdkit_version= token")
 
     run_config_keys = set()
     for node in ast.walk(search):
@@ -503,6 +531,107 @@ def check_append_integrity() -> list[str]:
     ]
 
 
+# 6) Frozen manifest-centric v2.0 matrix. This intentionally checks only the
+# approved per-artifact linkage fields and authoritative manifest mechanisms;
+# it must not grow into a requirement to duplicate every search knob into XYZ
+# comments or COM title blocks.
+def _frozen_matrix_problems(
+    manifest_text: str,
+    conformer_text: str,
+    gaussian_text: str,
+    slurm_text: str,
+) -> list[str]:
+    problems = []
+    try:
+        conformer_tree = ast.parse(conformer_text)
+        gaussian_tree = ast.parse(gaussian_text)
+        slurm_tree = ast.parse(slurm_text)
+        conformer_functions = {
+            node.name: node for node in conformer_tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        gaussian_functions = {
+            node.name: node for node in gaussian_tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        slurm_functions = {
+            node.name: node for node in slurm_tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        xyz_runtime = _function_runtime_literals(conformer_functions["search_conformers"])
+        com_runtime = _function_runtime_literals(gaussian_functions["write_gaussian_com"])
+        sh_runtime = _function_runtime_literals(slurm_functions["write_slurm_script"])
+    except (KeyError, SyntaxError) as exc:
+        return [f"cannot parse frozen stage writers: {exc}"]
+    manifest_tokens = (
+        'MANIFEST_SCHEMA = "2.0"',
+        "def canonical_json(",
+        "def configuration_hash(",
+        "def stable_record_id(",
+        "def sha256_file(",
+        "def validate_manifest(",
+        "def record_conformer_xyz(",
+        "def record_child_artifact(",
+        '"molecule_identity_hash"',
+        '"conformer_record_id"',
+        '"parent_artifact_id"',
+        '"relative_path"',
+        '"sha256"',
+    )
+    for token in manifest_tokens:
+        if token not in manifest_text:
+            problems.append(f"manifest contract omits {token!r}")
+
+    xyz_fields = (
+        "run_id=", "artifact_id=", "config_hash=", "conformer_id=",
+        "relative_energy_kcalmol=", "method=", "pipeline_version=",
+        "rdkit_version=",
+    )
+    for token in xyz_fields:
+        if token not in xyz_runtime:
+            problems.append(f"XYZ linkage omits {token!r}")
+
+    com_fields = (
+        "run_id=", "artifact_id=", "config_hash=", "conformer_id=",
+        "relative_energy_kcalmol=", "pipeline_version=", "rdkit_version=",
+    )
+    for token in com_fields:
+        if token not in com_runtime:
+            problems.append(f"COM linkage omits {token!r}")
+    for token in ("manifest_path", "record_child_artifact", "sha256_file"):
+        if token not in gaussian_text:
+            problems.append(f"Gaussian manifest boundary omits {token!r}")
+
+    sh_fields = (
+        "# run_id=", "# artifact_id=", "# source_com_relative_path=",
+        "# source_com_sha256=",
+    )
+    for token in sh_fields:
+        if token not in sh_runtime:
+            problems.append(f"SLURM linkage omits {token!r}")
+    for token in (
+        "zero-byte com_path", "duplicate normalized com_path",
+        "collapse to script basename", "record_child_artifact",
+    ):
+        if token not in slurm_text:
+            problems.append(f"SLURM one-to-one validation omits {token!r}")
+    return problems
+
+
+def check_frozen_matrix() -> list[str]:
+    paths = (MANIFEST, CONFORMERS, GAUSSIAN, SLURM)
+    missing = [path for path in paths if not path.exists()]
+    if missing:
+        return [f"[frozen-v2-matrix] missing {path.relative_to(ROOT)}" for path in missing]
+    problems = _frozen_matrix_problems(
+        MANIFEST.read_text(encoding="utf-8", errors="replace"),
+        CONFORMERS.read_text(encoding="utf-8", errors="replace"),
+        GAUSSIAN.read_text(encoding="utf-8", errors="replace"),
+        SLURM.read_text(encoding="utf-8", errors="replace"),
+    )
+    return [f"[frozen-v2-matrix] {problem}" for problem in problems]
+
+
 def main() -> int:
     problems = (
         check_placeholders()
@@ -510,6 +639,7 @@ def main() -> int:
         + check_status_doc()
         + check_gaussian_provenance()
         + check_append_integrity()
+        + check_frozen_matrix()
     )
     if problems:
         print("SCIENTIFIC INVARIANT CHECK FAILED:\n")

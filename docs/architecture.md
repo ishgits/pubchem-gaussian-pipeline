@@ -1,110 +1,156 @@
 # architecture.md
 
-> Canonical architecture (v2.0). Approved by Ish before implementation. The
-> earlier v1.1 architecture and the v2 draft/review history are archived under
-> `docs/review-history/v2/`.
+> Canonical v2.0 architecture, revised and frozen by Ish on 2026-07-13. The
+> exact normative release boundary is `docs/release-contract-v2.0.md`. Earlier
+> drafts and remediation history remain under `docs/review-history/v2/`.
 
-## What the system is
+## System purpose
 
-An automated pipeline that turns a list of molecule names into ready-to-submit
-Gaussian quantum-chemistry jobs, removing manual structure building. It produces
-*inputs* to Gaussian (`.com`) plus SLURM submission scripts (`.sh`); it does not
-run Gaussian.
+The pipeline converts molecule names into ranked conformer starting geometries,
+Gaussian Link1 opt/freq inputs, and SLURM scripts. It does not run Gaussian.
 
-## Why it exists
+The primary v2 flow is:
 
-Building Gaussian inputs by hand (name → structure → conformers → coordinates →
-formatted `.com` → SLURM script) is slow and error-prone at the scale of
-prebiotic-chemistry surveys. The pipeline makes input generation reproducible and
-traceable, and — new in v2 — hands DFT a *ranked ensemble* of conformers rather
-than a single force-field guess.
-
-## What v2 adds
-
-A conformer-search stage between molecule resolution and Gaussian input
-generation. For each molecule the pipeline embeds an RDKit conformer ensemble,
-MMFF94-optimizes and ranks it, and carries the **top 3 lowest-energy, distinct**
-conformers forward as DFT starting geometries — each with recorded provenance
-(RDKit version, seed, method, relative energy).
-
-**Why:** v1.1 handed DFT a single Open Babel conformer. For flexible molecules
-that conformer is often not the global minimum, so Gaussian can optimize into a
-local minimum and yield wrong relative energies — corrupting the comparative
-thermodynamics this pipeline feeds. Carrying the top 3 lets the DFT step, not the
-force field, make the final call.
-
-## Deliberately simple: no gating
-
-There is **no rotatable-bond branching**. Every molecule takes the same path.
-RMSD pruning at embed time plus "keep top 3 distinct" makes rigid molecules
-collapse to a single conformer on their own (adenine's conformers are
-near-identical → pruned to 1 → one DFT job), so v1.1 behavior for rigid molecules
-is preserved emergently, with no special-case code.
-
-## Data flow
-
-```
-names → [pubchem]     CID + IsomericSMILES (stereo-bearing) + properties
-      → [conformers]  RDKit ETKDGv3 embed (RMSD-pruned) → MMFF94 optimize/rank
-                      → keep top 3 distinct by energy → one XYZ per conformer
-      → [gaussian]    XYZ → .com per conformer (Link1 opt→freq, checkpoint-linked)
-      → [slurm]       .com → .sh per conformer (run-scoped, submission-independent)
+```text
+names
+  -> PubChem CID + stereo-bearing SMILES
+  -> RDKit ETKDGv3 ensemble
+  -> MMFF94 optimization/ranking, UFF recorded fallback
+  -> top-N carried conformers
+  -> conformer XYZ artifacts
+  -> Gaussian COM artifacts
+  -> SLURM SH artifacts
 ```
 
-Input to the conformer stage is the `IsomericSMILES` already present in
-`build_molecule_table` output (stereochemistry preserved; no Open Babel needed on
-this path). Every stage writes a log CSV so any output traces back to its input
-(molecule name → CID → SMILES → conformer XYZ → `.com` → `.sh`).
+Rigid molecules naturally collapse to fewer conformers through embed-time RMSD
+pruning. There is no rotatable-bond gate.
+
+## Provenance architecture
+
+v2.0 uses an authoritative **manifest-centric** model.
+
+```text
+                         run_manifest.json
+                         /       |        \
+                conformer rows  COM rows  SLURM rows
+                    |              |          |
+                   XYZ ----------> COM ------> SH
+```
+
+`run_manifest.json` records the complete run configuration, resolved molecular
+identity, conformer generation and selection data, Gaussian settings, SLURM
+settings, artifact lineage, relative paths, and SHA-256 file hashes.
+
+Every v2 artifact carries stable linkage:
+
+- `run_id` identifies the execution;
+- `config_hash` identifies the canonical complete configuration;
+- `artifact_id` identifies one artifact record.
+
+Stage CSVs remain operational indexes and must agree with the manifest. They are
+not the sole provenance authority.
+
+## Artifact contract
+
+### XYZ and COM
+
+XYZ and COM are scientific artifacts. They carry the minimal self-identifying
+metadata defined in `docs/release-contract-v2.0.md`, including manifest linkage,
+conformer identity, and source software identity. They do not duplicate every
+conformer-search knob; the complete configuration is in the manifest.
+
+### SLURM scripts
+
+SH files are operational artifacts. Each script identifies its source COM path
+and hash plus run/artifact identity. SBATCH resources and the execution command
+remain visible in the script itself.
+
+### Supported package
+
+The supported transfer/archive unit is the complete current run package:
+manifest, stage logs, XYZ directory, COM directory, and SLURM directory. An
+isolated artifact is attributable but not promised to be independently
+reproducible without the manifest.
 
 ## Modules
 
-- `pipeline/pubchem.py` — name→CID scoring/fallback, property + stereo-SMILES
-  retrieval, SDF download, caching, rate limiting.
-- `pipeline/conformers.py` — RDKit ETKDGv3 embed + MMFF94/UFF rank; `select_top_n`
-  is a pure, RDKit-free ranking helper; `search_conformers` is the batch driver
-  that writes `conformer_log.csv` (one row per kept conformer) and the XYZ files.
-- `pipeline/gaussian.py` — XYZ→.com; owns the route lines and the Link1 contract;
-  `write_gaussian_coms_from_conformers` writes one `.com` per conformer row.
-- `pipeline/slurm.py` — .com→.sh from an editable cluster template; scripts
-  resolve their `.com` relative to their own location so submission works from any
-  directory.
-- `pipeline/geometry.py` — legacy v1.1 SDF→XYZ via Open Babel (single-geometry
-  path, retained but not the default).
-- `pipeline/utils.py` — sanitization, dir handling, CID normalization, provenance.
+- `pipeline/pubchem.py` — name resolution, CID selection, stereo-SMILES and
+  property retrieval, caching, and legacy SDF download.
+- `pipeline/conformers.py` — eligibility, ETKDGv3 generation, MMFF94/UFF
+  optimization, ranking, convergence handling, selection, XYZ writing, and
+  conformer-stage records.
+- `pipeline/gaussian.py` — physical-line XYZ parsing, Gaussian COM generation,
+  routes, charge/multiplicity, checkpoints, and Link1 behavior.
+- `pipeline/slurm.py` — validated COM-to-SH mapping and cluster template output.
+- `pipeline/utils.py` — shared normalization, hashing, provenance, identifiers,
+  and filesystem helpers.
+- a manifest module or equivalent shared implementation — canonical
+  configuration serialization, IDs, hashes, lineage, and final manifest write.
 
-## Reproducibility & resume
+## Identity and one-to-one mapping
 
-- A rerun with the same seed reproduces the ensemble. `conformer_log.csv` records
-  RDKit version, seed, method (MMFF94/UFF), `n_generated`, `n_kept`, `rmsd_prune`,
-  `pipeline_version`, `pipeline_commit`, and per conformer the id + ΔE (kcal/mol).
-- Resume is identity- and config-aware: a molecule is skipped only when its
-  recorded run-level config (seed, `n_generate`, `top_n`, `rmsd_prune`, pipeline
-  and RDKit version) **and** per-molecule identity (CID, SMILES) match this run,
-  and every recorded XYZ still exists. Any drift regenerates the molecule rather
-  than reusing a stale geometry. By default the log holds exactly the molecules
-  requested this run (`append=True` retains carry-forward).
-- SLURM scripts default to the current run's `com_write_log.csv`, so stale `.com`
-  files on disk are never turned into jobs; `.sh` files are overwritten so a
-  rerun cannot leave stale SBATCH directives behind.
+Each stage must preserve one-to-one lineage. Every accepted source record maps to
+one unique destination record and path. Distinct inputs must never collapse to a
+single filename or script.
 
-## Scientific assumptions (invariants live in AGENTS.md §2)
+v2.0 fails before mutation on:
 
-- Default level of theory: B3LYP/6-311++G(2df,2p), IEFPCM water, 298 K.
-- Conformer energies are MMFF94 (or UFF fallback) in **kcal/mol**, never mixed
-  with DFT Hartree values.
-- RDKit/MMFF geometries are DFT *starting* points, not minima; the DFT step makes
-  the final call among the carried conformers.
+- sanitized molecule-label collisions;
+- duplicate source paths or artifact IDs;
+- duplicate destination paths;
+- two COMs mapping to one SH path;
+- blank, missing, or zero-byte required inputs;
+- manifest/path/hash disagreement.
 
-## Out of scope
+Automatic filename disambiguation is deferred to v2.1.
 
-Rotatable-bond gating; xTB/CREST; energy-window logic; Boltzmann/entropy
-weighting; solvent-aware search; running or parsing Gaussian; changing the level
-of theory or the Link1 contract.
+## Reproducibility, resume, and append
 
-## Change log
+A conformer group may be reused only when:
 
-- v1.1 — PubChem → Open Babel single geometry → Gaussian opt+freq
-  (Zenodo 10.5281/zenodo.18894724).
-- v2.0 — adds RDKit conformer search (top 3 distinct conformers per molecule to
-  DFT, no gating); run-scoped, submission-independent SLURM scripts;
-  identity/config-aware resume. `pipeline.__version__ = "2.0.0"`.
+- molecular identity matches;
+- search configuration matches;
+- the group is complete and internally consistent;
+- referenced files exist, are nonempty, and match manifest hashes;
+- pipeline and RDKit versions match;
+- the recorded and current pipeline commits are the same clean, nonblank commit.
+
+Dirty trees, source archives without git metadata, and installed packages without
+commit identity disable reuse and force regeneration. Version-only fallback is
+not permitted under the frozen v2.0 contract.
+
+Append mode applies the same integrity and provenance checks to retained groups.
+An invalid unrequested group aborts before mutation because it cannot be safely
+regenerated without a current molecule-table identity.
+
+## Scientific choices
+
+- PubChem's stereo-bearing SMILES is authoritative; undefined stereo is skipped.
+- ETKDG embed-time RMSD pruning defines distinctness in v2.0; no post-MMFF
+  re-pruning is performed.
+- MMFF94 is preferred; UFF is a recorded fallback. Force-field ΔE comparisons are
+  within one molecule and one method only.
+- RDKit geometries are starting points, not minima.
+- Charge and multiplicity are explicit Gaussian inputs; conformer generation
+  does not infer multiplicity.
+- Default Gaussian chemistry and Link1 semantics remain unchanged.
+
+## Directory scope
+
+The `runs/<study>/<run_id>/` redesign is deferred to v2.1. v2.0 retains flat
+output directories but treats the current manifest and its referenced artifact
+set as authoritative. Physical stale-file cleanup is not required if stale files
+cannot enter the manifest-driven submission path.
+
+## Legacy boundary
+
+The Open Babel v1.1 single-geometry path is deprecated and explicitly exempt
+from the strict v2 manifest contract. It must be labeled legacy and must not be
+presented as having v2 provenance guarantees.
+
+## Out of scope for v2.0
+
+Rotatable-bond gating, xTB/CREST, energy windows, Boltzmann or entropy weighting,
+solvent-aware conformer search, post-optimization RMSD re-pruning, running or
+parsing Gaussian, auto-disambiguated internal filenames, and per-study run
+directories.

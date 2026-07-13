@@ -14,6 +14,16 @@ import os
 import pandas as pd
 
 from .conformers import UNCONVERGED_FF_SEED
+from .manifest import (
+    assert_stage_configuration,
+    find_artifact,
+    find_conformer_record,
+    record_child_artifact,
+    relative_artifact_path,
+    remove_artifacts_by_kind,
+    sha256_file,
+    stable_record_id,
+)
 from .utils import ensure_dir, sanitize_basename
 
 
@@ -22,17 +32,27 @@ from .utils import ensure_dir, sanitize_basename
 # writer preserves it for traceability.
 _LEGACY_COM_LOG_COLUMNS = ["name", "xyz_path", "com_path"]
 _CONFORMER_COM_LOG_COLUMNS = [
+    "run_id",
+    "artifact_id",
+    "config_hash",
     "name",
     "conformer_id",
+    "conformer_record_id",
+    "xyz_artifact_id",
     "xyz_path",
     "com_path",
+    "com_sha256",
     "pipeline_version",
     "pipeline_commit",
     "rdkit_version",
 ]
 _REQUIRED_CONFORMER_PROVENANCE_COLUMNS = (
+    "run_id",
+    "artifact_id",
+    "config_hash",
     "pipeline_version",
     "rdkit_version",
+    "xyz_sha256",
 )
 
 
@@ -81,6 +101,12 @@ def _validate_direct_conformer_provenance(
     conformer_id: int | None,
     pipeline_version,
     rdkit_version,
+    run_id,
+    artifact_id,
+    config_hash,
+    manifest_path,
+    parent_artifact_id,
+    conformer_record_id,
 ) -> None:
     """Require source versions for direct conformer-specific COM writes (M-17)."""
     if conformer_id is None:
@@ -91,6 +117,18 @@ def _validate_direct_conformer_provenance(
         missing.append("pipeline_version")
     if _optional_text(rdkit_version) is None:
         missing.append("rdkit_version")
+    if _optional_text(run_id) is None:
+        missing.append("run_id")
+    if _optional_text(artifact_id) is None:
+        missing.append("artifact_id")
+    if _optional_text(config_hash) is None:
+        missing.append("config_hash")
+    if _optional_text(manifest_path) is None:
+        missing.append("manifest_path")
+    if _optional_text(parent_artifact_id) is None:
+        missing.append("parent_artifact_id")
+    if _optional_text(conformer_record_id) is None:
+        missing.append("conformer_record_id")
     if missing:
         raise ValueError(
             "Conformer-specific Gaussian inputs require nonblank provenance: "
@@ -188,6 +226,12 @@ def write_gaussian_com(
     pipeline_version: str | None = None,
     pipeline_commit: str | None = None,
     rdkit_version: str | None = None,
+    run_id: str | None = None,
+    artifact_id: str | None = None,
+    config_hash: str | None = None,
+    manifest_path: str | None = None,
+    parent_artifact_id: str | None = None,
+    conformer_record_id: str | None = None,
 ) -> str:
     """
     Write a Gaussian .com input file from an XYZ file.
@@ -258,10 +302,69 @@ def write_gaussian_com(
         conformer_id,
         pipeline_version,
         rdkit_version,
+        run_id,
+        artifact_id,
+        config_hash,
+        manifest_path,
+        parent_artifact_id,
+        conformer_record_id,
     )
     pipeline_version = _optional_text(pipeline_version)
     pipeline_commit = _optional_text(pipeline_commit)
     rdkit_version = _optional_text(rdkit_version)
+    run_id = _optional_text(run_id)
+    artifact_id = _optional_text(artifact_id)
+    config_hash = _optional_text(config_hash)
+    manifest_path = _optional_text(manifest_path)
+    parent_artifact_id = _optional_text(parent_artifact_id)
+    conformer_record_id = _optional_text(conformer_record_id)
+
+    if conformer_id is not None:
+        manifest = assert_stage_configuration(
+            manifest_path,
+            "gaussian",
+            {
+                "route_opt": route_opt,
+                "route_freq": route_freq,
+                "title_suffix": title_suffix,
+                "charge": charge,
+                "multiplicity": multiplicity,
+                "nproc": nproc,
+                "link1": link1,
+            },
+        )
+        if run_id != manifest["run_id"] or config_hash != manifest["config_hash"]:
+            raise ValueError("Direct COM identity disagrees with run manifest.")
+        if pipeline_version != manifest["pipeline_version"] or rdkit_version != manifest["rdkit_version"]:
+            raise ValueError("Direct COM software versions disagree with run manifest.")
+        if (pipeline_commit or "") != manifest["pipeline_commit"]:
+            raise ValueError("Direct COM source commit disagrees with run manifest.")
+        parent = find_artifact(manifest, parent_artifact_id)
+        if parent["kind"] != "xyz" or parent.get("conformer_record_id") != conformer_record_id:
+            raise ValueError("Direct COM parent lineage is invalid.")
+        if relative_artifact_path(xyz_path, manifest_path) != parent["relative_path"]:
+            raise ValueError("Direct COM XYZ path disagrees with run manifest.")
+        if sha256_file(xyz_path) != parent["sha256"]:
+            raise ValueError("Direct COM XYZ hash disagrees with run manifest.")
+        expected_artifact_id = stable_record_id(
+            manifest["run_id"], "com", parent_artifact_id
+        )
+        if artifact_id != expected_artifact_id:
+            raise ValueError("Direct COM artifact ID is not stable for its lineage.")
+        molecule_record, conformer_record = find_conformer_record(
+            manifest, conformer_record_id
+        )
+        if str(name) != molecule_record["molecule_name"]:
+            raise ValueError("Direct COM molecule name disagrees with run manifest.")
+        if int(conformer_id) != conformer_record["conformer_id"]:
+            raise ValueError("Direct COM conformer ID disagrees with run manifest.")
+        if rel_energy_kcalmol is None or abs(
+            float(rel_energy_kcalmol)
+            - float(conformer_record["relative_energy_kcalmol"])
+        ) > 1e-9:
+            raise ValueError("Direct COM relative energy disagrees with run manifest.")
+        if bool(unconverged) == bool(conformer_record["converged"]):
+            raise ValueError("Direct COM convergence marker disagrees with run manifest.")
 
     ensure_dir(outdir)
     base = sanitize_basename(name)
@@ -293,6 +396,18 @@ def write_gaussian_com(
     if rdkit_version:
         provenance_parts.append(f"rdkit={rdkit_version}")
     title_lines = [title]
+    if conformer_id is not None:
+        relative_energy_text = (
+            "unavailable"
+            if rel_energy_kcalmol is None
+            else f"{rel_energy_kcalmol:.6f}"
+        )
+        title_lines.append(
+            f"run_id={run_id} artifact_id={artifact_id} config_hash={config_hash} "
+            f"conformer_id={conformer_id} "
+            f"relative_energy_kcalmol={relative_energy_text} "
+            f"pipeline_version={pipeline_version} rdkit_version={rdkit_version}"
+        )
     if provenance_parts:
         title_lines.append("provenance " + " ".join(provenance_parts))
     title_block = "\n".join(title_lines)
@@ -316,6 +431,16 @@ def write_gaussian_com(
 
     with open(com_path, "w") as f:
         f.write(text)
+
+    if conformer_id is not None:
+        record_child_artifact(
+            manifest_path,
+            kind="com",
+            artifact_id=artifact_id,
+            parent_artifact_id=parent_artifact_id,
+            conformer_record_id=conformer_record_id,
+            path=com_path,
+        )
 
     return com_path
 
@@ -367,6 +492,7 @@ def write_gaussian_coms_from_conformers(
     conformer_log_csv: str,
     outdir: str = "gaussian_inputs",
     log_csv: str = "com_write_log.csv",
+    manifest_path: str = "run_manifest.json",
     **kwargs,
 ) -> pd.DataFrame:
     """
@@ -394,15 +520,87 @@ def write_gaussian_coms_from_conformers(
     # from the environment running this downstream stage.
     _validate_required_conformer_provenance(conf_log)
 
+    gaussian_config = {
+        "route_opt": kwargs.get("route_opt"),
+        "route_freq": kwargs.get("route_freq"),
+        "title_suffix": kwargs.get("title_suffix", ""),
+        "charge": kwargs.get("charge", 0),
+        "multiplicity": kwargs.get("multiplicity", 1),
+        "nproc": kwargs.get("nproc", 16),
+        "link1": kwargs.get("link1", True),
+    }
+    manifest = assert_stage_configuration(
+        manifest_path, "gaussian", gaussian_config
+    )
+
+    # Validate all source linkage, hashes, and destination mappings before the
+    # first directory/log/manifest mutation.  A conformer-derived COM has no
+    # supported v2 meaning without its exact XYZ manifest parent.
+    prepared = []
+    seen_rows = set()
+    seen_destinations = set()
+    for index, row in conf_log.iterrows():
+        if str(row["run_id"]) != manifest["run_id"] or str(row["config_hash"]) != manifest["config_hash"]:
+            raise ValueError(f"Conformer row {int(index)} disagrees with manifest identity.")
+        xyz_artifact_id = str(row["artifact_id"])
+        if xyz_artifact_id in seen_rows:
+            raise ValueError(f"Duplicate XYZ artifact record in conformer log: {xyz_artifact_id!r}.")
+        seen_rows.add(xyz_artifact_id)
+        xyz_artifact = find_artifact(manifest, xyz_artifact_id)
+        if xyz_artifact["kind"] != "xyz":
+            raise ValueError(f"Conformer row {int(index)} does not reference an XYZ artifact.")
+        molecule_record, conformer_record = find_conformer_record(
+            manifest, xyz_artifact["conformer_record_id"]
+        )
+        if str(row["name"]) != molecule_record["molecule_name"]:
+            raise ValueError(f"Conformer row {int(index)} molecule name disagrees with manifest.")
+        row_cid = None if pd.isna(row.get("cid")) else int(float(row.get("cid")))
+        row_smiles = "" if pd.isna(row.get("smiles")) else str(row.get("smiles"))
+        if row_cid != molecule_record["CID"] or row_smiles != molecule_record["IsomericSMILES"]:
+            raise ValueError(f"Conformer row {int(index)} molecule identity disagrees with manifest.")
+        if int(row["conformer_id"]) != conformer_record["conformer_id"]:
+            raise ValueError(f"Conformer row {int(index)} ID disagrees with manifest.")
+        rel_energy = row.get("rel_energy_kcalmol")
+        if pd.isna(rel_energy) or abs(
+            float(rel_energy) - float(conformer_record["relative_energy_kcalmol"])
+        ) > 1e-9:
+            raise ValueError(f"Conformer row {int(index)} energy disagrees with manifest.")
+        for field in ("pipeline_version", "pipeline_commit", "rdkit_version"):
+            row_value = _optional_text(row.get(field)) or ""
+            if row_value != str(manifest[field]):
+                raise ValueError(
+                    f"Conformer row {int(index)} {field} disagrees with manifest."
+                )
+        xyz_path = str(row["xyz_path"])
+        if relative_artifact_path(xyz_path, manifest_path) != xyz_artifact["relative_path"]:
+            raise ValueError(f"Conformer row {int(index)} XYZ path disagrees with manifest.")
+        if str(row["xyz_sha256"]) != xyz_artifact["sha256"] or sha256_file(xyz_path) != xyz_artifact["sha256"]:
+            raise ValueError(f"Conformer row {int(index)} XYZ hash disagrees with manifest.")
+        conformer_id = int(row["conformer_id"])
+        base = f"{sanitize_basename(str(row['name']))}_c{conformer_id:02d}"
+        com_path = os.path.join(outdir, f"{base}_F.com")
+        normalized_destination = os.path.normcase(os.path.abspath(com_path))
+        if normalized_destination in seen_destinations:
+            raise ValueError(f"Duplicate Gaussian destination path: {com_path!r}.")
+        seen_destinations.add(normalized_destination)
+        com_artifact_id = stable_record_id(
+            manifest["run_id"], "com", xyz_artifact_id
+        )
+        prepared.append((row, xyz_artifact, com_path, com_artifact_id))
+
     # Clear any stale failure log from a prior run (MIN-02); rewritten below only
     # if this run actually has failures.
     if os.path.exists("com_write_failed.csv"):
         os.remove("com_write_failed.csv")
 
+    # Regenerating COMs replaces the downstream layers in manifest order.
+    remove_artifacts_by_kind(manifest_path, "sh")
+    remove_artifacts_by_kind(manifest_path, "com")
+
     written = []
     failed = []
 
-    for _, row in conf_log.iterrows():
+    for row, xyz_artifact, expected_com_path, com_artifact_id in prepared:
         name = row["name"]
         xyz_path = row["xyz_path"]
         conformer_id = int(row["conformer_id"])
@@ -420,6 +618,8 @@ def write_gaussian_coms_from_conformers(
         pipeline_version = _optional_text(row.get("pipeline_version"))
         pipeline_commit = _optional_text(row.get("pipeline_commit"))
         rdkit_version = _optional_text(row.get("rdkit_version"))
+        run_id = str(row["run_id"])
+        config_hash = str(row["config_hash"])
         try:
             com_path = write_gaussian_com(
                 name,
@@ -431,13 +631,28 @@ def write_gaussian_coms_from_conformers(
                 pipeline_version=pipeline_version,
                 pipeline_commit=pipeline_commit,
                 rdkit_version=rdkit_version,
+                run_id=run_id,
+                artifact_id=com_artifact_id,
+                config_hash=config_hash,
+                manifest_path=manifest_path,
+                parent_artifact_id=xyz_artifact["artifact_id"],
+                conformer_record_id=xyz_artifact["conformer_record_id"],
                 **kwargs,
             )
+            if os.path.normcase(os.path.abspath(com_path)) != os.path.normcase(os.path.abspath(expected_com_path)):
+                raise ValueError("Gaussian writer destination changed after validation.")
+            com_digest = sha256_file(com_path)
             written.append({
+                "run_id": run_id,
+                "artifact_id": com_artifact_id,
+                "config_hash": config_hash,
                 "name": name,
                 "conformer_id": conformer_id,
+                "conformer_record_id": xyz_artifact["conformer_record_id"],
+                "xyz_artifact_id": xyz_artifact["artifact_id"],
                 "xyz_path": xyz_path,
                 "com_path": com_path,
+                "com_sha256": com_digest,
                 "pipeline_version": pipeline_version,
                 "pipeline_commit": pipeline_commit or "",
                 "rdkit_version": rdkit_version,

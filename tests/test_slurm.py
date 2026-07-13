@@ -10,6 +10,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pipeline.slurm import write_slurm_script, write_slurm_scripts
+from manifest_helpers import ensure_manifest, write_linked_com_log
+
+SAMPLE_XYZ = os.path.join(os.path.dirname(__file__), "sample_data", "water.xyz")
 
 
 class TestWriteSlurmScript:
@@ -121,22 +124,28 @@ class TestWriteSlurmScriptsLogDriven:
 
     def test_only_logged_jobs_get_scripts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            from pathlib import Path
+
+            root = Path(tmpdir)
             com_dir = os.path.join(tmpdir, "gaussian_inputs")
             slurm_dir = os.path.join(tmpdir, "slurm_scripts")
-            os.makedirs(com_dir)
-            logged = []
-            for name in ("a_F", "b_F", "c_F"):
-                p = os.path.join(com_dir, f"{name}.com")
-                open(p, "w").close()
-                logged.append(p)
+            log_csv, manifest_path = write_linked_com_log(
+                root,
+                [
+                    {"name": name, "com_path": root / "gaussian_inputs" / f"{name}_F.com"}
+                    for name in ("a", "b", "c")
+                ],
+                SAMPLE_XYZ,
+            )
             # A stale .com on disk that is NOT in the log must be ignored.
-            open(os.path.join(com_dir, "stale_F.com"), "w").close()
+            with open(os.path.join(com_dir, "stale_F.com"), "w") as handle:
+                handle.write("stale\n")
 
-            log_csv = self._make_log(tmpdir, logged)
             df = write_slurm_scripts(
                 com_log_csv=log_csv,
                 slurm_dir=slurm_dir,
                 log_csv=os.path.join(tmpdir, "slurm_write_log.csv"),
+                manifest_path=manifest_path,
             )
             assert len(df) == 3
             jobs = sorted(df["jobname"])
@@ -169,31 +178,45 @@ class TestWriteSlurmScriptsLogDriven:
     ):
         com_log = tmp_path / "com_write_log.csv"
         pd.DataFrame([{
+            "run_id": "run-test",
+            "artifact_id": "com-test",
+            "config_hash": "a" * 64,
+            "conformer_record_id": "conformer-test",
+            "com_sha256": "b" * 64,
             "name": "bad",
             "xyz_path": "x.xyz",
             "com_path": bad_path,
         }]).to_csv(com_log, index=False)
         slurm_dir = tmp_path / "slurm_scripts"
         slurm_log = tmp_path / "slurm_write_log.csv"
+        empty_table = pd.DataFrame(columns=["name", "cid", "IsomericSMILES"])
+        manifest_path = ensure_manifest(tmp_path, empty_table)
 
         with pytest.raises(ValueError, match="invalid COM log entries"):
             write_slurm_scripts(
                 com_log_csv=str(com_log),
                 slurm_dir=str(slurm_dir),
                 log_csv=str(slurm_log),
+                manifest_path=manifest_path,
             )
 
         assert not slurm_dir.exists()
         assert not slurm_log.exists()
 
     def test_one_missing_logged_com_preserves_all_prior_outputs(self, tmp_path):
+        com_log, manifest_path = write_linked_com_log(
+            tmp_path,
+            [{"name": "Water", "com_path": tmp_path / "gaussian_inputs" / "water_F.com"}],
+            SAMPLE_XYZ,
+        )
+        rows = pd.read_csv(com_log)
         com_dir = tmp_path / "gaussian_inputs"
-        com_dir.mkdir()
-        valid_com = com_dir / "water_F.com"
-        valid_com.write_text("")
         missing_com = com_dir / "missing_F.com"
-        com_log = tmp_path / "com_write_log.csv"
-        self._make_log(tmp_path, [str(valid_com), str(missing_com)])
+        missing = rows.iloc[0].copy()
+        missing["artifact_id"] = "missing-artifact"
+        missing["com_path"] = str(missing_com)
+        rows = pd.concat([rows, missing.to_frame().T], ignore_index=True)
+        rows.to_csv(com_log, index=False)
 
         slurm_dir = tmp_path / "slurm_scripts"
         slurm_dir.mkdir()
@@ -207,12 +230,112 @@ class TestWriteSlurmScriptsLogDriven:
                 com_log_csv=str(com_log),
                 slurm_dir=str(slurm_dir),
                 log_csv=str(slurm_log),
+                manifest_path=manifest_path,
             )
 
         assert prior_script.read_bytes() == b"prior script\n"
         assert slurm_log.read_bytes() == b"prior log\n"
         assert {path.name for path in slurm_dir.glob("*.sh")} == {"prior_F.sh"}
         assert not (slurm_dir / "water_F.sh").exists()
+
+
+class TestStrictOneToOneManifestMapping:
+    """Frozen v2 mapping failures must happen before any output mutation."""
+
+    @staticmethod
+    def _prior_outputs(tmp_path):
+        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_dir.mkdir()
+        prior_script = slurm_dir / "prior.sh"
+        prior_script.write_bytes(b"prior script\n")
+        slurm_log = tmp_path / "slurm_write_log.csv"
+        slurm_log.write_bytes(b"prior log\n")
+        return slurm_dir, prior_script, slurm_log
+
+    def test_distinct_same_basename_paths_fail_before_mutation(self, tmp_path):
+        com_log, manifest_path = write_linked_com_log(
+            tmp_path,
+            [
+                {"name": "First", "com_path": tmp_path / "a" / "same.com"},
+                {"name": "Second", "com_path": tmp_path / "b" / "same.com"},
+            ],
+            SAMPLE_XYZ,
+        )
+        slurm_dir, prior_script, slurm_log = self._prior_outputs(tmp_path)
+        with pytest.raises(ValueError, match="collapse to script basename"):
+            write_slurm_scripts(
+                com_log_csv=com_log,
+                slurm_dir=str(slurm_dir),
+                log_csv=str(slurm_log),
+                manifest_path=manifest_path,
+            )
+        assert prior_script.read_bytes() == b"prior script\n"
+        assert slurm_log.read_bytes() == b"prior log\n"
+
+    def test_duplicate_normalized_source_fails_before_mutation(self, tmp_path):
+        com_log, manifest_path = write_linked_com_log(
+            tmp_path,
+            [{"name": "Water", "com_path": tmp_path / "inputs" / "water.com"}],
+            SAMPLE_XYZ,
+        )
+        rows = pd.read_csv(com_log)
+        rows = pd.concat([rows, rows], ignore_index=True)
+        rows.to_csv(com_log, index=False)
+        slurm_dir, prior_script, slurm_log = self._prior_outputs(tmp_path)
+        with pytest.raises(ValueError, match="duplicate normalized com_path"):
+            write_slurm_scripts(
+                com_log_csv=com_log,
+                slurm_dir=str(slurm_dir),
+                log_csv=str(slurm_log),
+                manifest_path=manifest_path,
+            )
+        assert prior_script.read_bytes() == b"prior script\n"
+        assert slurm_log.read_bytes() == b"prior log\n"
+
+    def test_zero_byte_com_fails_before_mutation(self, tmp_path):
+        com_log, manifest_path = write_linked_com_log(
+            tmp_path,
+            [{
+                "name": "Water",
+                "com_path": tmp_path / "inputs" / "water.com",
+                "content": "",
+            }],
+            SAMPLE_XYZ,
+        )
+        slurm_dir, prior_script, slurm_log = self._prior_outputs(tmp_path)
+        with pytest.raises(ValueError, match="zero-byte com_path"):
+            write_slurm_scripts(
+                com_log_csv=com_log,
+                slurm_dir=str(slurm_dir),
+                log_csv=str(slurm_log),
+                manifest_path=manifest_path,
+            )
+        assert prior_script.read_bytes() == b"prior script\n"
+        assert slurm_log.read_bytes() == b"prior log\n"
+
+    def test_valid_inputs_have_one_record_and_linked_header_each(self, tmp_path):
+        com_log, manifest_path = write_linked_com_log(
+            tmp_path,
+            [
+                {"name": "Water", "com_path": tmp_path / "inputs" / "water.com"},
+                {"name": "Ammonia", "com_path": tmp_path / "inputs" / "ammonia.com"},
+            ],
+            SAMPLE_XYZ,
+        )
+        out = write_slurm_scripts(
+            com_log_csv=com_log,
+            slurm_dir=str(tmp_path / "slurm_scripts"),
+            log_csv=str(tmp_path / "slurm_write_log.csv"),
+            manifest_path=manifest_path,
+        )
+        assert len(out) == 2
+        assert out["artifact_id"].is_unique
+        assert out["sh_path"].is_unique
+        for _, row in out.iterrows():
+            text = open(row["sh_path"], encoding="utf-8").read()
+            assert f"# run_id={row['run_id']}" in text
+            assert f"# artifact_id={row['artifact_id']}" in text
+            assert f"# source_com_sha256={row['com_sha256']}" in text
 
 
 class TestWriteSlurmScriptsOverwrite:
@@ -224,7 +347,8 @@ class TestWriteSlurmScriptsOverwrite:
             slurm_dir = os.path.join(tmpdir, "slurm_scripts")
             os.makedirs(com_dir)
             com_path = os.path.join(com_dir, "adenine_F.com")
-            open(com_path, "w").close()
+            with open(com_path, "w") as handle:
+                handle.write("%chk=adenine.chk\n")
             log_csv = os.path.join(tmpdir, "com_write_log.csv")
             pd.DataFrame([
                 {"name": "adenine", "xyz_path": "x.xyz", "com_path": com_path}
@@ -232,12 +356,12 @@ class TestWriteSlurmScriptsOverwrite:
 
             slog = os.path.join(tmpdir, "slurm_write_log.csv")
             first = write_slurm_scripts(
-                com_log_csv=log_csv, slurm_dir=slurm_dir, log_csv=slog, account="old"
+                com_dir=com_dir, slurm_dir=slurm_dir, log_csv=slog, account="old"
             )
             assert list(first["status"]) == ["WROTE"]
 
             second = write_slurm_scripts(
-                com_log_csv=log_csv, slurm_dir=slurm_dir, log_csv=slog, account="new"
+                com_dir=com_dir, slurm_dir=slurm_dir, log_csv=slog, account="new"
             )
             assert list(second["status"]) == ["OVERWROTE"]
             with open(os.path.join(slurm_dir, "adenine_F.sh")) as f:
@@ -259,34 +383,35 @@ class TestWriteSlurmScriptsCurrentRunCleanup:
         ).to_csv(path, index=False)
 
     def test_smaller_rerun_prunes_stale_scripts(self, tmp_path):
-        com_dir = tmp_path / "gaussian_inputs"
         slurm_dir = tmp_path / "slurm_scripts"
-        com_dir.mkdir()
-        com_log = tmp_path / "com_write_log.csv"
         slurm_log = tmp_path / "slurm_write_log.csv"
-
-        first_paths = []
-        for name in ("water_F.com", "glycine_F.com"):
-            path = com_dir / name
-            path.write_text("")
-            first_paths.append(str(path))
-        self._write_com_log(com_log, first_paths)
+        com_log, manifest_path = write_linked_com_log(
+            tmp_path,
+            [
+                {"name": "Water", "com_path": tmp_path / "gaussian_inputs" / "water_F.com"},
+                {"name": "Glycine", "com_path": tmp_path / "gaussian_inputs" / "glycine_F.com"},
+                {"name": "Adenine", "com_path": tmp_path / "gaussian_inputs" / "adenine_F.com"},
+            ],
+            SAMPLE_XYZ,
+        )
+        all_rows = pd.read_csv(com_log)
+        all_rows.iloc[:2].to_csv(com_log, index=False)
         write_slurm_scripts(
             com_log_csv=str(com_log),
             slurm_dir=str(slurm_dir),
             log_csv=str(slurm_log),
+            manifest_path=manifest_path,
         )
         assert {p.name for p in slurm_dir.glob("*.sh")} == {
             "water_F.sh", "glycine_F.sh"
         }
 
-        adenine = com_dir / "adenine_F.com"
-        adenine.write_text("")
-        self._write_com_log(com_log, [str(adenine)])
+        all_rows.iloc[[2]].to_csv(com_log, index=False)
         out = write_slurm_scripts(
             com_log_csv=str(com_log),
             slurm_dir=str(slurm_dir),
             log_csv=str(slurm_log),
+            manifest_path=manifest_path,
         )
 
         assert list(out["jobname"]) == ["adenine_F"]
@@ -300,14 +425,21 @@ class TestWriteSlurmScriptsCurrentRunCleanup:
         com_log = tmp_path / "com_write_log.csv"
         self._write_com_log(com_log, [])
         slurm_log = tmp_path / "slurm_write_log.csv"
+        empty_table = pd.DataFrame(columns=["name", "cid", "IsomericSMILES"])
+        manifest_path = ensure_manifest(tmp_path, empty_table)
 
         out = write_slurm_scripts(
             com_log_csv=str(com_log),
             slurm_dir=str(slurm_dir),
             log_csv=str(slurm_log),
+            manifest_path=manifest_path,
         )
 
-        expected = ["jobname", "com_path", "sh_path", "status"]
+        expected = [
+            "run_id", "artifact_id", "config_hash", "jobname",
+            "com_artifact_id", "com_path", "com_sha256", "sh_path",
+            "sh_sha256", "status",
+        ]
         assert out.empty
         assert list(out.columns) == expected
         assert list(pd.read_csv(slurm_log).columns) == expected

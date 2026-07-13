@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -14,8 +15,18 @@ from pipeline.gaussian import (
     write_gaussian_coms,
     write_gaussian_coms_from_conformers,
 )
+from manifest_helpers import (
+    direct_com_context,
+    ensure_manifest,
+    write_linked_conformer_log,
+)
 
 SAMPLE_XYZ = os.path.join(os.path.dirname(__file__), "sample_data", "water.xyz")
+LINKAGE = {
+    "run_id": "run-test",
+    "artifact_id": "com-test",
+    "config_hash": "a" * 64,
+}
 
 
 def _write_xyz(tmpdir, contents):
@@ -215,9 +226,13 @@ class TestWriteGaussianComConformer:
 
     def test_conformer_filename_and_chk(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            xyz_path, linkage = direct_com_context(
+                Path(tmpdir), SAMPLE_XYZ, rdkit_version="2025.03.3",
+                pipeline_commit="",
+            )
             com_path = write_gaussian_com(
                 name="Ribose",
-                xyz_path=SAMPLE_XYZ,
+                xyz_path=xyz_path,
                 outdir=tmpdir,
                 route_opt="# opt b3lyp/6-31g(d)",
                 route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
@@ -225,6 +240,7 @@ class TestWriteGaussianComConformer:
                 rel_energy_kcalmol=0.0,
                 pipeline_version="2.0.0",
                 rdkit_version="2025.03.3",
+                **linkage,
             )
             assert com_path.endswith("ribose_c00_F.com")
             with open(com_path) as f:
@@ -239,9 +255,14 @@ class TestWriteGaussianComConformer:
 
     def test_conformer_delta_energy_in_title(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            xyz_path, linkage = direct_com_context(
+                Path(tmpdir), SAMPLE_XYZ, rdkit_version="2025.03.3",
+                pipeline_commit="", conformer_id=2,
+                rel_energy_kcalmol=1.2345,
+            )
             com_path = write_gaussian_com(
                 name="Ribose",
-                xyz_path=SAMPLE_XYZ,
+                xyz_path=xyz_path,
                 outdir=tmpdir,
                 route_opt="# opt b3lyp/6-31g(d)",
                 route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
@@ -249,6 +270,7 @@ class TestWriteGaussianComConformer:
                 rel_energy_kcalmol=1.2345,
                 pipeline_version="2.0.0",
                 rdkit_version="2025.03.3",
+                **linkage,
             )
             with open(com_path) as f:
                 text = f.read()
@@ -287,18 +309,47 @@ class TestWriteGaussianComConformer:
                 rel_energy_kcalmol=0.0,
                 pipeline_version=pipeline_version,
                 rdkit_version=rdkit_version,
+                **LINKAGE,
             )
 
         assert missing in str(excinfo.value)
+        assert not outdir.exists()
+
+    def test_tampered_direct_artifact_id_fails_before_output_mutation(self, tmp_path):
+        xyz_path, linkage = direct_com_context(tmp_path, SAMPLE_XYZ)
+        linkage["artifact_id"] = "com-tampered"
+        outdir = tmp_path / "gaussian_inputs"
+        with pytest.raises(ValueError, match="not stable"):
+            write_gaussian_com(
+                name="Ribose",
+                xyz_path=xyz_path,
+                outdir=str(outdir),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                conformer_id=0,
+                rel_energy_kcalmol=0.0,
+                pipeline_version="2.0.0",
+                pipeline_commit="abc1234",
+                rdkit_version="2025.09.3",
+                **linkage,
+            )
         assert not outdir.exists()
 
     def test_provenance_is_stamped_only_in_title_section(self):
         route_opt = "# opt b3lyp/6-31g(d)"
         route_freq = "# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read"
         with tempfile.TemporaryDirectory() as tmpdir:
+            xyz_path, linkage = direct_com_context(
+                Path(tmpdir),
+                SAMPLE_XYZ,
+                route_opt=route_opt,
+                route_freq=route_freq,
+                charge=-1,
+                multiplicity=2,
+            )
             com_path = write_gaussian_com(
                 name="Ribose",
-                xyz_path=SAMPLE_XYZ,
+                xyz_path=xyz_path,
                 outdir=tmpdir,
                 route_opt=route_opt,
                 route_freq=route_freq,
@@ -309,6 +360,7 @@ class TestWriteGaussianComConformer:
                 pipeline_version="2.0.0",
                 pipeline_commit="abc1234",
                 rdkit_version="2025.09.3",
+                **linkage,
             )
             with open(com_path) as f:
                 text = f.read()
@@ -329,16 +381,21 @@ class TestWriteGaussianComConformer:
 
     def test_missing_commit_is_explicit_when_other_provenance_exists(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            xyz_path, linkage = direct_com_context(
+                Path(tmpdir), SAMPLE_XYZ, pipeline_commit="",
+            )
             com_path = write_gaussian_com(
                 name="Ribose",
-                xyz_path=SAMPLE_XYZ,
+                xyz_path=xyz_path,
                 outdir=tmpdir,
                 route_opt="# opt b3lyp/6-31g(d)",
                 route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
                 conformer_id=0,
+                rel_energy_kcalmol=0.0,
                 pipeline_version="2.0.0",
                 pipeline_commit="",
                 rdkit_version="2025.09.3",
+                **linkage,
             )
             with open(com_path) as f:
                 text = f.read()
@@ -364,15 +421,17 @@ class TestWriteGaussianComConformer:
 
 class TestWriteGaussianComsFromConformers:
     def test_three_conformer_rows_three_coms(self):
-        import pandas as pd
-
         with tempfile.TemporaryDirectory() as tmpdir:
-            log_csv = os.path.join(tmpdir, "conformer_log.csv")
-            pd.DataFrame([
-                {"name": "Ribose", "conformer_id": 0, "rel_energy_kcalmol": 0.0, "xyz_path": SAMPLE_XYZ, "pipeline_version": "2.0.0", "rdkit_version": "2025.09.3"},
-                {"name": "Ribose", "conformer_id": 1, "rel_energy_kcalmol": 0.5, "xyz_path": SAMPLE_XYZ, "pipeline_version": "2.0.0", "rdkit_version": "2025.09.3"},
-                {"name": "Ribose", "conformer_id": 2, "rel_energy_kcalmol": 1.1, "xyz_path": SAMPLE_XYZ, "pipeline_version": "2.0.0", "rdkit_version": "2025.09.3"},
-            ]).to_csv(log_csv, index=False)
+            root = Path(tmpdir)
+            log_csv, manifest_path = write_linked_conformer_log(
+                root,
+                [
+                    {"name": "Ribose", "conformer_id": 0, "rel_energy_kcalmol": 0.0},
+                    {"name": "Ribose", "conformer_id": 1, "rel_energy_kcalmol": 0.5},
+                    {"name": "Ribose", "conformer_id": 2, "rel_energy_kcalmol": 1.1},
+                ],
+                SAMPLE_XYZ,
+            )
 
             outdir = os.path.join(tmpdir, "gaussian_inputs")
             out = write_gaussian_coms_from_conformers(
@@ -381,6 +440,7 @@ class TestWriteGaussianComsFromConformers:
                 log_csv=os.path.join(tmpdir, "com_write_log.csv"),
                 route_opt="# opt b3lyp/6-31g(d)",
                 route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                manifest_path=manifest_path,
             )
             assert len(out) == 3
             names = sorted(os.path.basename(p) for p in out["com_path"])
@@ -397,16 +457,14 @@ class TestWriteGaussianComsFromConformers:
     def test_batch_copies_provenance_into_com_and_log(self, tmp_path):
         import pandas as pd
 
-        conformer_log = tmp_path / "conformer_log.csv"
-        pd.DataFrame([{
+        conformer_log, manifest_path = write_linked_conformer_log(tmp_path, [{
             "name": "Ribose",
             "conformer_id": 0,
             "rel_energy_kcalmol": 0.0,
-            "xyz_path": SAMPLE_XYZ,
             "pipeline_version": "2.0.0",
             "pipeline_commit": "abc1234",
             "rdkit_version": "2025.09.3",
-        }]).to_csv(conformer_log, index=False)
+        }], SAMPLE_XYZ)
         com_log = tmp_path / "com_write_log.csv"
 
         out = write_gaussian_coms_from_conformers(
@@ -415,10 +473,13 @@ class TestWriteGaussianComsFromConformers:
             log_csv=str(com_log),
             route_opt="# opt b3lyp/6-31g(d)",
             route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            manifest_path=manifest_path,
         )
 
         expected_columns = [
-            "name", "conformer_id", "xyz_path", "com_path",
+            "run_id", "artifact_id", "config_hash", "name", "conformer_id",
+            "conformer_record_id", "xyz_artifact_id", "xyz_path", "com_path",
+            "com_sha256",
             "pipeline_version", "pipeline_commit", "rdkit_version",
         ]
         assert list(out.columns) == expected_columns
@@ -439,14 +500,17 @@ class TestWriteGaussianComsFromConformers:
     def test_batch_missing_commit_writes_unavailable(self, tmp_path):
         import pandas as pd
 
-        conformer_log = tmp_path / "conformer_log.csv"
-        pd.DataFrame([{
+        conformer_log, manifest_path = write_linked_conformer_log(
+            tmp_path,
+            [{
             "name": "Ribose",
             "conformer_id": 0,
-            "xyz_path": SAMPLE_XYZ,
             "pipeline_version": "2.0.0",
             "rdkit_version": "2025.09.3",
-        }]).to_csv(conformer_log, index=False)
+            }],
+            SAMPLE_XYZ,
+            pipeline_commit="",
+        )
 
         out = write_gaussian_coms_from_conformers(
             str(conformer_log),
@@ -454,6 +518,7 @@ class TestWriteGaussianComsFromConformers:
             log_csv=str(tmp_path / "com_write_log.csv"),
             route_opt="# opt b3lyp/6-31g(d)",
             route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            manifest_path=manifest_path,
         )
 
         with open(out.loc[0, "com_path"]) as f:
@@ -470,9 +535,13 @@ class TestRequiredConformerProvenance:
     @staticmethod
     def _base_row():
         return {
+            "run_id": "run-test",
+            "artifact_id": "xyz-test",
+            "config_hash": "a" * 64,
             "name": "Water",
             "conformer_id": 0,
             "xyz_path": SAMPLE_XYZ,
+            "xyz_sha256": "b" * 64,
             "pipeline_version": "2.0.0",
             "rdkit_version": "2025.09.3",
         }
@@ -566,53 +635,56 @@ class TestEmptyComLogSchemas:
             conformer_log, index=False
         )
         com_log = tmp_path / "com_write_log.csv"
+        empty_table = pd.DataFrame(columns=["name", "cid", "IsomericSMILES"])
+        manifest_path = ensure_manifest(
+            tmp_path, empty_table
+        )
 
         out = write_gaussian_coms_from_conformers(
-            str(conformer_log), log_csv=str(com_log)
+            str(conformer_log),
+            log_csv=str(com_log),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            manifest_path=manifest_path,
         )
 
         expected = [
-            "name", "conformer_id", "xyz_path", "com_path",
+            "run_id", "artifact_id", "config_hash", "name", "conformer_id",
+            "conformer_record_id", "xyz_artifact_id", "xyz_path", "com_path",
+            "com_sha256",
             "pipeline_version", "pipeline_commit", "rdkit_version",
         ]
         assert list(out.columns) == expected
         assert out.empty
         assert list(pd.read_csv(com_log).columns) == expected
 
-    def test_every_conformer_write_failure_keeps_headers(
+    def test_missing_linked_xyz_fails_before_log_mutation(
         self, tmp_path, monkeypatch
     ):
         import pandas as pd
         import pipeline.gaussian as G
 
         monkeypatch.chdir(tmp_path)
-        conformer_log = tmp_path / "conformer_log.csv"
-        pd.DataFrame([{
+        conformer_log, manifest_path = write_linked_conformer_log(tmp_path, [{
             "name": "Water",
             "conformer_id": 0,
-            "xyz_path": "missing.xyz",
             "pipeline_version": "2.0.0",
             "rdkit_version": "2025.09.3",
-        }]).to_csv(conformer_log, index=False)
-        monkeypatch.setattr(
-            G,
-            "write_gaussian_com",
-            lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("bad XYZ")),
-        )
+        }], SAMPLE_XYZ)
+        linked = pd.read_csv(conformer_log)
+        os.remove(linked.loc[0, "xyz_path"])
         com_log = tmp_path / "com_write_log.csv"
+        com_log.write_bytes(b"prior log\n")
 
-        out = G.write_gaussian_coms_from_conformers(
-            str(conformer_log), log_csv=str(com_log)
-        )
-
-        expected = [
-            "name", "conformer_id", "xyz_path", "com_path",
-            "pipeline_version", "pipeline_commit", "rdkit_version",
-        ]
-        assert out.empty
-        assert list(pd.read_csv(com_log).columns) == expected
-        failures = pd.read_csv(tmp_path / "com_write_failed.csv")
-        assert len(failures) == 1
+        with pytest.raises((FileNotFoundError, ValueError)):
+            G.write_gaussian_coms_from_conformers(
+                str(conformer_log),
+                log_csv=str(com_log),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                manifest_path=manifest_path,
+            )
+        assert com_log.read_bytes() == b"prior log\n"
 
     def test_all_ineligible_molecules_complete_zero_job_pipeline(
         self, tmp_path, monkeypatch
@@ -633,16 +705,26 @@ class TestEmptyComLogSchemas:
         }])
         conformer_log = tmp_path / "conformer_log.csv"
         failed_log = tmp_path / "conformer_search_failed.csv"
+        manifest_path = ensure_manifest(
+            tmp_path,
+            molecule_table,
+            rdkit_version="test-rdkit",
+        )
         C.search_conformers(
             molecule_table,
             xyz_dir=str(tmp_path / "xyz"),
             log_csv=str(conformer_log),
             failed_csv=str(failed_log),
+            manifest_path=manifest_path,
         )
 
         com_log = tmp_path / "com_write_log.csv"
         coms = write_gaussian_coms_from_conformers(
-            str(conformer_log), log_csv=str(com_log)
+            str(conformer_log),
+            log_csv=str(com_log),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            manifest_path=manifest_path,
         )
         slurm_dir = tmp_path / "slurm_scripts"
         slurm_dir.mkdir()
@@ -652,6 +734,7 @@ class TestEmptyComLogSchemas:
             com_log_csv=str(com_log),
             slurm_dir=str(slurm_dir),
             log_csv=str(slurm_log),
+            manifest_path=manifest_path,
         )
 
         assert pd.read_csv(conformer_log).empty
@@ -660,5 +743,7 @@ class TestEmptyComLogSchemas:
         assert scripts.empty
         assert list(slurm_dir.glob("*.sh")) == []
         assert list(pd.read_csv(slurm_log).columns) == [
-            "jobname", "com_path", "sh_path", "status"
+            "run_id", "artifact_id", "config_hash", "jobname",
+            "com_artifact_id", "com_path", "com_sha256", "sh_path",
+            "sh_sha256", "status",
         ]

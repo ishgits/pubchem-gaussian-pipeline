@@ -1,75 +1,108 @@
-# Agentic review workflow — how this repo runs
+# Agentic review workflow
 
-A handoff substrate for going back and forth between Claude (implementer /
-architect / remediation planner) and Codex (independent reviewer) over GitHub
-pull requests, instead of ZIPs and chat-trapped context.
+This repository uses a contract-first handoff between Ish, the architect or
+remediation planner, the implementer, CI, and an independent reviewer.
 
-## The loop
+## Governing artifacts
 
+- `AGENTS.md` — universal operating and review rules.
+- `docs/release-contract-v2.0.md` — frozen v2.0 provenance, artifact, collision,
+  reuse, scientific-judgment, and review boundary.
+- `docs/architecture.md` — system structure and data flow.
+- `docs/implementation-plan.md` — ordered release tasks and acceptance tests.
+- `docs/implementation-status.md` — honest current merge-gate status.
+- `reviews/*-template.md` and `prompts/*.md` — stable handoff formats.
+
+## Workflow
+
+```text
+Ish approves architecture and release contract
+        |
+implementer changes code on a branch
+        |
+objective floor: tests + invariants + diff + repo hygiene
+        |
+one holistic base-to-head Codex review
+        |
+Ish/remediation planner accepts contract violations or rejects contract expansions
+        |
+implementer fixes accepted findings and records verification
+        |
+one final re-review
+        |
+Ish makes the merge decision
 ```
-        ┌─────────────── HUMAN GATE 1 ───────────────┐
-        │  Ish approves architecture.md + plan        │
-Cowork  ▼                                             │
-(Claude) architecture.md + implementation-plan.md ────┘
-        │
-Claude  ▼  prompts/implementer.md
-Code     branch → implement → run floor → status doc → open PR
-        │
-CI      ▼  review-readiness.yml  (tests + invariants + repo hygiene)  ← floor
-        │        green?  ──no──► fix; not review-ready
-        │        yes
-Codex   ▼  native `@codex review` on the PR (reads AGENTS.md §6)
-         posts findings → review-round-NN
-        │
-        ├──────────────── HUMAN GATE 2 ───────────────┐
-        │  Ish reviews substantive findings           │
-Cowork  ▼  prompts/remediation-planner.md             │
-(Claude) remediation-plan-round-NN.md  (accept/reject)┘
-        │
-Claude  ▼  implement accepted fixes; record commit+verification per finding
-Code     push → CI floor reruns → Codex diff-based re-review (round NN+1)
-        │        classifies each prior finding
-        │
-        └──────────────── HUMAN GATE 3 ───────────────┐
-                          Ish makes final merge call   ┘
+
+## Architecture freeze
+
+Once Ish freezes a release contract:
+
+- reviewers assess conformance to that contract;
+- reviewers may recommend broader improvements, but must label them proposed
+  contract expansions;
+- proposed expansions are deferred to the next release unless Ish explicitly
+  accepts them;
+- remediation plans may legitimately reject a finding whose requested design
+  conflicts with the frozen architecture, while still accepting and solving the
+  underlying risk through the approved architecture.
+
+For v2.0, full conformer configuration belongs in `run_manifest.json`; XYZ and
+COM files carry stable manifest linkage rather than every duplicated knob.
+
+## Objective floor
+
+Before review:
+
+```bash
+pytest tests/ -q
+python scripts/check_invariants.py
+git diff --check
+test -z "$(git ls-files -ci --exclude-standard)"
 ```
 
-## What each file is
+Before release, repeat the checks from a clean `git archive` and accurately
+record the dependency environment used.
 
-- `AGENTS.md` — source of truth: objective, scientific invariants, dev rules,
-  required checks, definition of done, Codex review guidelines.
-- `CLAUDE.md` — thin pointer + Claude-Code implementer role.
-- `docs/architecture.md` / `implementation-plan.md` — the two gate-1 artifacts
-  (canonical v2). Earlier drafts and per-round history live under
-  `docs/review-history/v2/`.
-- `docs/implementation-status.md` — implementer's self-report and the AGENTS.md
-  §5 **merge gate** (reviewer verifies, never trusts). §6 "questions requiring
-  scientific judgment" is what Ish reads first. It must never sit as the empty
-  template — `scripts/check_invariants.py` fails the floor if this file still
-  holds template placeholders. The full per-round evidence (commit hashes, verify
-  runs) is archived in `docs/review-history/v2/`.
-- `reviews/*-template.md` — the review and remediation artifact formats.
-- `prompts/*.md` — the versioned brief each agent gets, so handoffs are identical
-  every time (kills "no universal handoff format" + "context trapped in chats").
-- `scripts/check_invariants.py` — the mechanical floor.
-- `.github/workflows/review-readiness.yml` — runs the floor on every PR
-  (tests + scientific-invariant checks + repo-hygiene: no tracked generated files).
+## Review scope
 
-## Running the Codex review (native, no secrets)
+The holistic review covers every supported public entry point and handoff:
 
-Turn on Code review for this repo in Codex settings, then comment `@codex review`
-on the PR. Codex reads the review guidelines in `AGENTS.md` §6 (full
-Blocker→Verified-Strength taxonomy, stable IDs, code anchors) and posts its
-findings on the PR. No API key, no extra workflow, and no third-party secret is
-required — the review runs entirely through Codex's native GitHub integration
-against the same `AGENTS.md`, so there is no separate setup to keep in sync.
+```text
+identity
+complete groups
+manifest lineage and hashes
+unique source and destination paths
+failure before mutation
+resume and append
+zero-job behavior
+scientific invariants
+clean-archive reproducibility
+```
 
-On a re-review Codex does a diff-based pass and classifies each prior finding
-Resolved / Partial / Unresolved / Rejected(justif.) / Regressed.
+It includes malformed, blank, missing, zero-byte, duplicate, colliding, stale,
+damaged, dirty-git, and no-git cases where relevant.
 
-## A lightweight path (don't over-ceremony small PRs)
+## Native Codex review
 
-The full 2-round loop is for PRs touching scientific logic (route lines,
-geometry, the Link1 contract, energetics). For docstrings, plotting, or README
-tweaks: floor green + one human glance is enough. Reserve the ceremony for
-load-bearing changes.
+Comment `@codex review` on the PR. Codex reads `AGENTS.md` and the frozen release
+contract. Every finding must state whether it is:
+
+- an actual frozen-contract violation; or
+- a proposed expansion for a future release.
+
+Re-review classifies prior findings as Resolved, Partially resolved, Unresolved,
+Rejected with justification, or Regressed.
+
+## Stop rule
+
+The v2.0 loop ends after:
+
+1. the implementation aligns with the frozen contract;
+2. one holistic review is completed;
+3. actual contract-level Blocker/Major findings are fixed;
+4. one final re-review finds no contract-level Blocker/Major regression;
+5. non-contract recommendations are recorded for v2.1;
+6. Ish approves the merge.
+
+Small documentation-only PRs may use the lightweight path: green floor and one
+human review, unless they change a governing contract.

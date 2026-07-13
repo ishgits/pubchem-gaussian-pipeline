@@ -1,14 +1,21 @@
-# Remediation planner brief (Cowork / Claude)
+# Remediation planner brief
 
-Read `reviews/review-round-NN.md`. Think about each finding on its merits.
+Read the review, `AGENTS.md`, and `docs/release-contract-v2.0.md`.
 
-Produce `reviews/remediation-plan-round-NN.md`:
-- For each finding: Accept or Reject, with rationale. Rejecting is legitimate
-  when the architecture or the science declines the finding — say why.
-- Turn accepted findings into ordered, independent fix tasks, each referencing
-  its finding ID and naming the verification step.
-- Do NOT implement yet. This plan goes to Ish for approval (human gate).
+For every finding determine first whether it demonstrates an actual frozen-
+contract violation or proposes a broader design.
 
-After approval, the implementer addresses each accepted finding, records the
-commit hash and the verification run, and marks resolved ONLY after the
-verification step passes — never on code change alone.
+Produce a remediation plan that:
+
+- accepts actual contract violations;
+- may reject a requested implementation whose design conflicts with the frozen
+  architecture, with an exact contract citation;
+- still addresses the underlying risk through the approved architecture;
+- records proposed contract expansions for v2.1 unless Ish explicitly accepts
+  them for v2.0;
+- turns accepted findings into independent ordered tasks with verification;
+- requires validation before mutation and regression tests at adjacent public
+  boundaries.
+
+Do not implement until Ish approves the plan. Mark a finding resolved only after
+its verification passes, not when code is merely changed.
