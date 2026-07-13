@@ -10,8 +10,8 @@
 Maintained by the implementing agent (Claude Code). The reviewer (Codex) must
 verify these claims against the code, not trust them.
 
-**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 4
-(v2 conformer search + remediation rounds 01–04; released as v2.0.0). Works
+**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 5
+(v2 conformer search + remediation rounds 01–05; released as v2.0.0). Works
 against `docs/architecture.md` and `docs/implementation-plan.md`.
 
 ## 1. What was implemented
@@ -69,6 +69,17 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   Gaussian inputs are never built on outdated or wrong-structure conformers. By
   default (round-04 M-02) the log holds exactly the molecules requested this run;
   `append=True` retains unrequested molecules' rows.
+- **Complete-group resume validation (round-05 M-12).** A requested molecule is
+  resumable only when every row has a parseable, agreeing `n_kept`; the group has
+  exactly that many rows; `conformer_id` values are the unique contiguous set
+  `0..n_kept-1`; and `xyz_path` values are unique, present, and non-empty. A
+  truncated, duplicated, or otherwise damaged group is dropped and regenerated
+  rather than accepted because its surviving rows happen to be valid.
+- **Collision-safe output labels (round-05 B-05).** Before any output directory,
+  failure log, or geometry is mutated, `search_conformers` rejects distinct
+  molecule labels that collapse to the same `sanitize_basename()` value (including
+  punctuation/whitespace and case-only collisions). This prevents one molecule's
+  XYZ/COM/checkpoint/SLURM files from overwriting another's.
 - **Physical-line XYZ parsing (round-04 B-01).** `xyz_to_gaussian_coords` reads
   line 1 = atom count, line 2 = comment (may be empty), then exactly that many
   coordinate rows; a count mismatch or malformed row raises `ValueError` instead
@@ -78,13 +89,21 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   `write_slurm_scripts` defaults to the current run's `com_write_log.csv` (stale
   `.com` files are never picked up; a `com_dir` glob is the explicit legacy mode)
   and overwrites `.sh` files (reporting `WROTE`/`OVERWROTE`) so a rerun cannot
-  leave stale SBATCH directives. Each script resolves its `.com` relative to its
-  own location and runs `g16` on the basename, so `sbatch` works from any
-  directory.
+  leave stale SBATCH directives. Round-05 B-06 additionally removes `.sh` files
+  not represented by the current COM set, including all old scripts on a zero-job
+  rerun, so the documented submission glob agrees with `slurm_write_log.csv`.
+  Each script resolves its `.com` relative to its own location and runs `g16` on
+  the basename, so `sbatch` works from any directory.
+- **Stable zero-result schemas (round-05 M-11).** Both the legacy and conformer
+  Gaussian batch writers emit header-only, readable COM logs when zero files are
+  written (including all-write-failure batches). The SLURM writer likewise emits
+  a fixed-schema empty log and completes with zero scripts, so a scientifically
+  valid "no eligible jobs" run proceeds through the default notebook stages.
 - **Early parameter validation + stale-log hygiene (round-04 MIN-03, MIN-02).**
   `search_conformers` rejects `n_generate<1`, `top_n<1`, `rmsd_prune<0`, duplicate
-  molecule labels, and empty sanitized filenames at entry; it and the Gaussian
-  writers clear a stale `*_failed.csv` at stage start.
+  molecule labels, colliding sanitized basenames, and empty sanitized filenames
+  at entry; it and the Gaussian writers clear a stale v2 conformer or COM
+  `*_failed.csv` at stage start.
 - **Repo hygiene + release versioning (round-04 B-04, MOD-01).** Generated
   outputs are untracked and gitignored (`git ls-files -ci --exclude-standard`
   empty), enforced by a new `review-readiness.yml` step; `pipeline.__version__ =
@@ -93,8 +112,8 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   install step; README leads with the RDKit conformer flow, with Open Babel demoted
   to a labeled legacy v1.1 section.
 
-Required checks locally green after round 04 (rdkit 2025.09.3): `pytest tests/ -q`
-→ **143 passed**; `python scripts/check_invariants.py` → **passed**;
+Required checks locally green after round 05 (rdkit 2025.09.3): `pytest tests/ -q`
+→ **159 passed**; `python scripts/check_invariants.py` → **passed**;
 `git ls-files -ci --exclude-standard` → empty.
 
 ## 2. What was NOT implemented (and why)
@@ -108,11 +127,12 @@ Required checks locally green after round 04 (rdkit 2025.09.3): `pytest tests/ -
   tracked as a next-round candidate, not a silent omission.
 - Post-optimization RMSD re-pruning is not added; distinctness relies on
   `pruneRmsThresh` at embed time (see §6).
-- **Round-04 deferrals (recorded, not silent):** the per-study `runs/`
-  run-directory redesign; a fuller resume key (`pipeline_commit` in-key, `n_rows
-  == n_kept` reconcile, duplicate-label re-keying by identity); and extending
-  version/commit provenance to `com_write_log.csv` / `sdf_download_log.csv`. All
-  logged for a later round per `docs/review-history/v2/remediation-plan-round-04-v2.md`.
+- **Remaining recorded deferrals:** the per-study `runs/` run-directory redesign;
+  adding `pipeline_commit` to the resume key; replacing label-based filenames
+  with a collision-proof internal identifier rather than rejecting collisions;
+  and extending version/commit provenance to `com_write_log.csv` /
+  `sdf_download_log.csv`. The round-04 `n_rows == n_kept` reconciliation is no
+  longer deferred: round-05 M-12 implements it with ID/path integrity checks.
 
 ## 3. Deviations from architecture / plan
 
@@ -172,17 +192,28 @@ title) and never mixed with DFT Hartree values.
   `TestResumeConfigValidationBatch`, `TestPreserveUnrequestedBatch`);
   early parameter validation (`TestParameterValidation`) and stale-`*_failed.csv`
   clearing (`TestStaleFailedCsvCleared`).
+- `tests/test_conformers.py` round-05 — sanitized-basename collisions fail before
+  writes while distinct basenames succeed (B-05); complete resume groups are
+  accepted, while truncation, missing/duplicate IDs, inconsistent `n_kept`, and
+  duplicate XYZ paths invalidate the group; a truncated three-conformer batch is
+  regenerated to the full set (M-12).
 - `tests/test_gaussian.py` — physical-line XYZ parsing: empty comment keeps all
   atoms, count-mismatch (either direction) and malformed/non-integer rows raise,
   trailing blank tolerated (`TestXyzParsingByPhysicalLine`).
 - `tests/test_slurm.py` — script resolves its `.com` from a sibling directory
   (`TestSlurmScriptResolvesInput`); log-driven default vs legacy glob
-  (`TestWriteSlurmScriptsLogDriven`); overwrite-on-rerun (`TestWriteSlurmScriptsOverwrite`).
+  (`TestWriteSlurmScriptsLogDriven`); overwrite-on-rerun
+  (`TestWriteSlurmScriptsOverwrite`); smaller reruns prune prior scripts and a
+  zero-job rerun removes all `.sh` files while keeping the fixed log schema
+  (`TestWriteSlurmScriptsCurrentRunCleanup`).
 - `tests/test_pubchem.py` — SMILES key handling (`TestIsomericSmiles`), resolved-row
   schema (`TestResolvedRow`), and current-schema scoring with the stereo bonus
   (`TestScoreCandidateCurrentSchema`).
 - `tests/test_gaussian.py` — per-conformer filenames, ΔE in title, Link1 intact
-  (`TestWriteGaussianComConformer`, `TestWriteGaussianComsFromConformers`).
+  (`TestWriteGaussianComConformer`, `TestWriteGaussianComsFromConformers`);
+  header-only legacy/conformer COM logs, all-write-failure behavior, and the
+  all-ineligible conformer → Gaussian → SLURM zero-job path
+  (`TestEmptyComLogSchemas`).
 - `tests/test_utils.py` — the offline provenance helper: git absent / non-zero /
   timeout give empty string, clean tree gives the SHA, dirty tree appends
   `.dirty` (`TestGitShortSha`, `TestPipelineProvenance`). No test asserts a

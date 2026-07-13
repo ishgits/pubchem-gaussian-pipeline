@@ -152,7 +152,7 @@ code change alone.
   - `search_conformers(molecule_table, ...)` — batch driver. Reads
     `IsomericSMILES` per row, generates/ranks, keeps top `TOP_N=3` distinct,
     writes `{base}_c{ii}.xyz`, appends one provenance row per kept conformer to
-    `conformer_log.csv`. Failures (including missing SMILES) → 
+    `conformer_log.csv`. Failures (including missing SMILES) →
     `conformer_search_failed.csv`. Resume-safe: molecules already in the log are
     skipped. `rel_energy_kcalmol` is ΔE from that molecule's lowest conformer
     (min = 0.0). (Plan Task 3.)
