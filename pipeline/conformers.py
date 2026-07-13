@@ -519,6 +519,37 @@ def _resume_group_is_complete(rows: list[dict]) -> bool:
     return len(set(xyz_paths)) == len(xyz_paths)
 
 
+def validate_unique_output_basenames(labels: list[str]) -> None:
+    """Reject distinct molecule labels that map to the same output basename.
+
+    Repeated occurrences of the same label are allowed because a conformer log
+    has one row per retained conformer. Distinct labels must remain distinct
+    after :func:`sanitize_basename`, and every label must produce a non-empty
+    basename (B-05/B-07).
+    """
+    seen_labels: set[str] = set()
+    seen_basenames: dict[str, str] = {}
+    for value in labels:
+        label = str(value)
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        basename = sanitize_basename(label)
+        if basename == "":
+            raise ValueError(
+                f"Molecule label {label!r} sanitizes to an empty filename; give "
+                f"it a name with at least one alphanumeric character."
+            )
+        if basename in seen_basenames:
+            previous = seen_basenames[basename]
+            raise ValueError(
+                f"Molecule labels {previous!r} and {label!r} both map to output "
+                f"basename {basename!r}. Use unique labels that remain distinct "
+                f"after filename sanitization."
+            )
+        seen_basenames[basename] = label
+
+
 def _resume_partition(
     existing, config: dict, requested: dict, preserve_unrequested: bool = False
 ):
@@ -621,7 +652,10 @@ def search_conformers(
     the molecules requested **this run** — molecules present in the log but not in
     *molecule_table* are dropped, so a changed molecule list yields a clean run.
     Pass ``append=True`` to retain those unrequested molecules' rows (carry-forward
-    behavior).
+    behavior). Before any output mutation, append mode validates sanitized output
+    basenames across the current labels and all labels that would be retained from
+    the existing log; a collision raises rather than overwriting either chemistry
+    (B-07).
 
     Returns the full conformer log as a DataFrame.
     """
@@ -636,8 +670,8 @@ def search_conformers(
         raise ValueError(f"top_n must be >= 1, got {top_n}.")
     if rmsd_prune < 0:
         raise ValueError(f"rmsd_prune must be >= 0, got {rmsd_prune}.")
-    seen_labels: set = set()
-    seen_basenames: dict[str, str] = {}
+    current_labels: list[str] = []
+    seen_labels: set[str] = set()
     for _, row in molecule_table.iterrows():
         name = row.get("name")
         if name is None:
@@ -649,20 +683,24 @@ def search_conformers(
                 f"must be unique so each molecule maps to a distinct output set."
             )
         seen_labels.add(label)
-        basename = sanitize_basename(label)
-        if basename == "":
-            raise ValueError(
-                f"Molecule label {label!r} sanitizes to an empty filename; give "
-                f"it a name with at least one alphanumeric character."
-            )
-        if basename in seen_basenames:
-            previous = seen_basenames[basename]
-            raise ValueError(
-                f"Molecule labels {previous!r} and {label!r} both map to output "
-                f"basename {basename!r}. Use unique labels that remain distinct "
-                f"after filename sanitization."
-            )
-        seen_basenames[basename] = label
+        current_labels.append(label)
+
+    # B-07: append mode retains unrequested rows from the existing log, so output
+    # identity must be validated over the UNION of current and retained labels.
+    # Load that log before any directory creation, failure-log deletion, or file
+    # write, and reuse the DataFrame later for resume partitioning. This also
+    # rejects an already-corrupt append log containing colliding labels.
+    existing = None
+    labels_to_validate = list(current_labels)
+    if append and os.path.exists(log_csv):
+        existing = pd.read_csv(log_csv)
+        current_label_set = set(current_labels)
+        labels_to_validate.extend(
+            str(name)
+            for name in existing.get("name", pd.Series(dtype=object)).tolist()
+            if str(name) not in current_label_set
+        )
+    validate_unique_output_basenames(labels_to_validate)
 
     ensure_dir(xyz_dir)
 
@@ -709,7 +747,8 @@ def search_conformers(
     # pre-provenance log) are stale — drop them and regenerate so downstream never
     # builds on outdated conformers.
     if os.path.exists(log_csv):
-        existing = pd.read_csv(log_csv)
+        if existing is None:
+            existing = pd.read_csv(log_csv)
         done_names, log_rows, stale_names = _resume_partition(
             existing, run_config, requested, preserve_unrequested=append
         )

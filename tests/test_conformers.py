@@ -985,6 +985,82 @@ class TestPreserveUnrequestedBatch:
         # append=True: prior molecules carried forward alongside the new one.
         assert set(log2["name"]) == {"Water", "Glycine", "Adenine"}
 
+    @pytest.mark.parametrize(
+        "prior_label,current_label",
+        [("A+B", "A B"), ("Water", "water")],
+    )
+    def test_append_collision_raises_before_any_mutation(
+        self, tmp_path, monkeypatch, prior_label, current_label
+    ):
+        import pandas as pd
+
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        kw = self._kw(tmp_path)
+        first = pd.DataFrame([{
+            "name": prior_label,
+            "cid": 1,
+            "IsomericSMILES": "O",
+        }])
+        second = pd.DataFrame([{
+            "name": current_label,
+            "cid": 2,
+            "IsomericSMILES": "N",
+        }])
+        first_log = C.search_conformers(first, **kw)
+        log_path = tmp_path / "conformer_log.csv"
+        xyz_paths = [
+            tmp_path / "xyz" / os.path.basename(path)
+            for path in first_log["xyz_path"]
+        ]
+        before_log = log_path.read_bytes()
+        before_xyz = {path: path.read_bytes() for path in xyz_paths}
+        failed_path = tmp_path / "fail.csv"
+        failed_path.write_text("prior failure log\n")
+
+        with pytest.raises(ValueError, match="both map to output basename"):
+            C.search_conformers(second, **self._kw(tmp_path, append=True))
+
+        assert len(calls) == 1  # the colliding molecule was never generated
+        assert log_path.read_bytes() == before_log
+        assert {path: path.read_bytes() for path in xyz_paths} == before_xyz
+        assert failed_path.read_text() == "prior failure log\n"
+
+    def test_already_corrupt_append_log_is_rejected_without_mutation(
+        self, tmp_path
+    ):
+        import pandas as pd
+        import pipeline.conformers as C
+
+        log_path = tmp_path / "conformer_log.csv"
+        pd.DataFrame([{"name": "A+B"}, {"name": "A B"}]).to_csv(
+            log_path, index=False
+        )
+        xyz_dir = tmp_path / "xyz"
+        xyz_dir.mkdir()
+        xyz_path = xyz_dir / "a_b_c00.xyz"
+        xyz_path.write_text("prior geometry\n")
+        before_log = log_path.read_bytes()
+        before_xyz = xyz_path.read_bytes()
+        current = pd.DataFrame([{
+            "name": "Adenine",
+            "cid": 3,
+            "IsomericSMILES": "N",
+        }])
+
+        with pytest.raises(ValueError, match="both map to output basename"):
+            C.search_conformers(
+                current,
+                xyz_dir=str(xyz_dir),
+                log_csv=str(log_path),
+                failed_csv=str(tmp_path / "fail.csv"),
+                append=True,
+            )
+
+        assert log_path.read_bytes() == before_log
+        assert xyz_path.read_bytes() == before_xyz
+        assert not (tmp_path / "fail.csv").exists()
+
 
 class TestStaleFailedCsvCleared:
     """MIN-02: a prior run's *_failed.csv must not survive a later clean run."""
