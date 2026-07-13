@@ -22,6 +22,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 PIPELINE = ROOT / "pipeline"
 STATUS_DOC = ROOT / "docs" / "implementation-status.md"
 GAUSSIAN = PIPELINE / "gaussian.py"
+CONFORMERS = PIPELINE / "conformers.py"
 
 # 1) Placeholder science: real API results / coordinates / energies must never
 #    be replaced by hardcoded, illustrative, random, or mocked values in a
@@ -134,7 +135,7 @@ def _function_runtime_literals(function: ast.FunctionDef) -> str:
 
 
 def _gaussian_provenance_problems(text: str) -> list[str]:
-    """Return missing M-14 writer/threading semantics in Gaussian source text."""
+    """Return missing M-14/M-16 provenance semantics in Gaussian source text."""
     try:
         tree = ast.parse(text)
     except SyntaxError as exc:
@@ -145,6 +146,7 @@ def _gaussian_provenance_problems(text: str) -> list[str]:
     }
     writer = functions.get("write_gaussian_com")
     batch = functions.get("write_gaussian_coms_from_conformers")
+    validator = functions.get("_validate_required_conformer_provenance")
     problems = []
     if writer is None:
         problems.append("write_gaussian_com is missing")
@@ -193,6 +195,75 @@ def _gaussian_provenance_problems(text: str) -> list[str]:
             problems.append(
                 f"write_gaussian_coms_from_conformers does not forward {field}"
             )
+
+    # M-16: the downstream writer must reject nonempty external logs that lack
+    # the source versions. Checking this here prevents a future refactor from
+    # preserving title-token threading while accidentally removing the boundary
+    # validation that makes those tokens trustworthy.
+    required_columns = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name)
+            and target.id == "_REQUIRED_CONFORMER_PROVENANCE_COLUMNS"
+            for target in node.targets
+        ):
+            continue
+        if isinstance(node.value, (ast.Tuple, ast.List)):
+            required_columns = {
+                elt.value
+                for elt in node.value.elts
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+            }
+    for field in ("pipeline_version", "rdkit_version"):
+        if field not in required_columns:
+            problems.append(f"required conformer provenance omits {field}")
+
+    if validator is None:
+        problems.append("_validate_required_conformer_provenance is missing")
+    else:
+        validator_calls = {
+            node.func.id
+            for node in ast.walk(validator)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        if "_optional_text" not in validator_calls:
+            problems.append(
+                "required conformer provenance does not reject blank/NaN values"
+            )
+        if not any(isinstance(node, ast.Raise) for node in ast.walk(validator)):
+            problems.append("required conformer provenance validator never raises")
+
+    read_lines = []
+    validation_lines = []
+    mutation_lines = []
+    for node in ast.walk(batch):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "read_csv":
+            read_lines.append(node.lineno)
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "_validate_required_conformer_provenance"
+        ):
+            validation_lines.append(node.lineno)
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "write_gaussian_com"
+        ) or (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"remove", "to_csv"}
+        ):
+            mutation_lines.append(node.lineno)
+    if not validation_lines:
+        problems.append(
+            "write_gaussian_coms_from_conformers does not validate required provenance"
+        )
+    elif not read_lines or min(validation_lines) <= min(read_lines):
+        problems.append("required conformer provenance validation is not after CSV read")
+    elif mutation_lines and min(validation_lines) >= min(mutation_lines):
+        problems.append("required conformer provenance validation occurs after mutation")
     return problems
 
 
@@ -206,12 +277,114 @@ def check_gaussian_provenance() -> list[str]:
     ]
 
 
+# 5) Append carry-forward integrity (M-15). Unrequested groups cannot be
+# regenerated from the current molecule table, so append mode must validate and
+# reject them before any output mutation rather than copying them untouched.
+def _append_integrity_problems(text: str) -> list[str]:
+    """Return missing M-15 append-boundary semantics in conformer source text."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        return [f"cannot parse pipeline/conformers.py: {exc}"]
+
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    carry = functions.get("_carry_forward_group_is_valid")
+    partition = functions.get("_resume_partition")
+    search = functions.get("search_conformers")
+    problems = []
+    for name, function in (
+        ("_carry_forward_group_is_valid", carry),
+        ("_resume_partition", partition),
+        ("search_conformers", search),
+    ):
+        if function is None:
+            problems.append(f"{name} is missing")
+    if carry is None or partition is None or search is None:
+        return problems
+
+    carry_calls = {
+        node.func.id
+        for node in ast.walk(carry)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    for required in (
+        "_resume_group_is_complete",
+        "_group_identity_is_consistent",
+        "_row_config_matches",
+    ):
+        if required not in carry_calls:
+            problems.append(f"carry-forward validation omits {required}")
+    if "pipeline_commit" not in _function_runtime_literals(carry):
+        problems.append("carry-forward validation omits pipeline_commit field presence")
+
+    partition_calls = {
+        node.func.id
+        for node in ast.walk(partition)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    partition_names = {
+        node.id for node in ast.walk(partition) if isinstance(node, ast.Name)
+    }
+    if "_carry_forward_group_is_valid" not in partition_calls:
+        problems.append("_resume_partition does not validate carry-forward groups")
+    if "preserve_unrequested" not in partition_names:
+        problems.append("_resume_partition lacks append carry-forward gating")
+    if "invalid_retained" not in partition_names:
+        problems.append("_resume_partition does not report invalid retained groups")
+
+    partition_lines = []
+    mutation_lines = []
+    for node in ast.walk(search):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == "_resume_partition":
+            partition_lines.append(node.lineno)
+        if isinstance(node.func, ast.Name) and node.func.id == "ensure_dir":
+            mutation_lines.append(node.lineno)
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {"remove", "to_csv"}:
+            mutation_lines.append(node.lineno)
+
+    guard_lines = []
+    for node in ast.walk(search):
+        if not isinstance(node, ast.If):
+            continue
+        test_names = {
+            child.id for child in ast.walk(node.test) if isinstance(child, ast.Name)
+        }
+        if "invalid_retained" in test_names and any(
+            isinstance(child, ast.Raise) for child in ast.walk(node)
+        ):
+            guard_lines.append(node.lineno)
+    if not partition_lines:
+        problems.append("search_conformers does not partition the existing log")
+    if not guard_lines:
+        problems.append("search_conformers does not raise for invalid retained groups")
+    elif mutation_lines and min(guard_lines) >= min(mutation_lines):
+        problems.append("invalid retained groups are checked after output mutation")
+    elif partition_lines and min(partition_lines) >= min(guard_lines):
+        problems.append("invalid retained groups are checked before partitioning")
+    return problems
+
+
+def check_append_integrity() -> list[str]:
+    if not CONFORMERS.exists():
+        return ["[append-integrity] pipeline/conformers.py is missing"]
+    text = CONFORMERS.read_text(encoding="utf-8", errors="replace")
+    return [
+        f"[append-integrity] {problem}"
+        for problem in _append_integrity_problems(text)
+    ]
+
+
 def main() -> int:
     problems = (
         check_placeholders()
         + check_route_constants()
         + check_status_doc()
         + check_gaussian_provenance()
+        + check_append_integrity()
     )
     if problems:
         print("SCIENTIFIC INVARIANT CHECK FAILED:\n")

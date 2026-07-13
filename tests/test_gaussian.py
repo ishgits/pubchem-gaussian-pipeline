@@ -324,9 +324,9 @@ class TestWriteGaussianComsFromConformers:
         with tempfile.TemporaryDirectory() as tmpdir:
             log_csv = os.path.join(tmpdir, "conformer_log.csv")
             pd.DataFrame([
-                {"name": "Ribose", "conformer_id": 0, "rel_energy_kcalmol": 0.0, "xyz_path": SAMPLE_XYZ},
-                {"name": "Ribose", "conformer_id": 1, "rel_energy_kcalmol": 0.5, "xyz_path": SAMPLE_XYZ},
-                {"name": "Ribose", "conformer_id": 2, "rel_energy_kcalmol": 1.1, "xyz_path": SAMPLE_XYZ},
+                {"name": "Ribose", "conformer_id": 0, "rel_energy_kcalmol": 0.0, "xyz_path": SAMPLE_XYZ, "pipeline_version": "2.0.0", "rdkit_version": "2025.09.3"},
+                {"name": "Ribose", "conformer_id": 1, "rel_energy_kcalmol": 0.5, "xyz_path": SAMPLE_XYZ, "pipeline_version": "2.0.0", "rdkit_version": "2025.09.3"},
+                {"name": "Ribose", "conformer_id": 2, "rel_energy_kcalmol": 1.1, "xyz_path": SAMPLE_XYZ, "pipeline_version": "2.0.0", "rdkit_version": "2025.09.3"},
             ]).to_csv(log_csv, index=False)
 
             outdir = os.path.join(tmpdir, "gaussian_inputs")
@@ -391,6 +391,109 @@ class TestWriteGaussianComsFromConformers:
             "provenance pipeline=2.0.0 commit=abc1234 rdkit=2025.09.3" in text
         )
 
+    def test_batch_missing_commit_writes_unavailable(self, tmp_path):
+        import pandas as pd
+
+        conformer_log = tmp_path / "conformer_log.csv"
+        pd.DataFrame([{
+            "name": "Ribose",
+            "conformer_id": 0,
+            "xyz_path": SAMPLE_XYZ,
+            "pipeline_version": "2.0.0",
+            "rdkit_version": "2025.09.3",
+        }]).to_csv(conformer_log, index=False)
+
+        out = write_gaussian_coms_from_conformers(
+            str(conformer_log),
+            outdir=str(tmp_path / "gaussian_inputs"),
+            log_csv=str(tmp_path / "com_write_log.csv"),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+        )
+
+        with open(out.loc[0, "com_path"]) as f:
+            text = f.read()
+        assert (
+            "provenance pipeline=2.0.0 commit=unavailable rdkit=2025.09.3"
+            in text
+        )
+
+
+class TestRequiredConformerProvenance:
+    """M-16: nonempty external conformer logs must identify their source."""
+
+    @staticmethod
+    def _base_row():
+        return {
+            "name": "Water",
+            "conformer_id": 0,
+            "xyz_path": SAMPLE_XYZ,
+            "pipeline_version": "2.0.0",
+            "rdkit_version": "2025.09.3",
+        }
+
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            ("pipeline_version", "rdkit_version"),
+            ("pipeline_version",),
+            ("rdkit_version",),
+        ],
+    )
+    def test_missing_required_columns_fail_before_writes(
+        self, tmp_path, monkeypatch, missing
+    ):
+        import pandas as pd
+
+        monkeypatch.chdir(tmp_path)
+        row = self._base_row()
+        for column in missing:
+            del row[column]
+        conformer_log = tmp_path / "conformer_log.csv"
+        pd.DataFrame([row]).to_csv(conformer_log, index=False)
+        stale_failure = tmp_path / "com_write_failed.csv"
+        stale_failure.write_bytes(b"prior failure\n")
+        prior_log = tmp_path / "com_write_log.csv"
+        prior_log.write_bytes(b"prior log\n")
+
+        with pytest.raises(ValueError, match="missing required provenance column"):
+            write_gaussian_coms_from_conformers(
+                str(conformer_log),
+                outdir=str(tmp_path / "gaussian_inputs"),
+                log_csv=str(prior_log),
+            )
+
+        assert stale_failure.read_bytes() == b"prior failure\n"
+        assert prior_log.read_bytes() == b"prior log\n"
+        assert not (tmp_path / "gaussian_inputs").exists()
+
+    @pytest.mark.parametrize(
+        "column,value",
+        [
+            ("pipeline_version", ""),
+            ("pipeline_version", None),
+            ("rdkit_version", "   "),
+            ("rdkit_version", float("nan")),
+        ],
+    )
+    def test_blank_required_values_report_rows(self, tmp_path, column, value):
+        import pandas as pd
+
+        row = self._base_row()
+        row[column] = value
+        conformer_log = tmp_path / "conformer_log.csv"
+        pd.DataFrame([row]).to_csv(conformer_log, index=False)
+
+        with pytest.raises(ValueError) as excinfo:
+            write_gaussian_coms_from_conformers(
+                str(conformer_log),
+                outdir=str(tmp_path / "gaussian_inputs"),
+                log_csv=str(tmp_path / "com_write_log.csv"),
+            )
+
+        assert f"{column} missing at row(s) [0]" in str(excinfo.value)
+        assert not (tmp_path / "gaussian_inputs").exists()
+
 
 class TestEmptyComLogSchemas:
     """M-11: zero writes remain valid, readable CSVs for downstream stages."""
@@ -443,6 +546,8 @@ class TestEmptyComLogSchemas:
             "name": "Water",
             "conformer_id": 0,
             "xyz_path": "missing.xyz",
+            "pipeline_version": "2.0.0",
+            "rdkit_version": "2025.09.3",
         }]).to_csv(conformer_log, index=False)
         monkeypatch.setattr(
             G,

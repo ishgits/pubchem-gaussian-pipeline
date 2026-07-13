@@ -30,6 +30,10 @@ _CONFORMER_COM_LOG_COLUMNS = [
     "pipeline_commit",
     "rdkit_version",
 ]
+_REQUIRED_CONFORMER_PROVENANCE_COLUMNS = (
+    "pipeline_version",
+    "rdkit_version",
+)
 
 
 def _optional_text(value) -> str | None:
@@ -38,6 +42,39 @@ def _optional_text(value) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _validate_required_conformer_provenance(conf_log: pd.DataFrame) -> None:
+    """Reject nonempty v2 logs missing source-version provenance (M-16)."""
+    if conf_log.empty:
+        return
+
+    missing_columns = [
+        column
+        for column in _REQUIRED_CONFORMER_PROVENANCE_COLUMNS
+        if column not in conf_log.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "Nonempty conformer log is missing required provenance column(s): "
+            + ", ".join(missing_columns)
+        )
+
+    problems = []
+    for column in _REQUIRED_CONFORMER_PROVENANCE_COLUMNS:
+        bad_rows = [
+            int(index)
+            for index, value in conf_log[column].items()
+            if _optional_text(value) is None
+        ]
+        if bad_rows:
+            problems.append(f"{column} missing at row(s) {bad_rows}")
+
+    if problems:
+        raise ValueError(
+            "Nonempty conformer log has missing required provenance: "
+            + "; ".join(problems)
+        )
 
 
 def xyz_to_gaussian_coords(xyz_path: str) -> str:
@@ -305,6 +342,9 @@ def write_gaussian_coms_from_conformers(
     column (``rel_energy_kcalmol``) is recorded in the title line when present.
     A ``converged`` column (M-04), when present and False, tags the title with
     ``UNCONVERGED_FF_SEED`` so an unminimized best-effort start is visible.
+    Every nonempty log row must contain nonblank ``pipeline_version`` and
+    ``rdkit_version`` values (M-16); they describe conformer generation and are
+    never inferred from the current Gaussian-writer environment.
     ``pipeline_version``, ``pipeline_commit``, and ``rdkit_version`` are copied
     from each row into the COM title section and the COM write log (M-14); a
     missing commit is recorded in the COM as ``commit=unavailable``.
@@ -312,12 +352,18 @@ def write_gaussian_coms_from_conformers(
     contract is unchanged — every keyword argument is forwarded to
     :func:`write_gaussian_com`, exactly as :func:`write_gaussian_coms` does.
     """
+    conf_log = pd.read_csv(conformer_log_csv)
+    # M-16: validate source-version provenance before deleting a stale failure
+    # log, creating an output directory, or writing any COM/log file. These
+    # versions belong to conformer generation and cannot be backfilled safely
+    # from the environment running this downstream stage.
+    _validate_required_conformer_provenance(conf_log)
+
     # Clear any stale failure log from a prior run (MIN-02); rewritten below only
     # if this run actually has failures.
     if os.path.exists("com_write_failed.csv"):
         os.remove("com_write_failed.csv")
 
-    conf_log = pd.read_csv(conformer_log_csv)
     written = []
     failed = []
 

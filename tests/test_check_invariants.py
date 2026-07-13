@@ -66,7 +66,7 @@ class TestStatusDocDriftGuard:
 
 
 class TestGaussianProvenanceGuard:
-    """M-14: the mechanical floor checks semantic provenance threading."""
+    """M-14/M-16: the floor checks threading and input-boundary validation."""
 
     @staticmethod
     def _source():
@@ -102,3 +102,51 @@ class TestGaussianProvenanceGuard:
         )
         problems = check_invariants._gaussian_provenance_problems(broken)
         assert any("title missing token 'rdkit='" in p for p in problems)
+
+    def test_detects_missing_required_source_version(self):
+        broken = self._source().replace(
+            '    "rdkit_version",\n)\n\n\ndef _optional_text',
+            ')\n\n\ndef _optional_text',
+            1,
+        )
+        problems = check_invariants._gaussian_provenance_problems(broken)
+        assert any("required conformer provenance omits rdkit_version" in p for p in problems)
+
+    def test_detects_missing_batch_boundary_validation(self):
+        broken = self._source().replace(
+            "    _validate_required_conformer_provenance(conf_log)\n", "", 1
+        )
+        problems = check_invariants._gaussian_provenance_problems(broken)
+        assert any("does not validate required provenance" in p for p in problems)
+
+
+class TestAppendIntegrityGuard:
+    """M-15: the floor checks retained-group validation before mutation."""
+
+    @staticmethod
+    def _source():
+        return (SCRIPT.parents[1] / "pipeline" / "conformers.py").read_text()
+
+    def test_current_conformer_source_passes(self):
+        assert check_invariants._append_integrity_problems(self._source()) == []
+
+    def test_detects_missing_complete_group_check(self):
+        broken = self._source().replace(
+            "        _resume_group_is_complete(rows)\n",
+            "        True\n",
+            1,
+        )
+        problems = check_invariants._append_integrity_problems(broken)
+        assert any("omits _resume_group_is_complete" in p for p in problems)
+
+    def test_detects_missing_identity_check(self):
+        broken = self._source().replace(
+            "        and _group_identity_is_consistent(rows)\n", "", 1
+        )
+        problems = check_invariants._append_integrity_problems(broken)
+        assert any("omits _group_identity_is_consistent" in p for p in problems)
+
+    def test_detects_missing_commit_field_check(self):
+        broken = self._source().replace('"pipeline_commit" in row', '"other" in row', 1)
+        problems = check_invariants._append_integrity_problems(broken)
+        assert any("omits pipeline_commit" in p for p in problems)

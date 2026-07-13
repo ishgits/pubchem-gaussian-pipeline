@@ -7,11 +7,11 @@
 > `docs/review-history/v2/` (`implementation-status-v2.md` and each
 > `remediation-plan-round-0N-v2.md`).
 
-Maintained by the implementing agent (Claude Code). The reviewer (Codex) must
-verify these claims against the code, not trust them.
+Maintained by the implementing agents. Reviewers must verify these claims
+against the code, not trust them.
 
-**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 7
-(v2 conformer search + remediation rounds 01–07; released as v2.0.0). Works
+**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 8
+(v2 conformer search + remediation rounds 01–08; released as v2.0.0). Works
 against `docs/architecture.md` and `docs/implementation-plan.md`.
 
 ## 1. What was implemented
@@ -65,6 +65,13 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   line unless those optional arguments are explicitly supplied. Route lines,
   coordinates, charge/multiplicity, checkpoint names, and Link1 behavior are
   unchanged.
+- **Required conformer provenance at the Gaussian boundary (round-08 M-16).**
+  `write_gaussian_coms_from_conformers` rejects every nonempty external log that
+  lacks a nonblank `pipeline_version` or `rdkit_version`, before deleting a stale
+  failure log or writing any COM/log output. These source versions describe
+  conformer generation and are never inferred from the downstream writer's
+  environment. Empty zero-job logs remain valid; an absent/blank source commit
+  remains explicit in each COM as `commit=unavailable`.
 - **Notebook (round 01, M-02).** `notebooks/run_pipeline.ipynb` runs the
   conformer path by default; the v1.1 single-geometry path is a commented-out
   labeled legacy appendix.
@@ -99,6 +106,13 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   collides with retained chemistry and also rejects an already-corrupt append
   log. On failure, the prior conformer log, XYZ files, and failure log remain
   unchanged.
+- **Append carry-forward integrity (round-08 M-15).** Every unrequested group
+  retained by `append=True` must pass the same complete-group/XYZ and current
+  config/version checks used for resume, plus internal name/CID/SMILES
+  consistency and explicit `pipeline_commit` field presence. Invalid retained
+  groups abort append mode before any output mutation: they are never copied,
+  silently dropped, partially retained, or regenerated without a current
+  molecule-table identity.
 - **Physical-line XYZ parsing (round-04 B-01).** `xyz_to_gaussian_coords` reads
   line 1 = atom count, line 2 = comment (may be empty), then exactly that many
   coordinate rows; a count mismatch or malformed row raises `ValueError` instead
@@ -131,9 +145,21 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   install step; README leads with the RDKit conformer flow, with Open Babel demoted
   to a labeled legacy v1.1 section.
 
-Required checks locally green after round 07 (rdkit 2025.09.3): `pytest tests/ -q`
-→ **173 passed**; `python scripts/check_invariants.py` → **passed**;
+Required checks locally green after round 08 (RDKit 2025.03.3):
+`pytest tests/ -q` → **204 passed**; `python scripts/check_invariants.py` →
+**passed**; `git diff --check` → **passed**;
 `git ls-files -ci --exclude-standard` → empty.
+
+### Round-08 append and provenance boundary hardening
+
+- **M-15 — Resolved:** append-mode carry-forward groups now undergo
+  complete-group, XYZ-existence, current-config/version, internal-identity, and
+  provenance checks. Invalid retained groups abort append mode before any output
+  mutation because unrequested molecules cannot be regenerated safely from the
+  current input.
+- **M-16 — Resolved:** the conformer-to-Gaussian batch writer rejects nonempty
+  logs with missing/blank pipeline or RDKit provenance before creating any COM.
+  Missing source commits remain explicit as `commit=unavailable`.
 
 ## 2. What was NOT implemented (and why)
 
@@ -157,6 +183,10 @@ Required checks locally green after round 07 (rdkit 2025.09.3): `pytest tests/ -
   files in `conformer_xyz/` or `gaussian_inputs/` cannot enter the documented
   submission path. They may remain on disk; README documents this behavior and
   recommends fresh output directories when studies require physical separation.
+- **Old or damaged append inputs require explicit repair/regeneration.** Round-08
+  M-15 deliberately refuses to infer or backfill retained-group identity and
+  provenance. Include the affected molecule in a current run so it can be
+  regenerated, repair the log/XYZ set, or use `append=False`.
 
 ## 3. Deviations from architecture / plan
 
@@ -225,6 +255,13 @@ title) and never mixed with DFT Hartree values.
   case-only collisions raise before generation; prior log, XYZ, and failure-log
   bytes remain unchanged; distinct basenames append successfully; and an already
   corrupt retained-label set is rejected before mutation (B-07).
+- `tests/test_conformers.py` round-08 — pure retained-group checks cover complete
+  groups, config/version equality, internal CID/SMILES consistency, and explicit
+  commit-field presence. Batch tests corrupt each resume config/version field,
+  truncate a group, remove an XYZ, remove provenance columns, and mix CID/SMILES
+  identities; every case asserts the conformer log, surviving XYZ files, failure
+  log, and full output file set remain byte-for-byte unchanged (M-15). A valid
+  retained group still appends successfully.
 - `tests/test_gaussian.py` — physical-line XYZ parsing: empty comment keeps all
   atoms, count-mismatch (either direction) and malformed/non-integer rows raise,
   trailing blank tolerated (`TestXyzParsingByPhysicalLine`).
@@ -246,14 +283,19 @@ title) and never mixed with DFT Hartree values.
   (`TestEmptyComLogSchemas`). Round-07 tests verify direct and batch provenance,
   explicit unavailable commits, expanded COM-log schemas, unchanged route/
   charge/checkpoint/Link1 fields, and unchanged legacy output (M-14).
+- `tests/test_gaussian.py` round-08 — nonempty logs missing either/both required
+  source-version columns or containing blank/NaN values fail with row details
+  before any output mutation; missing commits still emit
+  `commit=unavailable`; empty logs and current valid logs still succeed (M-16).
 - `tests/test_utils.py` — the offline provenance helper: git absent / non-zero /
   timeout give empty string, clean tree gives the SHA, dirty tree appends
   `.dirty` (`TestGitShortSha`, `TestPipelineProvenance`). No test asserts a
   concrete SHA.
 - `tests/test_check_invariants.py` — the status-doc drift guard fires on a
-  template and passes on a populated file (`TestStatusDocDriftGuard`); an
-  AST-based M-14 guard verifies writer parameters, conformer-row reads,
-  forwarding, and the required title tokens (`TestGaussianProvenanceGuard`).
+  template and passes on a populated file (`TestStatusDocDriftGuard`); AST-based
+  guards verify M-14 provenance threading/title tokens, M-16 required-version
+  validation before mutation, and M-15 complete/config/identity/provenance
+  carry-forward validation plus fail-before-mutation ordering.
 
 RDKit-dependent tests use `pytest.importorskip("rdkit")` so a bare environment
 still runs the pure tests; CI installs rdkit so they execute there.
@@ -277,6 +319,10 @@ still runs the pure tests; CI installs rdkit so they execute there.
   `pipeline_commit` (no git) falls back to `pipeline_version`, which is only as
   precise as manual version bumping. A recorded commit is therefore not a
   guarantee of exact code.
+- **Nonempty pre-round-08 conformer logs without source-version provenance cannot
+  be converted to v2 COM files.** They must be regenerated or repaired from
+  trustworthy records; the Gaussian stage intentionally does not infer historical
+  RDKit/pipeline versions from its current environment.
 
 ## 6. Questions requiring scientific judgment  ← Ish reads this FIRST
 
@@ -305,8 +351,9 @@ still runs the pure tests; CI installs rdkit so they execute there.
   `conformer_log.csv` `pipeline_version`, and best-effort git commit in
   `pipeline_commit`). PubChem User-Agent `gaussian-input-pipeline/2.0`. Branch
   `feat/conformer-search-v2`; base v1.1 (Zenodo 10.5281/zenodo.18894724).
-- RDKit version used for local test runs: 2025.09.3 (recorded per row in
-  `conformer_log.csv` `rdkit_version` at runtime).
+- RDKit version used for the round-08 local test run: 2025.03.3; round-07 used
+  2025.09.3. Runtime conformer generation records its actual version per row in
+  `conformer_log.csv` `rdkit_version`.
 - Conformer stage config: `N_GENERATE=20`, `TOP_N=3`, `RMSD_PRUNE=0.5 Å`,
   `SEED=42`, ranking MMFF94 (UFF logged fallback), energies kcal/mol.
 - Open Babel: not used on the conformer path (RDKit consumes `IsomericSMILES`

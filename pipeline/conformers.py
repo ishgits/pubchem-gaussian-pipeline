@@ -519,6 +519,35 @@ def _resume_group_is_complete(rows: list[dict]) -> bool:
     return len(set(xyz_paths)) == len(xyz_paths)
 
 
+def _group_identity_is_consistent(rows: list[dict]) -> bool:
+    """True iff retained rows agree on one non-empty molecule identity (M-15)."""
+    if not rows:
+        return False
+
+    names = {str(row.get("name")) for row in rows}
+    cid_values = {_cid_key(row.get("cid")) for row in rows}
+    smiles_values = {_smiles_key(row.get("smiles")) for row in rows}
+    return (
+        len(names) == 1
+        and len(cid_values) == 1
+        and None not in cid_values
+        and len(smiles_values) == 1
+        and "" not in smiles_values
+    )
+
+
+def _carry_forward_group_is_valid(rows: list[dict], config: dict) -> bool:
+    """Validate an unrequested group before append-mode carry-forward (M-15)."""
+    return (
+        _resume_group_is_complete(rows)
+        and _group_identity_is_consistent(rows)
+        and all(_row_config_matches(row, config) for row in rows)
+        # The commit is best-effort and may be blank, but the field itself must
+        # exist so an old schema cannot be mistaken for current provenance.
+        and all("pipeline_commit" in row for row in rows)
+    )
+
+
 def validate_unique_output_basenames(labels: list[str]) -> None:
     """Reject distinct molecule labels that map to the same output basename.
 
@@ -569,13 +598,16 @@ def _resume_partition(
     Molecules **not requested this run** are dropped from the new log by default
     (M-02 call 2a): the conformer log represents the molecules requested this run,
     so a changed molecule list yields a clean current run. When
-    *preserve_unrequested* is True (the ``append=True`` opt-in), their rows are
-    carried forward instead.
+    *preserve_unrequested* is True (the ``append=True`` opt-in), each retained
+    group must pass complete-group, XYZ, current-config/version, internal-identity,
+    and provenance checks (M-15). Invalid unrequested groups cannot be regenerated
+    from the current molecule table, so they are reported to the caller instead
+    of being silently kept or dropped.
 
-    Returns ``(done_names, kept_rows, stale_names)`` where ``done_names`` are
-    skipped as complete, ``kept_rows`` are preserved in the new log, and
-    ``stale_names`` (config/version/identity drift or a missing XYZ) are dropped
-    so they regenerate.
+    Returns ``(done_names, kept_rows, stale_names, invalid_retained)`` where
+    ``done_names`` are skipped as complete, ``kept_rows`` are preserved in the
+    new log, ``stale_names`` are requested groups that must regenerate, and
+    ``invalid_retained`` maps invalid unrequested group names to failure reasons.
     """
     groups: dict[str, list] = {}
     for rec in existing.to_dict("records"):
@@ -584,10 +616,17 @@ def _resume_partition(
     done_names: set = set()
     kept_rows: list = []
     stale_names: set = set()
+    invalid_retained: dict[str, str] = {}
     for name, rows in groups.items():
         if name not in requested:
             if preserve_unrequested:
-                kept_rows.extend(rows)  # append=True — carry forward untouched
+                if _carry_forward_group_is_valid(rows, config):
+                    kept_rows.extend(rows)
+                else:
+                    invalid_retained[name] = (
+                        "incomplete group, missing XYZ, config/version mismatch, "
+                        "missing provenance, or inconsistent identity"
+                    )
             continue
         cid = requested[name].get("cid")
         smiles = requested[name].get("smiles")
@@ -600,7 +639,7 @@ def _resume_partition(
             kept_rows.extend(rows)
         else:
             stale_names.add(name)  # config/version/identity drift — regenerate
-    return done_names, kept_rows, stale_names
+    return done_names, kept_rows, stale_names, invalid_retained
 
 
 def search_conformers(
@@ -651,11 +690,13 @@ def search_conformers(
     Scope of the new log (M-02 call 2a): by default the conformer log represents
     the molecules requested **this run** — molecules present in the log but not in
     *molecule_table* are dropped, so a changed molecule list yields a clean run.
-    Pass ``append=True`` to retain those unrequested molecules' rows (carry-forward
-    behavior). Before any output mutation, append mode validates sanitized output
-    basenames across the current labels and all labels that would be retained from
-    the existing log; a collision raises rather than overwriting either chemistry
-    (B-07).
+    Pass ``append=True`` to retain valid unrequested molecules' rows
+    (carry-forward behavior). Before any output mutation, append mode validates
+    sanitized output basenames across the current labels and all retained labels
+    (B-07), then validates every retained group for completeness, XYZ existence,
+    current config/version, internal identity, and provenance (M-15). A collision
+    or invalid retained group raises rather than overwriting, dropping, or
+    silently preserving questionable chemistry.
 
     Returns the full conformer log as a DataFrame.
     """
@@ -702,14 +743,6 @@ def search_conformers(
         )
     validate_unique_output_basenames(labels_to_validate)
 
-    ensure_dir(xyz_dir)
-
-    # Clear any stale failure log from a prior run (MIN-02) so a later clean run
-    # never leaves the notebook surfacing failures that no longer apply. Rewritten
-    # at the end only if this run actually has failures.
-    if os.path.exists(failed_csv):
-        os.remove(failed_csv)
-
     # Provenance captured once per run (M-06): pipeline version + best-effort git
     # commit, so conformer_log rows and XYZ files tie back to the code revision.
     pipeline_version, pipeline_commit = pipeline_provenance()
@@ -740,7 +773,8 @@ def search_conformers(
         if row.get("name") is not None
     }
 
-    # Resume-safe (M-09 / B-02): only skip a molecule whose existing rows were
+    # Resume-safe (M-09 / B-02 / M-15): only skip a requested molecule whose
+    # existing rows were
     # produced with THIS run's config AND identity, and whose XYZ files still
     # exist. Rows from a different seed/n_generate/top_n/rmsd_prune, pipeline or
     # RDKit version, a different cid/smiles, or with a missing XYZ (or a
@@ -749,9 +783,22 @@ def search_conformers(
     if os.path.exists(log_csv):
         if existing is None:
             existing = pd.read_csv(log_csv)
-        done_names, log_rows, stale_names = _resume_partition(
+        done_names, log_rows, stale_names, invalid_retained = _resume_partition(
             existing, run_config, requested, preserve_unrequested=append
         )
+        if invalid_retained:
+            details = "; ".join(
+                f"{name!r}: {reason}"
+                for name, reason in sorted(invalid_retained.items())
+            )
+            raise ValueError(
+                "append=True cannot carry forward invalid existing conformer "
+                "group(s): "
+                + details
+                + ". Rerun with those molecules included so they can be "
+                "regenerated, repair the existing log/XYZ files, or use "
+                "append=False."
+            )
         for name in sorted(stale_names):
             print(
                 f"WARNING: {name!r} in {log_csv} has stale config/identity, "
@@ -762,6 +809,17 @@ def search_conformers(
     else:
         done_names = set()
         log_rows = []
+
+    # All append validation above is intentionally complete before the first
+    # output mutation (M-15). An invalid retained group must leave the prior log,
+    # XYZ files, and failure log byte-for-byte unchanged.
+    ensure_dir(xyz_dir)
+
+    # Clear any stale failure log from a prior run (MIN-02) so a later clean run
+    # never leaves the notebook surfacing failures that no longer apply. Rewritten
+    # at the end only if this run actually has failures.
+    if os.path.exists(failed_csv):
+        os.remove(failed_csv)
 
     failed = []
 

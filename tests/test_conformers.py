@@ -15,7 +15,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pipeline.conformers import (
     UNCONVERGED_FF_SEED,
+    _carry_forward_group_is_valid,
     _finalize_convergence,
+    _group_identity_is_consistent,
     _resume_group_is_complete,
     _resume_partition,
     _row_config_matches,
@@ -687,6 +689,7 @@ class TestResumePartition:
             xyz = tmp_path / f"{name}_{i}.xyz"
             xyz.write_text("1\n\nO 0 0 0\n")
             row = dict(_CFG, name=name, cid=1, smiles="O",
+                       pipeline_commit="abc1234",
                        conformer_id=next_id[name], n_kept=counts[name],
                        xyz_path=str(xyz))
             next_id[name] += 1
@@ -704,11 +707,12 @@ class TestResumePartition:
             ("B", {"seed": 7}),   # requested, config drift
             ("C", {}),            # NOT requested
         )
-        done, kept, stale = _resume_partition(
+        done, kept, stale, invalid = _resume_partition(
             existing, _CFG, self._requested("A", "B")
         )
         assert done == {"A"}
         assert stale == {"B"}
+        assert invalid == {}
         # M-02 default: unrequested C is dropped; only resumed A is kept.
         assert {r["name"] for r in kept} == {"A"}
 
@@ -716,44 +720,60 @@ class TestResumePartition:
         existing = self._rows_with_xyz(
             tmp_path, ("A", {}), ("C", {}),
         )
-        done, kept, stale = _resume_partition(
+        done, kept, stale, invalid = _resume_partition(
             existing, _CFG, self._requested("A"), preserve_unrequested=True
         )
         assert done == {"A"}
+        assert invalid == {}
         # append=True: unrequested C carried forward alongside resumed A.
         assert {r["name"] for r in kept} == {"A", "C"}
 
     def test_changed_identity_is_stale(self, tmp_path):
         # Same name A, but recorded cid differs from requested → stale.
         existing = self._rows_with_xyz(tmp_path, ("A", {"cid": 999}))
-        done, kept, stale = _resume_partition(
+        done, kept, stale, invalid = _resume_partition(
             existing, _CFG, self._requested("A")
         )
         assert done == set()
         assert stale == {"A"}
+        assert invalid == {}
 
     def test_missing_xyz_is_stale(self, tmp_path):
         import pandas as pd
 
         row = dict(_CFG, name="A", cid=1, smiles="O",
                    conformer_id=0, xyz_path=str(tmp_path / "gone.xyz"))
-        done, kept, stale = _resume_partition(
+        done, kept, stale, invalid = _resume_partition(
             pd.DataFrame([row]), _CFG, self._requested("A")
         )
         assert stale == {"A"}
         assert done == set()
+        assert invalid == {}
 
     def test_all_rows_of_a_molecule_must_match(self, tmp_path):
         # Two rows for A: one matches, one drifted → A is stale (regenerate all).
         existing = self._rows_with_xyz(
             tmp_path, ("A", {}), ("A", {"top_n": 1}),
         )
-        done, kept, stale = _resume_partition(
+        done, kept, stale, invalid = _resume_partition(
             existing, _CFG, self._requested("A")
         )
         assert done == set()
         assert stale == {"A"}
         assert kept == []
+        assert invalid == {}
+
+    def test_invalid_unrequested_is_reported_not_kept(self, tmp_path):
+        existing = self._rows_with_xyz(
+            tmp_path, ("A", {}), ("C", {"seed": 7}),
+        )
+        done, kept, stale, invalid = _resume_partition(
+            existing, _CFG, self._requested("A"), preserve_unrequested=True
+        )
+        assert done == {"A"}
+        assert stale == set()
+        assert {row["name"] for row in kept} == {"A"}
+        assert set(invalid) == {"C"}
 
 
 class TestResumeGroupCompleteness:
@@ -800,6 +820,51 @@ class TestResumeGroupCompleteness:
         rows = self._rows(tmp_path)
         rows[1]["xyz_path"] = rows[0]["xyz_path"]
         assert _resume_group_is_complete(rows) is False
+
+
+class TestCarryForwardGroupValidation:
+    """M-15: retained groups need integrity, identity, config, and provenance."""
+
+    def _rows(self, tmp_path):
+        rows = []
+        for conformer_id in range(2):
+            xyz = tmp_path / f"retained_{conformer_id}.xyz"
+            xyz.write_text("1\n\nO 0 0 0\n")
+            rows.append(dict(
+                _CFG,
+                name="Retained",
+                cid=1,
+                smiles="O",
+                pipeline_commit="abc1234",
+                conformer_id=conformer_id,
+                n_kept=2,
+                xyz_path=str(xyz),
+            ))
+        return rows
+
+    def test_valid_group_passes(self, tmp_path):
+        rows = self._rows(tmp_path)
+        assert _group_identity_is_consistent(rows) is True
+        assert _carry_forward_group_is_valid(rows, _CFG) is True
+
+    @pytest.mark.parametrize("field,value", [("cid", 2), ("smiles", "N")])
+    def test_inconsistent_identity_fails(self, tmp_path, field, value):
+        rows = self._rows(tmp_path)
+        rows[1][field] = value
+        assert _group_identity_is_consistent(rows) is False
+        assert _carry_forward_group_is_valid(rows, _CFG) is False
+
+    def test_missing_commit_field_fails(self, tmp_path):
+        rows = self._rows(tmp_path)
+        for row in rows:
+            del row["pipeline_commit"]
+        assert _carry_forward_group_is_valid(rows, _CFG) is False
+
+    def test_blank_commit_value_is_allowed(self, tmp_path):
+        rows = self._rows(tmp_path)
+        for row in rows:
+            row["pipeline_commit"] = ""
+        assert _carry_forward_group_is_valid(rows, _CFG) is True
 
 
 class TestResumeConfigValidationBatch:
@@ -984,6 +1049,95 @@ class TestPreserveUnrequestedBatch:
         log2 = C.search_conformers(self._one(), **self._kw(tmp_path, append=True))
         # append=True: prior molecules carried forward alongside the new one.
         assert set(log2["name"]) == {"Water", "Glycine", "Adenine"}
+
+    @pytest.mark.parametrize(
+        "corruption",
+        [
+            "truncated",
+            "missing_xyz",
+            "seed",
+            "n_generate",
+            "top_n",
+            "rmsd_prune",
+            "pipeline_version",
+            "rdkit_version",
+            "pre_provenance",
+            "inconsistent_cid",
+            "inconsistent_smiles",
+        ],
+    )
+    def test_invalid_retained_group_fails_before_any_mutation(
+        self, tmp_path, monkeypatch, corruption
+    ):
+        import pandas as pd
+
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        kw = self._kw(tmp_path)
+        C.search_conformers(self._two(), **kw)
+        log_path = tmp_path / "conformer_log.csv"
+        existing = pd.read_csv(log_path)
+        water_index = existing.index[existing["name"] == "Water"][0]
+
+        if corruption == "truncated":
+            existing.loc[water_index, "n_kept"] = 2
+        elif corruption == "missing_xyz":
+            os.remove(existing.loc[water_index, "xyz_path"])
+        elif corruption == "pre_provenance":
+            existing = existing.drop(
+                columns=["pipeline_version", "rdkit_version", "pipeline_commit"]
+            )
+        elif corruption in {"inconsistent_cid", "inconsistent_smiles"}:
+            second = existing.loc[water_index].copy()
+            existing.loc[water_index, "n_kept"] = 2
+            second["conformer_id"] = 1
+            second["n_kept"] = 2
+            copied_xyz = tmp_path / "xyz" / "water_c01.xyz"
+            copied_xyz.write_text("1\n\nO 1 0 0\n")
+            second["xyz_path"] = str(copied_xyz)
+            if corruption == "inconsistent_cid":
+                second["cid"] = 999
+            else:
+                second["smiles"] = "N"
+            existing = pd.concat([existing, second.to_frame().T], ignore_index=True)
+        else:
+            mismatches = {
+                "seed": 7,
+                "n_generate": 50,
+                "top_n": 1,
+                "rmsd_prune": 0.75,
+                "pipeline_version": "1.9.0",
+                "rdkit_version": "old-rdkit",
+            }
+            existing.loc[water_index, corruption] = mismatches[corruption]
+
+        if corruption != "missing_xyz":
+            existing.to_csv(log_path, index=False)
+        else:
+            # Preserve the original CSV so it points at the now-missing XYZ.
+            assert not os.path.exists(existing.loc[water_index, "xyz_path"])
+
+        failed_path = tmp_path / "fail.csv"
+        failed_path.write_bytes(b"prior failure log\n")
+        before = {
+            path.relative_to(tmp_path): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+        calls_before = len(calls)
+
+        with pytest.raises(ValueError, match="cannot carry forward invalid") as excinfo:
+            C.search_conformers(self._one(), **self._kw(tmp_path, append=True))
+
+        assert "Water" in str(excinfo.value)
+        assert len(calls) == calls_before
+        after = {
+            path.relative_to(tmp_path): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
+        assert not (tmp_path / "xyz" / "adenine_c00.xyz").exists()
 
     @pytest.mark.parametrize(
         "prior_label,current_label",
