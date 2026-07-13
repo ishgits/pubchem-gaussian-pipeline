@@ -993,6 +993,15 @@ def search_conformers(
                 "account for the complete run manifest; " + "; ".join(details)
             )
 
+    # M-30: every v2 output destination must stay inside the manifest package,
+    # validated BEFORE the first mutation. An xyz_dir or authoritative conformer
+    # log outside the package must raise before any conformer-lineage removal,
+    # directory creation, failure-log deletion, XYZ write, or log rewrite. Every
+    # per-conformer XYZ path is built only as os.path.join(xyz_dir, base + ...),
+    # and the basename is already validated, so directory-level checks suffice.
+    relative_artifact_path(xyz_dir, manifest_path)
+    relative_artifact_path(log_csv, manifest_path)
+
     # A molecule being regenerated replaces its complete prior lineage in this
     # same immutable run.  This happens only after all append/resume validation.
     names_to_replace = set(current_labels) - set(done_names)

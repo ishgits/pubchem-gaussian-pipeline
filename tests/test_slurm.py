@@ -471,3 +471,65 @@ class TestWriteSlurmScriptsCurrentRunCleanup:
         assert list(out.columns) == expected
         assert list(pd.read_csv(slurm_log).columns) == expected
         assert list(slurm_dir.glob("*.sh")) == []
+
+
+class TestPackageBoundaryPreflight:
+    """M-30: in manifest-driven mode the SLURM output root and authoritative log
+    must stay inside the run package, validated before directory creation,
+    SH-lineage removal, stale-script pruning, or script writing — an outside
+    slurm_dir or log_csv fails atomically and the writer is never invoked."""
+
+    def _build_valid_run(self, tmp_path):
+        com_log, manifest_path = write_linked_com_log(
+            tmp_path,
+            [{"name": "Water", "com_path": tmp_path / "gaussian_inputs" / "water_F.com"}],
+            SAMPLE_XYZ,
+        )
+        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_log = tmp_path / "slurm_write_log.csv"
+        write_slurm_scripts(
+            com_log_csv=str(com_log),
+            slurm_dir=str(slurm_dir),
+            log_csv=str(slurm_log),
+            manifest_path=manifest_path,
+        )
+        return com_log, manifest_path, slurm_dir, slurm_log
+
+    @pytest.mark.parametrize("target", ["slurm_dir", "log_csv"])
+    def test_outside_package_destination_fails_atomically(
+        self, tmp_path, monkeypatch, target
+    ):
+        import pipeline.slurm as S
+
+        com_log, manifest_path, slurm_dir, slurm_log = self._build_valid_run(tmp_path)
+
+        manifest_before = open(manifest_path, "rb").read()
+        slurm_log_before = slurm_log.read_bytes()
+        sh_bytes = {p: p.read_bytes() for p in slurm_dir.glob("*.sh")}
+        assert sh_bytes  # the valid run wrote at least one SH script
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("write_slurm_script must not run after preflight")
+
+        monkeypatch.setattr(S, "write_slurm_script", _fail)
+
+        outside = tmp_path.parent / f"m30_slurm_outside_{tmp_path.name}"
+        if target == "slurm_dir":
+            call = dict(slurm_dir=str(outside), log_csv=str(slurm_log))
+        else:
+            call = dict(
+                slurm_dir=str(slurm_dir),
+                log_csv=str(outside / "slurm_write_log.csv"),
+            )
+
+        with pytest.raises(ValueError, match="inside the run package"):
+            S.write_slurm_scripts(
+                com_log_csv=str(com_log),
+                manifest_path=manifest_path,
+                **call,
+            )
+
+        assert open(manifest_path, "rb").read() == manifest_before
+        assert slurm_log.read_bytes() == slurm_log_before
+        assert {p: p.read_bytes() for p in slurm_dir.glob("*.sh")} == sh_bytes
+        assert not outside.exists()

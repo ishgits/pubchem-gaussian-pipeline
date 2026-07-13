@@ -1399,11 +1399,14 @@ class TestStaleFailedCsvCleared:
             failed_csv=str(failed_csv),
         )
 
-        # First run fails eligibility → a failure log is written.
+        # First run fails eligibility → a failure log is written. Both runs share
+        # the shared xyz_dir/log_csv/failed_csv paths, so their manifests must be
+        # rooted at tmp_path to keep every output inside the run package (M-30);
+        # distinct molecule tables give the two manifests distinct digest names.
         monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: "no IsomericSMILES")
         bad_table = pd.DataFrame([{"name": "Bad", "cid": 1, "IsomericSMILES": None}])
         bad_kw = dict(kw, manifest_path=ensure_manifest(
-            tmp_path / "bad_run", bad_table, rdkit_version="test-rdkit"
+            tmp_path, bad_table, rdkit_version="test-rdkit"
         ))
         C.search_conformers(bad_table, **bad_kw)
         assert failed_csv.exists()
@@ -1416,9 +1419,8 @@ class TestStaleFailedCsvCleared:
         )
         good_table = pd.DataFrame([{"name": "Good", "cid": 2, "IsomericSMILES": "O"}])
         good_kw = dict(kw, manifest_path=ensure_manifest(
-            tmp_path / "good_run", good_table, rdkit_version="test-rdkit"
+            tmp_path, good_table, rdkit_version="test-rdkit"
         ))
-        good_kw["xyz_dir"] = str(tmp_path / "good_run" / "xyz")
         C.search_conformers(good_table, **good_kw)
         assert not failed_csv.exists()
 
@@ -1613,3 +1615,93 @@ class TestManifestMoleculeCoverage:
         assert not (tmp_path / "xyz").exists()
         assert not (tmp_path / "conformer_log.csv").exists()
         assert not (tmp_path / "conformer_search_failed.csv").exists()
+
+
+class TestPackageBoundaryPreflight:
+    """M-30: every v2 output destination is validated inside the run package
+    before the first mutation, so an outside xyz_dir or authoritative conformer
+    log fails atomically — no lineage removal, directory creation, failure-log
+    deletion, XYZ write, or log rewrite occurs, and RDKit is never reached."""
+
+    def _build_valid_run(self, tmp_path, monkeypatch):
+        import pandas as pd
+
+        import pipeline.conformers as C
+
+        monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
+        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+        monkeypatch.setattr(
+            C, "pipeline_provenance", lambda: ("2.0.0", "test-clean-commit")
+        )
+        coords = [[("O", 0.0, 0.0, 0.0), ("H", 0.0, 0.0, 0.96)]]
+        monkeypatch.setattr(
+            C, "generate_conformers",
+            lambda smiles, **kw: (coords, [0.0], "MMFF94", [True]),
+        )
+        table = pd.DataFrame([{"name": "Water", "cid": 1, "IsomericSMILES": "O"}])
+        manifest_path = ensure_manifest(
+            tmp_path,
+            table,
+            pipeline_version="2.0.0",
+            pipeline_commit="test-clean-commit",
+            rdkit_version="test-rdkit",
+        )
+        xyz_dir = tmp_path / "xyz"
+        log_csv = tmp_path / "conformer_log.csv"
+        failed_csv = tmp_path / "conformer_search_failed.csv"
+        C.search_conformers(
+            table,
+            xyz_dir=str(xyz_dir),
+            log_csv=str(log_csv),
+            failed_csv=str(failed_csv),
+            manifest_path=manifest_path,
+        )
+        return C, table, manifest_path, xyz_dir, log_csv, failed_csv
+
+    @pytest.mark.parametrize("target", ["xyz_dir", "log_csv"])
+    def test_outside_package_destination_fails_atomically(
+        self, tmp_path, monkeypatch, target
+    ):
+        from pathlib import Path
+
+        C, table, manifest_path, xyz_dir, log_csv, failed_csv = (
+            self._build_valid_run(tmp_path, monkeypatch)
+        )
+        # An existing failure log from a prior run must survive an aborted rerun.
+        failed_csv.write_bytes(b"prior failure\n")
+
+        manifest_before = Path(manifest_path).read_bytes()
+        log_before = log_csv.read_bytes()
+        failed_before = failed_csv.read_bytes()
+        xyz_before = {p: p.read_bytes() for p in xyz_dir.glob("*.xyz")}
+        assert xyz_before  # the valid run wrote at least one XYZ
+
+        # Any generation attempt after preflight would be a bug: prove the stage
+        # aborts during package-boundary preflight, before RDKit is reached.
+        def _fail(*args, **kwargs):
+            raise AssertionError("generate_conformers must not run after preflight")
+
+        monkeypatch.setattr(C, "generate_conformers", _fail)
+
+        outside = tmp_path.parent / f"m30_conformer_outside_{tmp_path.name}"
+        if target == "xyz_dir":
+            call = dict(xyz_dir=str(outside), log_csv=str(log_csv))
+        else:
+            call = dict(
+                xyz_dir=str(xyz_dir),
+                log_csv=str(outside / "conformer_log.csv"),
+            )
+
+        with pytest.raises(ValueError, match="inside the run package"):
+            C.search_conformers(
+                table,
+                failed_csv=str(failed_csv),
+                manifest_path=manifest_path,
+                **call,
+            )
+
+        assert Path(manifest_path).read_bytes() == manifest_before
+        assert log_csv.read_bytes() == log_before
+        assert failed_csv.read_bytes() == failed_before
+        assert {p: p.read_bytes() for p in xyz_dir.glob("*.xyz")} == xyz_before
+        assert not outside.exists()

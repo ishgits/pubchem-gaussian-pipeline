@@ -139,6 +139,27 @@ are also resolved locally:
   compares it exactly with the manifest conformer record during preflight.
   Missing, malformed, or altered convergence metadata fails before prior COM/SH
   lineage, COM files, logs, or failure records are changed.
+- **M-30 — Resolved locally.** Each v2 stage now validates that its output root
+  and authoritative write log stay inside the manifest run package *before* the
+  first mutation, reusing the existing `relative_artifact_path` boundary check
+  (no manifest-schema or path-helper change). `search_conformers` checks
+  `xyz_dir` and `conformer_log.csv` before any conformer-lineage removal,
+  directory creation, failure-log deletion, XYZ write, or log rewrite;
+  `write_gaussian_coms_from_conformers` checks `outdir` right after manifest
+  configuration and the `com_write_log.csv` after source/artifact-set preflight,
+  before any COM/SH lineage removal or write; `write_slurm_scripts` checks
+  `slurm_dir` and `slurm_write_log.csv` in manifest-driven mode before directory
+  creation, SH-lineage removal, stale-script pruning, or script writing (the
+  zero-job path is covered because it still creates `slurm_dir`). The legacy
+  Open Babel v1.1 and explicit `com_dir` paths remain exempt and unchanged. Six
+  new parameterized failure-atomicity regression cases (two per stage) start
+  from an already-valid run, monkeypatch the writer to fail if reached, and
+  prove that an outside destination raises the package-boundary `ValueError`
+  while leaving the manifest, prior artifacts, and all logs byte-for-byte
+  unchanged and creating no outside file. One pre-existing MIN-02 test
+  (`test_failed_csv_cleared_on_clean_rerun`) placed its shared outputs outside a
+  subdirectory manifest package; its fixture was corrected to root both
+  manifests at the shared package directory, preserving the test's intent.
 
 No known local frozen-contract Blocker or Major remains. This exact patched head
 still requires remote CI and one current-head review before the human merge
@@ -175,12 +196,17 @@ pytest 9.1.1
 Current local results:
 
 ```text
-pytest tests/ -q: 278 passed
+pytest tests/ -q: 284 passed
 python scripts/check_invariants.py: passed
 Python compilation: passed
 notebook JSON validation: passed
-clean package copy: 278 passed; invariant checks passed
+clean package copy: 284 passed; invariant checks passed
 ```
+
+The M-30 re-verification above (284 passed, six new package-boundary cases)
+was run with the pinned dependency versions (pandas 3.0.3, requests 2.34.2,
+RDKit 2025.09.3, pytest 9.1.1) on CPython 3.13.3 rather than the 3.12.13
+release-target interpreter recorded above.
 
 The publication checkout also passed `git diff --check` and the
 ignored-but-tracked hygiene guard. Remote CI and Ish's final human merge gate

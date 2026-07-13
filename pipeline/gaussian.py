@@ -556,6 +556,10 @@ def write_gaussian_coms_from_conformers(
     manifest = assert_stage_configuration(
         manifest_path, "gaussian", gaussian_config
     )
+    # M-30: the COM output root must stay inside the manifest package. Validate it
+    # before any lineage removal, directory creation, or COM write so an outdir
+    # outside the package fails before prior COM/SH lineage is removed.
+    relative_artifact_path(outdir, manifest_path)
 
     # Validate all source linkage, hashes, and destination mappings before the
     # first directory/log/manifest mutation.  A conformer-derived COM has no
@@ -632,6 +636,12 @@ def write_gaussian_coms_from_conformers(
         observed_xyz_ids,
         source_label="conformer_log.csv",
     )
+
+    # M-30: the authoritative COM write log must also stay inside the package.
+    # Validate it after all source/artifact-set preflight but before the first
+    # mutation, so a log_csv outside the package fails before any failure-log
+    # deletion, COM/SH lineage removal, COM write, or log rewrite.
+    relative_artifact_path(log_csv, manifest_path)
 
     # Clear any stale failure log from a prior run (MIN-02); rewritten below only
     # if this run actually has failures.

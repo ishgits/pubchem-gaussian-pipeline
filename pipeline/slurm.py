@@ -275,6 +275,13 @@ def write_slurm_scripts(
         )
         prepared = _validated_logged_com_paths(com_log, manifest_path, manifest)
         com_paths = [item["com_path"] for item in prepared]
+        # M-30: the SLURM output root and authoritative log must stay inside the
+        # manifest package. Validate both before any directory creation, SH-lineage
+        # removal, stale-script pruning, or script writing. The zero-job path also
+        # creates slurm_dir, so this must run even when no scripts are written.
+        # Legacy explicit com_dir mode stays exempt from the strict v2 contract.
+        relative_artifact_path(slurm_dir, manifest_path)
+        relative_artifact_path(log_csv, manifest_path)
 
     # Prove one-to-one source→destination mapping and validate the template for
     # every job before pruning/creating any file or rewriting either log.

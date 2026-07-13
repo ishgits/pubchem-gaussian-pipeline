@@ -851,3 +851,99 @@ class TestConvergencePreflight:
         assert failure_log.read_bytes() == b"prior failure\n"
         for path, expected in com_bytes.items():
             assert path.read_bytes() == expected
+
+
+class TestPackageBoundaryPreflight:
+    """M-30: the COM output root and authoritative COM log must stay inside the
+    run package, validated before the first mutation — an outside outdir or
+    log_csv fails before prior COM/SH lineage is removed, any COM is written, or
+    either log is rewritten, and the batch writer is never invoked."""
+
+    def _build_valid_run(self, tmp_path):
+        from pipeline.slurm import write_slurm_scripts
+
+        conformer_log, manifest_path = write_linked_conformer_log(
+            tmp_path,
+            [
+                {"name": "Ribose", "conformer_id": 0, "rel_energy_kcalmol": 0.0},
+                {"name": "Ribose", "conformer_id": 1, "rel_energy_kcalmol": 0.5},
+            ],
+            SAMPLE_XYZ,
+        )
+        outdir = tmp_path / "gaussian_inputs"
+        com_log = tmp_path / "com_write_log.csv"
+        write_gaussian_coms_from_conformers(
+            conformer_log,
+            outdir=str(outdir),
+            log_csv=str(com_log),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            manifest_path=manifest_path,
+        )
+        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_log = tmp_path / "slurm_write_log.csv"
+        write_slurm_scripts(
+            com_log_csv=str(com_log),
+            slurm_dir=str(slurm_dir),
+            log_csv=str(slurm_log),
+            manifest_path=manifest_path,
+        )
+        return {
+            "conformer_log": conformer_log,
+            "manifest_path": manifest_path,
+            "outdir": outdir,
+            "com_log": com_log,
+            "slurm_dir": slurm_dir,
+            "slurm_log": slurm_log,
+        }
+
+    @pytest.mark.parametrize("target", ["outdir", "log_csv"])
+    def test_outside_package_destination_fails_atomically(
+        self, tmp_path, monkeypatch, target
+    ):
+        import pipeline.gaussian as G
+
+        # com_write_failed.csv is deleted by relative path (CWD); anchor it here.
+        monkeypatch.chdir(tmp_path)
+        run = self._build_valid_run(tmp_path)
+        failure_log = tmp_path / "com_write_failed.csv"
+        failure_log.write_bytes(b"prior failure\n")
+
+        manifest_before = Path(run["manifest_path"]).read_bytes()
+        com_log_before = run["com_log"].read_bytes()
+        slurm_log_before = run["slurm_log"].read_bytes()
+        failure_before = failure_log.read_bytes()
+        com_bytes = {p: p.read_bytes() for p in run["outdir"].glob("*.com")}
+        sh_bytes = {p: p.read_bytes() for p in run["slurm_dir"].glob("*.sh")}
+        assert com_bytes and sh_bytes  # the valid run wrote COM and SH artifacts
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("write_gaussian_com must not run after preflight")
+
+        monkeypatch.setattr(G, "write_gaussian_com", _fail)
+
+        outside = tmp_path.parent / f"m30_gaussian_outside_{tmp_path.name}"
+        if target == "outdir":
+            call = dict(outdir=str(outside), log_csv=str(run["com_log"]))
+        else:
+            call = dict(
+                outdir=str(run["outdir"]),
+                log_csv=str(outside / "com_write_log.csv"),
+            )
+
+        with pytest.raises(ValueError, match="inside the run package"):
+            G.write_gaussian_coms_from_conformers(
+                run["conformer_log"],
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                manifest_path=run["manifest_path"],
+                **call,
+            )
+
+        assert Path(run["manifest_path"]).read_bytes() == manifest_before
+        assert run["com_log"].read_bytes() == com_log_before
+        assert run["slurm_log"].read_bytes() == slurm_log_before
+        assert failure_log.read_bytes() == failure_before
+        assert {p: p.read_bytes() for p in run["outdir"].glob("*.com")} == com_bytes
+        assert {p: p.read_bytes() for p in run["slurm_dir"].glob("*.sh")} == sh_bytes
+        assert not outside.exists()
