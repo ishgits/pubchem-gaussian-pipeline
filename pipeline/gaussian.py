@@ -65,6 +65,29 @@ def _optional_text(value) -> str | None:
     return text or None
 
 
+
+
+def _parse_converged_flag(value, *, row_index: int) -> bool:
+    """Parse one manifest-linked convergence flag without permissive fallback."""
+    if value is None or pd.isna(value):
+        raise ValueError(f"Conformer row {row_index} converged value is missing.")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, float) and value in (0.0, 1.0):
+        return bool(int(value))
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    raise ValueError(
+        f"Conformer row {row_index} has invalid converged value {value!r}; "
+        "expected true/false."
+    )
+
 def _validate_required_conformer_provenance(conf_log: pd.DataFrame) -> None:
     """Reject nonempty v2 logs missing source-version provenance (M-16)."""
     if conf_log.empty:
@@ -561,6 +584,11 @@ def write_gaussian_coms_from_conformers(
             raise ValueError(f"Conformer row {int(index)} molecule identity disagrees with manifest.")
         if int(row["conformer_id"]) != conformer_record["conformer_id"]:
             raise ValueError(f"Conformer row {int(index)} ID disagrees with manifest.")
+        converged = _parse_converged_flag(row.get("converged"), row_index=int(index))
+        if converged is not bool(conformer_record["converged"]):
+            raise ValueError(
+                f"Conformer row {int(index)} convergence disagrees with manifest."
+            )
         rel_energy = row.get("rel_energy_kcalmol")
         if pd.isna(rel_energy) or abs(
             float(rel_energy) - float(conformer_record["relative_energy_kcalmol"])
@@ -587,7 +615,7 @@ def write_gaussian_coms_from_conformers(
         com_artifact_id = stable_record_id(
             manifest["run_id"], "com", xyz_artifact_id
         )
-        prepared.append((row, xyz_artifact, com_path, com_artifact_id))
+        prepared.append((row, xyz_artifact, com_path, com_artifact_id, converged))
 
     # A stage CSV is a subordinate index, not an independent source of truth.
     # After validating each present row, reject a valid-looking subset or extra
@@ -617,21 +645,13 @@ def write_gaussian_coms_from_conformers(
     written = []
     failed = []
 
-    for row, xyz_artifact, expected_com_path, com_artifact_id in prepared:
+    for row, xyz_artifact, expected_com_path, com_artifact_id, converged in prepared:
         name = row["name"]
         xyz_path = row["xyz_path"]
         conformer_id = int(row["conformer_id"])
         rel_e = row.get("rel_energy_kcalmol")
         rel_e = None if pd.isna(rel_e) else float(rel_e)
-        # Missing/NaN converged column → assume converged (backward compatible).
-        # Handle both native-bool and CSV string ("True"/"False") representations.
-        conv = row.get("converged")
-        if conv is None or (isinstance(conv, float) and pd.isna(conv)):
-            unconverged = False
-        elif isinstance(conv, str):
-            unconverged = conv.strip().lower() in ("false", "0", "no")
-        else:
-            unconverged = not bool(conv)
+        unconverged = not converged
         pipeline_version = _optional_text(row.get("pipeline_version"))
         pipeline_commit = _optional_text(row.get("pipeline_commit"))
         rdkit_version = _optional_text(row.get("rdkit_version"))

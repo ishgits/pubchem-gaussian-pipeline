@@ -129,6 +129,17 @@ are also resolved locally:
   manifest is written. Distinct labels such as `Water` and `water` therefore
   fail without leaving an immutable manifest for an invalid one-to-one mapping.
 
+- **B-10 — Resolved locally.** `search_conformers()` now requires the runtime
+  molecule identities to cover the immutable manifest exactly when
+  `append=False`. With `append=True`, current rows plus fully validated retained
+  groups must account for every manifest molecule. Missing configured molecules
+  fail before lineage, logs, failure records, or XYZ outputs are mutated.
+- **M-29 — Resolved locally.** The Gaussian stage now requires a nonblank,
+  parseable convergence flag for every manifest-linked conformer-log row and
+  compares it exactly with the manifest conformer record during preflight.
+  Missing, malformed, or altered convergence metadata fails before prior COM/SH
+  lineage, COM files, logs, or failure records are changed.
+
 No known local frozen-contract Blocker or Major remains. This exact patched head
 still requires remote CI and one current-head review before the human merge
 decision; the status does not treat the prior review as approval of new code.
@@ -164,11 +175,11 @@ pytest 9.1.1
 Current local results:
 
 ```text
-pytest tests/ -q: 272 passed
+pytest tests/ -q: 278 passed
 python scripts/check_invariants.py: passed
 Python compilation: passed
 notebook JSON validation: passed
-clean package copy: 272 passed; invariant checks passed
+clean package copy: 278 passed; invariant checks passed
 ```
 
 The publication checkout also passed `git diff --check` and the

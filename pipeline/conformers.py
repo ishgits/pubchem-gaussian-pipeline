@@ -796,11 +796,11 @@ def search_conformers(
     downstream Gaussian inputs are never built from conformers produced under a
     different configuration, for a different structure, or from a damaged log.
 
-    Scope of the new log (M-02 call 2a): by default the conformer log represents
-    the molecules requested **this run** — molecules present in the log but not in
-    *molecule_table* are dropped, so a changed molecule list yields a clean run.
-    Pass ``append=True`` to retain valid unrequested molecules' rows
-    (carry-forward behavior). Before any output mutation, append mode validates
+    Manifest coverage (B-10): with ``append=False``, *molecule_table* must match
+    the immutable manifest molecule set exactly. With ``append=True``, a subset is
+    allowed only when valid retained rows account for every other manifest
+    molecule; no configured molecule may disappear silently. Before any output
+    mutation, append mode validates
     sanitized output basenames across the current labels and all retained labels
     (B-07), then validates every retained group for completeness, XYZ existence,
     current config/version, internal identity, and provenance (M-15). A collision
@@ -921,6 +921,16 @@ def search_conformers(
         raise ValueError(
             "Runtime molecule identities disagree with run manifest; create a new manifest."
         )
+    if not append and requested_identities != configured_identities:
+        missing = sorted(
+            record["molecule_name"]
+            for record in configured_records
+            if record["molecule_identity_hash"] not in requested_identities
+        )
+        raise ValueError(
+            "append=False requires the runtime molecule table to match the run "
+            "manifest exactly; missing manifest molecule(s): " + ", ".join(missing)
+        )
 
     # Resume-safe (M-09 / B-02 / M-15): only skip a requested molecule whose
     # existing rows were
@@ -963,6 +973,25 @@ def search_conformers(
     else:
         done_names = set()
         log_rows = []
+
+    if append:
+        accounted_names = set(requested)
+        accounted_names.update(str(row.get("name")) for row in log_rows)
+        configured_names = {
+            str(record["molecule_name"]) for record in configured_records
+        }
+        if accounted_names != configured_names:
+            missing = sorted(configured_names - accounted_names)
+            extra = sorted(accounted_names - configured_names)
+            details = []
+            if missing:
+                details.append("missing manifest molecule(s): " + ", ".join(missing))
+            if extra:
+                details.append("unexpected molecule(s): " + ", ".join(extra))
+            raise ValueError(
+                "append=True requires current rows plus valid retained rows to "
+                "account for the complete run manifest; " + "; ".join(details)
+            )
 
     # A molecule being regenerated replaces its complete prior lineage in this
     # same immutable run.  This happens only after all append/resume validation.

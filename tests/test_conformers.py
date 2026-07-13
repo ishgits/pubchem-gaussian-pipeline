@@ -1195,20 +1195,30 @@ class TestPreserveUnrequestedBatch:
 
         return pd.DataFrame([{"name": "Adenine", "cid": 3, "IsomericSMILES": "O"}])
 
-    def test_default_drops_unrequested(self, tmp_path, monkeypatch):
+    def test_default_subset_rejected(self, tmp_path, monkeypatch):
+        import pandas as pd
+
         calls = []
         C = self._patch(monkeypatch, calls)
-        C.search_conformers(self._two(), **self._kw(tmp_path))
-        log2 = C.search_conformers(self._one(), **self._kw(tmp_path))
-        # Default: only the molecule requested this run remains in the log.
-        assert set(log2["name"]) == {"Adenine"}
+        full = pd.concat([self._two(), self._one()], ignore_index=True)
+        kw = self._kw(tmp_path, manifest_table=full)
+        C.search_conformers(full, **kw)
+        before = (tmp_path / "conformer_log.csv").read_bytes()
+        with pytest.raises(ValueError, match="match the run manifest exactly"):
+            C.search_conformers(self._one(), **kw)
+        assert (tmp_path / "conformer_log.csv").read_bytes() == before
 
     def test_append_retains_all(self, tmp_path, monkeypatch):
+        import pandas as pd
+
         calls = []
         C = self._patch(monkeypatch, calls)
-        C.search_conformers(self._two(), **self._kw(tmp_path))
-        log2 = C.search_conformers(self._one(), **self._kw(tmp_path, append=True))
-        # append=True: prior molecules carried forward alongside the new one.
+        full = pd.concat([self._two(), self._one()], ignore_index=True)
+        kw = self._kw(tmp_path, manifest_table=full)
+        C.search_conformers(full, **kw)
+        log2 = C.search_conformers(self._one(), **dict(kw, append=True))
+        # append=True may operate on a subset only when valid retained rows account
+        # for every other manifest molecule.
         assert set(log2["name"]) == {"Water", "Glycine", "Adenine"}
 
     @pytest.mark.parametrize(
@@ -1235,8 +1245,9 @@ class TestPreserveUnrequestedBatch:
 
         calls = []
         C = self._patch(monkeypatch, calls)
-        kw = self._kw(tmp_path)
-        C.search_conformers(self._two(), **kw)
+        full = pd.concat([self._two(), self._one()], ignore_index=True)
+        kw = self._kw(tmp_path, manifest_table=full)
+        C.search_conformers(full, **kw)
         log_path = tmp_path / "conformer_log.csv"
         existing = pd.read_csv(log_path)
         water_index = existing.index[existing["name"] == "Water"][0]
@@ -1290,7 +1301,7 @@ class TestPreserveUnrequestedBatch:
         calls_before = len(calls)
 
         with pytest.raises(ValueError, match="cannot carry forward invalid") as excinfo:
-            C.search_conformers(self._one(), **self._kw(tmp_path, append=True))
+            C.search_conformers(self._one(), **dict(kw, append=True))
 
         assert "Water" in str(excinfo.value)
         assert len(calls) == calls_before
@@ -1300,7 +1311,6 @@ class TestPreserveUnrequestedBatch:
             if path.is_file()
         }
         assert after == before
-        assert not (tmp_path / "xyz" / "adenine_c00.xyz").exists()
 
     @pytest.mark.parametrize(
         "prior_label,current_label",
@@ -1510,3 +1520,96 @@ class TestParameterValidation:
             "water_c00.xyz",
             "ammonia_c00.xyz",
         }
+
+
+class TestManifestMoleculeCoverage:
+    """B-10: runtime molecule inputs must account for the immutable manifest."""
+
+    @staticmethod
+    def _patch(monkeypatch):
+        import pipeline.conformers as C
+
+        monkeypatch.setattr(C, "check_conformer_eligibility", lambda smiles: None)
+        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+        monkeypatch.setattr(C, "pipeline_provenance", lambda: ("2.0.0", "test-clean-commit"))
+        monkeypatch.setattr(
+            C,
+            "generate_conformers",
+            lambda smiles, **kw: (
+                [[("O", 0.0, 0.0, 0.0)]], [0.0], "MMFF94", [True]
+            ),
+        )
+        return C
+
+    @staticmethod
+    def _tables():
+        import pandas as pd
+
+        full = pd.DataFrame([
+            {"name": "Water", "cid": 1, "IsomericSMILES": "O"},
+            {"name": "Ammonia", "cid": 2, "IsomericSMILES": "N"},
+        ])
+        return full, full.iloc[[0]].reset_index(drop=True)
+
+    def test_append_false_subset_fails_before_mutation(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        C = self._patch(monkeypatch)
+        full, subset = self._tables()
+        manifest_path = ensure_manifest(
+            tmp_path,
+            full,
+            pipeline_version="2.0.0",
+            pipeline_commit="test-clean-commit",
+            rdkit_version="test-rdkit",
+        )
+        manifest_before = Path(manifest_path).read_bytes()
+        prior_log = tmp_path / "conformer_log.csv"
+        prior_log.write_bytes(b"prior log\n")
+        prior_failure = tmp_path / "conformer_search_failed.csv"
+        prior_failure.write_bytes(b"prior failure\n")
+
+        with pytest.raises(ValueError, match="match the run manifest exactly"):
+            C.search_conformers(
+                subset,
+                xyz_dir=str(tmp_path / "xyz"),
+                log_csv=str(prior_log),
+                failed_csv=str(prior_failure),
+                manifest_path=manifest_path,
+            )
+
+        assert Path(manifest_path).read_bytes() == manifest_before
+        assert prior_log.read_bytes() == b"prior log\n"
+        assert prior_failure.read_bytes() == b"prior failure\n"
+        assert not (tmp_path / "xyz").exists()
+
+    def test_append_true_requires_current_plus_retained_complete_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        from pathlib import Path
+
+        C = self._patch(monkeypatch)
+        full, subset = self._tables()
+        manifest_path = ensure_manifest(
+            tmp_path,
+            full,
+            pipeline_version="2.0.0",
+            pipeline_commit="test-clean-commit",
+            rdkit_version="test-rdkit",
+        )
+        manifest_before = Path(manifest_path).read_bytes()
+
+        with pytest.raises(ValueError, match="account for the complete run manifest"):
+            C.search_conformers(
+                subset,
+                xyz_dir=str(tmp_path / "xyz"),
+                log_csv=str(tmp_path / "conformer_log.csv"),
+                failed_csv=str(tmp_path / "conformer_search_failed.csv"),
+                append=True,
+                manifest_path=manifest_path,
+            )
+
+        assert Path(manifest_path).read_bytes() == manifest_before
+        assert not (tmp_path / "xyz").exists()
+        assert not (tmp_path / "conformer_log.csv").exists()
+        assert not (tmp_path / "conformer_search_failed.csv").exists()

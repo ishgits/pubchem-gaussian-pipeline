@@ -799,3 +799,55 @@ class TestEmptyComLogSchemas:
             "com_artifact_id", "com_path", "com_sha256", "sh_path",
             "sh_sha256", "status",
         ]
+
+
+class TestConvergencePreflight:
+    """M-29: convergence metadata must match the manifest before mutation."""
+
+    @pytest.mark.parametrize("bad_value", ["", None, "maybe", True])
+    def test_damaged_convergence_rejected_before_lineage_mutation(
+        self, tmp_path, monkeypatch, bad_value
+    ):
+        import pandas as pd
+
+        monkeypatch.chdir(tmp_path)
+        conformer_log, manifest_path = write_linked_conformer_log(
+            tmp_path,
+            [{"name": "Seed", "conformer_id": 0, "converged": False}],
+            SAMPLE_XYZ,
+        )
+        com_log = tmp_path / "com_write_log.csv"
+        outdir = tmp_path / "gaussian_inputs"
+        first = write_gaussian_coms_from_conformers(
+            conformer_log,
+            outdir=str(outdir),
+            log_csv=str(com_log),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            manifest_path=manifest_path,
+        )
+        failure_log = tmp_path / "com_write_failed.csv"
+        failure_log.write_bytes(b"prior failure\n")
+        manifest_before = Path(manifest_path).read_bytes()
+        log_before = com_log.read_bytes()
+        com_bytes = {Path(path): Path(path).read_bytes() for path in first["com_path"]}
+
+        rows = pd.read_csv(conformer_log).astype({"converged": object})
+        rows.loc[0, "converged"] = bad_value
+        rows.to_csv(conformer_log, index=False)
+
+        with pytest.raises(ValueError, match="converged|convergence"):
+            write_gaussian_coms_from_conformers(
+                conformer_log,
+                outdir=str(outdir),
+                log_csv=str(com_log),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                manifest_path=manifest_path,
+            )
+
+        assert Path(manifest_path).read_bytes() == manifest_before
+        assert com_log.read_bytes() == log_before
+        assert failure_log.read_bytes() == b"prior failure\n"
+        for path, expected in com_bytes.items():
+            assert path.read_bytes() == expected

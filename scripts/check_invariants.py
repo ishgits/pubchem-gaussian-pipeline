@@ -633,6 +633,18 @@ def _frozen_matrix_problems(
             problems.append(f"Gaussian manifest boundary omits {token!r}")
     if "require_exact_artifact_id_set(" not in gaussian_text:
         problems.append("Gaussian boundary omits exact manifest XYZ-set validation")
+    for token in (
+        "_parse_converged_flag(",
+        "convergence disagrees with manifest",
+    ):
+        if token not in gaussian_text:
+            problems.append(f"Gaussian convergence preflight omits {token!r}")
+    for token in (
+        "requested_identities != configured_identities",
+        "account for the complete run manifest",
+    ):
+        if token not in conformer_text:
+            problems.append(f"Conformer manifest coverage omits {token!r}")
 
     sh_fields = (
         "# run_id=", "# artifact_id=", "# source_com_relative_path=",
