@@ -16,6 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pipeline.conformers import (
     UNCONVERGED_FF_SEED,
     _finalize_convergence,
+    _resume_partition,
+    _row_config_matches,
     check_conformer_eligibility,
     select_converged_top_n,
     select_top_n,
@@ -587,3 +589,167 @@ class TestProvenanceLogging:
             comment = f.read().splitlines()[1]  # line 2 of an XYZ file is the comment
         assert "pver=" in comment
         assert "pcommit=" in comment
+
+
+# ---------------------------------------------------------------------------
+# M-09 — resume must validate recorded config, not just the molecule name
+# ---------------------------------------------------------------------------
+
+_CFG = {"seed": 42, "n_generate": 20, "top_n": 3, "rmsd_prune": 0.5,
+        "pipeline_version": "0.2.0"}
+
+
+class TestRowConfigMatches:
+    """Pure config-match predicate (no RDKit)."""
+
+    def _row(self, **override):
+        row = dict(_CFG)
+        row.update(override)
+        return row
+
+    def test_exact_match(self):
+        assert _row_config_matches(self._row(), _CFG) is True
+
+    def test_seed_mismatch(self):
+        assert _row_config_matches(self._row(seed=7), _CFG) is False
+
+    def test_n_generate_mismatch(self):
+        assert _row_config_matches(self._row(n_generate=50), _CFG) is False
+
+    def test_top_n_mismatch(self):
+        assert _row_config_matches(self._row(top_n=1), _CFG) is False
+
+    def test_pipeline_version_mismatch(self):
+        assert _row_config_matches(self._row(pipeline_version="0.1.0"), _CFG) is False
+
+    def test_rmsd_within_float_tolerance(self):
+        assert _row_config_matches(self._row(rmsd_prune=0.5 + 1e-12), _CFG) is True
+
+    def test_rmsd_mismatch(self):
+        assert _row_config_matches(self._row(rmsd_prune=0.75), _CFG) is False
+
+    def test_missing_column_is_mismatch(self):
+        row = self._row()
+        del row["top_n"]  # pre-provenance / older-schema log
+        assert _row_config_matches(row, _CFG) is False
+
+
+class TestResumePartition:
+    """Pure partition of an existing log into done / kept / stale (no RDKit)."""
+
+    def test_partition(self):
+        import pandas as pd
+
+        rows = [
+            dict(_CFG, name="A", conformer_id=0),           # requested, matches
+            dict(_CFG, name="B", conformer_id=0, seed=7),   # requested, drift
+            dict(_CFG, name="C", conformer_id=0),           # NOT requested
+        ]
+        existing = pd.DataFrame(rows)
+        done, kept, stale = _resume_partition(
+            existing, _CFG, requested_names={"A", "B"}
+        )
+        assert done == {"A"}
+        assert stale == {"B"}
+        # A (resumed) and C (untouched) are kept; B's stale rows are dropped.
+        assert {r["name"] for r in kept} == {"A", "C"}
+
+    def test_all_rows_of_a_molecule_must_match(self):
+        import pandas as pd
+
+        # Two rows for A: one matches, one drifted → A is stale (regenerate all).
+        rows = [
+            dict(_CFG, name="A", conformer_id=0),
+            dict(_CFG, name="A", conformer_id=1, top_n=1),
+        ]
+        done, kept, stale = _resume_partition(
+            pd.DataFrame(rows), _CFG, requested_names={"A"}
+        )
+        assert done == set()
+        assert stale == {"A"}
+        assert kept == []
+
+
+class TestResumeConfigValidationBatch:
+    """search_conformers end-to-end with RDKit stubbed (synthetic/offline)."""
+
+    def _patch(self, monkeypatch, calls):
+        import pipeline.conformers as C
+
+        monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
+        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+
+        def gen(smiles, **kw):
+            calls.append(smiles)
+            return ([[("O", 0.0, 0.0, 0.0)]], [0.0], "MMFF94", [True])
+
+        monkeypatch.setattr(C, "generate_conformers", gen)
+        return C
+
+    def _table(self, name="Water", smiles="O"):
+        import pandas as pd
+
+        return pd.DataFrame([{"name": name, "cid": 1, "IsomericSMILES": smiles}])
+
+    def _kw(self, tmp_path, **over):
+        kw = dict(
+            xyz_dir=str(tmp_path / "xyz"),
+            log_csv=str(tmp_path / "conformer_log.csv"),
+            failed_csv=str(tmp_path / "fail.csv"),
+            seed=42, n_generate=20, top_n=3, rmsd_prune=0.5,
+        )
+        kw.update(over)
+        return kw
+
+    def test_matching_config_skips_regeneration(self, tmp_path, monkeypatch):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        C.search_conformers(self._table(), **self._kw(tmp_path))  # same config
+        assert len(calls) == 1  # second run resumed; molecule NOT regenerated
+
+    def test_changed_seed_regenerates(self, tmp_path, monkeypatch, capsys):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        C.search_conformers(self._table(), **self._kw(tmp_path, seed=42))
+        log2 = C.search_conformers(self._table(), **self._kw(tmp_path, seed=7))
+        assert len(calls) == 2  # regenerated under the new seed
+        assert set(log2[log2["name"] == "Water"]["seed"].astype(int)) == {7}
+        assert "regenerating" in capsys.readouterr().out
+
+    def test_changed_top_n_regenerates(self, tmp_path, monkeypatch):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        C.search_conformers(self._table(), **self._kw(tmp_path, top_n=1))
+        C.search_conformers(self._table(), **self._kw(tmp_path, top_n=3))
+        assert len(calls) == 2  # the TOP_N=1→3 case from the finding
+
+    def test_pre_provenance_log_regenerates(self, tmp_path, monkeypatch):
+        import pandas as pd
+
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        log_csv = tmp_path / "conformer_log.csv"
+        # Old-schema log: no n_generate/top_n/pipeline_version columns.
+        pd.DataFrame([{
+            "name": "Water", "cid": 1, "conformer_id": 0,
+            "seed": 42, "rmsd_prune": 0.5, "xyz_path": "old.xyz",
+        }]).to_csv(log_csv, index=False)
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        assert len(calls) == 1  # name present but stale → regenerated
+
+    def test_molecule_not_in_table_is_preserved(self, tmp_path, monkeypatch):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        import pandas as pd
+
+        two = pd.DataFrame([
+            {"name": "A", "cid": 1, "IsomericSMILES": "O"},
+            {"name": "B", "cid": 2, "IsomericSMILES": "O"},
+        ])
+        C.search_conformers(two, **self._kw(tmp_path, seed=42))
+        # Rerun with only A under a new seed: A regenerates, B is left untouched.
+        log2 = C.search_conformers(self._table(name="A"), **self._kw(tmp_path, seed=99))
+        assert "B" in set(log2["name"])
+        assert set(log2[log2["name"] == "A"]["seed"].astype(int)) == {99}
+        assert set(log2[log2["name"] == "B"]["seed"].astype(int)) == {42}

@@ -23,6 +23,7 @@ installed (matches the repo's no-network / no-heavy-dependency test rule).
 
 from __future__ import annotations
 
+import math
 import os
 
 import pandas as pd
@@ -381,12 +382,74 @@ _LOG_COLUMNS = [
     "pipeline_version",
     "pipeline_commit",
     "seed",
+    "n_generate",
+    "top_n",
     "method",
     "n_generated",
     "n_kept",
     "rmsd_prune",
     "converged",
 ]
+
+# Recorded fields that define a run's conformer-search configuration. A resumed
+# molecule may be skipped ONLY if its existing rows were produced with the same
+# values for all of these; otherwise its rows are stale and it is regenerated
+# (M-09). `seed`, `n_generate`, `top_n`, `rmsd_prune` are the requested search
+# knobs; `pipeline_version` guards against a code change to the generation logic.
+_RESUME_CONFIG_FIELDS = ("seed", "n_generate", "top_n", "rmsd_prune", "pipeline_version")
+
+
+def _row_config_matches(row: dict, config: dict) -> bool:
+    """
+    True iff a recorded conformer_log *row* was produced with *config*.
+
+    Missing columns (a pre-provenance / older-schema log) or unparseable values
+    count as a mismatch, so such rows are conservatively regenerated rather than
+    trusted. `rmsd_prune` is compared with a small float tolerance; the rest are
+    compared as ints (seed/n_generate/top_n) or strings (pipeline_version).
+    """
+    try:
+        if str(row["pipeline_version"]) != str(config["pipeline_version"]):
+            return False
+        for field in ("seed", "n_generate", "top_n"):
+            if int(row[field]) != int(config[field]):
+                return False
+        if not math.isclose(
+            float(row["rmsd_prune"]), float(config["rmsd_prune"]), rel_tol=0.0, abs_tol=1e-9
+        ):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _resume_partition(existing, config: dict, requested_names: set):
+    """
+    Split an existing conformer_log into resumable, carry-forward, and stale sets.
+
+    Groups rows by molecule name and, for each molecule **requested this run**,
+    keeps it only if *every* row matches *config* (M-09). Molecules not requested
+    this run are carried forward untouched (a different table shouldn't drop
+    them). Returns ``(done_names, kept_rows, stale_names)`` where ``done_names``
+    are skipped as complete, ``kept_rows`` are preserved in the new log, and
+    ``stale_names`` (config/version drift) are dropped so they regenerate.
+    """
+    groups: dict[str, list] = {}
+    for rec in existing.to_dict("records"):
+        groups.setdefault(str(rec.get("name")), []).append(rec)
+
+    done_names: set = set()
+    kept_rows: list = []
+    stale_names: set = set()
+    for name, rows in groups.items():
+        if name not in requested_names:
+            kept_rows.extend(rows)  # not requested this run — leave as-is
+        elif all(_row_config_matches(r, config) for r in rows):
+            done_names.add(name)
+            kept_rows.extend(rows)
+        else:
+            stale_names.add(name)  # config/version drift — drop and regenerate
+    return done_names, kept_rows, stale_names
 
 
 def search_conformers(
@@ -422,7 +485,13 @@ def search_conformers(
     XYZ comment carries the ``UNCONVERGED_FF_SEED`` marker and its FF energy is
     unreliable.
 
-    Resume-safe: molecules already present in an existing *log_csv* are skipped.
+    Resume-safe (M-09): a molecule already in *log_csv* is skipped **only** when
+    its recorded config (``seed``, ``n_generate``, ``top_n``, ``rmsd_prune``,
+    ``pipeline_version``) matches this call. If any differ — or the log predates
+    those provenance columns — its rows are treated as stale, dropped, and the
+    molecule is regenerated (with a warning), so downstream Gaussian inputs are
+    never built from conformers produced under a different configuration.
+    Molecules present in the log but not in *molecule_table* are left untouched.
 
     Returns the full conformer log as a DataFrame.
     """
@@ -431,21 +500,48 @@ def search_conformers(
 
     ensure_dir(xyz_dir)
 
-    # Resume-safe: preserve any existing log rows and skip those molecules.
+    # Provenance captured once per run (M-06): pipeline version + best-effort git
+    # commit, so conformer_log rows and XYZ files tie back to the code revision.
+    # Captured up front (offline, no RDKit) so the resume check can compare the
+    # recorded pipeline_version against this run's.
+    pipeline_version, pipeline_commit = pipeline_provenance()
+    rdkit_ver = None
+
+    # This run's conformer-search configuration; resumed rows must match it.
+    run_config = {
+        "seed": seed,
+        "n_generate": n_generate,
+        "top_n": top_n,
+        "rmsd_prune": rmsd_prune,
+        "pipeline_version": pipeline_version,
+    }
+    requested_names = {
+        str(row.get("name"))
+        for _, row in molecule_table.iterrows()
+        if row.get("name") is not None
+    }
+
+    # Resume-safe (M-09): only skip a molecule whose existing rows were produced
+    # with THIS run's config; rows from a different seed/n_generate/top_n/
+    # rmsd_prune or pipeline version (or a pre-provenance log) are stale — drop
+    # them and regenerate so downstream never builds on outdated conformers.
     if os.path.exists(log_csv):
         existing = pd.read_csv(log_csv)
-        done_names = set(existing["name"].astype(str)) if "name" in existing else set()
-        log_rows = existing.to_dict("records")
+        done_names, log_rows, stale_names = _resume_partition(
+            existing, run_config, requested_names
+        )
+        for name in sorted(stale_names):
+            print(
+                f"WARNING: {name!r} in {log_csv} was produced with a different "
+                f"conformer-search config or pipeline version; regenerating "
+                f"(stale rows dropped) so downstream inputs are not built on "
+                f"outdated conformers."
+            )
     else:
         done_names = set()
         log_rows = []
 
     failed = []
-    # Provenance captured once per run (M-06): pipeline version + best-effort git
-    # commit, so conformer_log rows and XYZ files tie back to the code revision.
-    rdkit_ver = None
-    pipeline_version = None
-    pipeline_commit = None
 
     for _, row in molecule_table.iterrows():
         name = row.get("name")
@@ -474,7 +570,6 @@ def search_conformers(
         try:
             if rdkit_ver is None:
                 rdkit_ver = _rdkit_version()
-                pipeline_version, pipeline_commit = pipeline_provenance()
             coords_list, energies_kcal, method, converged = generate_conformers(
                 str(smiles),
                 n_generate=n_generate,
@@ -532,6 +627,8 @@ def search_conformers(
                 "pipeline_version": pipeline_version,
                 "pipeline_commit": pipeline_commit,
                 "seed": seed,
+                "n_generate": n_generate,
+                "top_n": top_n,
                 "method": method,
                 "n_generated": n_generated,
                 "n_kept": n_kept,
