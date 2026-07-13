@@ -63,3 +63,42 @@ class TestStatusDocDriftGuard:
         problems = check_invariants._status_doc_problems("## X\n- \n- real item\n")
         assert len(problems) == 1
         assert "empty bullet" in problems[0]
+
+
+class TestGaussianProvenanceGuard:
+    """M-14: the mechanical floor checks semantic provenance threading."""
+
+    @staticmethod
+    def _source():
+        return (SCRIPT.parents[1] / "pipeline" / "gaussian.py").read_text()
+
+    def test_current_gaussian_source_passes(self):
+        assert check_invariants._gaussian_provenance_problems(self._source()) == []
+
+    def test_detects_missing_writer_parameter(self):
+        broken = self._source().replace(
+            "    pipeline_version: str | None = None,\n", "", 1
+        )
+        problems = check_invariants._gaussian_provenance_problems(broken)
+        assert any("missing parameter pipeline_version" in p for p in problems)
+
+    def test_detects_missing_row_read(self):
+        broken = self._source().replace(
+            'row.get("rdkit_version")', 'row.get("other_version")', 1
+        )
+        problems = check_invariants._gaussian_provenance_problems(broken)
+        assert any("does not read rdkit_version" in p for p in problems)
+
+    def test_detects_missing_forwarding(self):
+        broken = self._source().replace(
+            "                pipeline_commit=pipeline_commit,\n", "", 1
+        )
+        problems = check_invariants._gaussian_provenance_problems(broken)
+        assert any("does not forward pipeline_commit" in p for p in problems)
+
+    def test_detects_missing_title_token(self):
+        broken = self._source().replace(
+            'f"rdkit={rdkit_version}"', 'f"kit={rdkit_version}"', 1
+        )
+        problems = check_invariants._gaussian_provenance_problems(broken)
+        assert any("title missing token 'rdkit='" in p for p in problems)

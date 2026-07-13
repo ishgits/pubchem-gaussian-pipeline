@@ -247,6 +247,61 @@ class TestWriteGaussianComConformer:
             assert "dE=1.2345 kcal/mol" in text
             assert "ribose_c02" in text  # id in title line
 
+    def test_provenance_is_stamped_only_in_title_section(self):
+        route_opt = "# opt b3lyp/6-31g(d)"
+        route_freq = "# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            com_path = write_gaussian_com(
+                name="Ribose",
+                xyz_path=SAMPLE_XYZ,
+                outdir=tmpdir,
+                route_opt=route_opt,
+                route_freq=route_freq,
+                charge=-1,
+                multiplicity=2,
+                conformer_id=0,
+                rel_energy_kcalmol=0.0,
+                pipeline_version="2.0.0",
+                pipeline_commit="abc1234",
+                rdkit_version="2025.09.3",
+            )
+            with open(com_path) as f:
+                text = f.read()
+
+            provenance = (
+                "provenance pipeline=2.0.0 commit=abc1234 rdkit=2025.09.3"
+            )
+            title_and_rest = text.split(f"{route_opt}\n\n", 1)[1]
+            title_block, after_title = title_and_rest.split("\n\n", 1)
+            assert provenance in title_block
+            assert text.count(provenance) == 1
+            assert provenance not in after_title
+            assert text.count(route_opt) == 1
+            assert text.count(route_freq) == 1
+            assert "\n-1 2\n" in text
+            assert text.count("%chk=ribose_c00_F.chk") == 2
+            assert "--Link1--" in text
+
+    def test_missing_commit_is_explicit_when_other_provenance_exists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            com_path = write_gaussian_com(
+                name="Ribose",
+                xyz_path=SAMPLE_XYZ,
+                outdir=tmpdir,
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                conformer_id=0,
+                pipeline_version="2.0.0",
+                pipeline_commit="",
+                rdkit_version="2025.09.3",
+            )
+            with open(com_path) as f:
+                text = f.read()
+            assert (
+                "provenance pipeline=2.0.0 commit=unavailable rdkit=2025.09.3"
+                in text
+            )
+
     def test_none_conformer_preserves_v1_naming(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             com_path = write_gaussian_com(
@@ -257,6 +312,9 @@ class TestWriteGaussianComConformer:
                 route_freq="# freq b3lyp/6-31g(d)",
             )
             assert com_path.endswith("water_F.com")
+            with open(com_path) as f:
+                text = f.read()
+            assert "provenance " not in text
 
 
 class TestWriteGaussianComsFromConformers:
@@ -291,6 +349,48 @@ class TestWriteGaussianComsFromConformers:
                 assert "--Link1--" in text
                 assert f"dE={deltas[row['conformer_id']]} kcal/mol" in text
 
+    def test_batch_copies_provenance_into_com_and_log(self, tmp_path):
+        import pandas as pd
+
+        conformer_log = tmp_path / "conformer_log.csv"
+        pd.DataFrame([{
+            "name": "Ribose",
+            "conformer_id": 0,
+            "rel_energy_kcalmol": 0.0,
+            "xyz_path": SAMPLE_XYZ,
+            "pipeline_version": "2.0.0",
+            "pipeline_commit": "abc1234",
+            "rdkit_version": "2025.09.3",
+        }]).to_csv(conformer_log, index=False)
+        com_log = tmp_path / "com_write_log.csv"
+
+        out = write_gaussian_coms_from_conformers(
+            str(conformer_log),
+            outdir=str(tmp_path / "gaussian_inputs"),
+            log_csv=str(com_log),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+        )
+
+        expected_columns = [
+            "name", "conformer_id", "xyz_path", "com_path",
+            "pipeline_version", "pipeline_commit", "rdkit_version",
+        ]
+        assert list(out.columns) == expected_columns
+        assert out.loc[0, "pipeline_version"] == "2.0.0"
+        assert out.loc[0, "pipeline_commit"] == "abc1234"
+        assert out.loc[0, "rdkit_version"] == "2025.09.3"
+        written_log = pd.read_csv(com_log, dtype=str, keep_default_na=False)
+        assert list(written_log.columns) == expected_columns
+        assert written_log.loc[0, "pipeline_version"] == "2.0.0"
+        assert written_log.loc[0, "pipeline_commit"] == "abc1234"
+        assert written_log.loc[0, "rdkit_version"] == "2025.09.3"
+        with open(out.loc[0, "com_path"]) as f:
+            text = f.read()
+        assert (
+            "provenance pipeline=2.0.0 commit=abc1234 rdkit=2025.09.3" in text
+        )
+
 
 class TestEmptyComLogSchemas:
     """M-11: zero writes remain valid, readable CSVs for downstream stages."""
@@ -323,7 +423,10 @@ class TestEmptyComLogSchemas:
             str(conformer_log), log_csv=str(com_log)
         )
 
-        expected = ["name", "conformer_id", "xyz_path", "com_path"]
+        expected = [
+            "name", "conformer_id", "xyz_path", "com_path",
+            "pipeline_version", "pipeline_commit", "rdkit_version",
+        ]
         assert list(out.columns) == expected
         assert out.empty
         assert list(pd.read_csv(com_log).columns) == expected
@@ -352,7 +455,10 @@ class TestEmptyComLogSchemas:
             str(conformer_log), log_csv=str(com_log)
         )
 
-        expected = ["name", "conformer_id", "xyz_path", "com_path"]
+        expected = [
+            "name", "conformer_id", "xyz_path", "com_path",
+            "pipeline_version", "pipeline_commit", "rdkit_version",
+        ]
         assert out.empty
         assert list(pd.read_csv(com_log).columns) == expected
         failures = pd.read_csv(tmp_path / "com_write_failed.csv")

@@ -22,7 +22,7 @@ names → PubChem              → RDKit conformer search           → Gaussian
 
 **Step 2 — Conformer search** (`pipeline/conformers.py`). For each molecule, embed an RDKit ETKDGv3 ensemble (`N_GENERATE=20`, RMSD-pruned), MMFF94-optimize and rank it (UFF is a logged fallback only when MMFF params are unavailable), and carry the **top 3 lowest-energy, distinct** conformers forward — one XYZ each, with provenance (RDKit version, seed, method, ΔE in kcal/mol) in `conformer_log.csv`. Rigid molecules collapse to a single conformer on their own.
 
-**Step 3 — Gaussian inputs.** Write one `.com` per conformer as `{base}_c{ii}_F.com` using the **Link1 pattern**: the optimization job writes a checkpoint, the frequency job reads it via `Geom=AllChk Guess=Read`. The conformer id and its ΔE (kcal/mol) go in the title line.
+**Step 3 — Gaussian inputs.** Write one `.com` per conformer as `{base}_c{ii}_F.com` using the **Link1 pattern**: the optimization job writes a checkpoint, the frequency job reads it via `Geom=AllChk Guess=Read`. The title section records the conformer id, ΔE (kcal/mol), pipeline version, source commit (or `unavailable`), and RDKit version, so a copied COM remains self-describing without its CSV logs.
 
 **Step 4 — SLURM scripts.** One `.sh` per conformer. Scripts default to the current run's `com_write_log.csv` (stale `.com` files on disk are never picked up) and resolve their input **relative to their own location**, so `sbatch slurm_scripts/*.sh` works from any directory.
 

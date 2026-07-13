@@ -21,7 +21,23 @@ from .utils import ensure_dir, sanitize_basename
 # the next stage (M-11). The legacy writer has no conformer identifier; the v2
 # writer preserves it for traceability.
 _LEGACY_COM_LOG_COLUMNS = ["name", "xyz_path", "com_path"]
-_CONFORMER_COM_LOG_COLUMNS = ["name", "conformer_id", "xyz_path", "com_path"]
+_CONFORMER_COM_LOG_COLUMNS = [
+    "name",
+    "conformer_id",
+    "xyz_path",
+    "com_path",
+    "pipeline_version",
+    "pipeline_commit",
+    "rdkit_version",
+]
+
+
+def _optional_text(value) -> str | None:
+    """Normalize an optional scalar/CSV field to non-empty text or ``None``."""
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def xyz_to_gaussian_coords(xyz_path: str) -> str:
@@ -111,6 +127,9 @@ def write_gaussian_com(
     conformer_id: int | None = None,
     rel_energy_kcalmol: float | None = None,
     unconverged: bool = False,
+    pipeline_version: str | None = None,
+    pipeline_commit: str | None = None,
+    rdkit_version: str | None = None,
 ) -> str:
     """
     Write a Gaussian .com input file from an XYZ file.
@@ -154,6 +173,15 @@ def write_gaussian_com(
         converge (M-04 decision 2b best-effort seed). An ``UNCONVERGED_FF_SEED``
         marker is written into the title line so the unminimized start — and its
         unreliable FF energy — are visible on inspection.
+    pipeline_version : str, optional
+        Pipeline version that produced the conformer. When supplied, recorded on
+        a separate ``provenance`` line in the Gaussian title section (M-14).
+    pipeline_commit : str, optional
+        Source commit that produced the conformer. If missing while another
+        provenance field is supplied, the title records ``commit=unavailable``.
+    rdkit_version : str, optional
+        RDKit version that generated/ranked the starting geometry. When supplied,
+        recorded on the title-section provenance line.
 
     Returns
     -------
@@ -177,11 +205,31 @@ def write_gaussian_com(
         # Make the unconverged FF start explicit on the input itself (M-04 2b).
         title = f"{title} {UNCONVERGED_FF_SEED}".strip()
 
+    # M-14: keep software provenance self-contained in the Gaussian title
+    # section. It must never alter route lines, checkpoint directives,
+    # charge/multiplicity, coordinates, or the Link1 frequency section.
+    pipeline_version = _optional_text(pipeline_version)
+    pipeline_commit = _optional_text(pipeline_commit)
+    rdkit_version = _optional_text(rdkit_version)
+    provenance_parts = []
+    if pipeline_version:
+        provenance_parts.append(f"pipeline={pipeline_version}")
+    if pipeline_commit:
+        provenance_parts.append(f"commit={pipeline_commit}")
+    elif pipeline_version or rdkit_version:
+        provenance_parts.append("commit=unavailable")
+    if rdkit_version:
+        provenance_parts.append(f"rdkit={rdkit_version}")
+    title_lines = [title]
+    if provenance_parts:
+        title_lines.append("provenance " + " ".join(provenance_parts))
+    title_block = "\n".join(title_lines)
+
     text = (
         f"%nprocshared={nproc}\n"
         f"%chk={chk_name}\n"
         f"{route_opt}\n\n"
-        f"{title}\n\n"
+        f"{title_block}\n\n"
         f"{charge} {multiplicity}\n"
         f"{coords}\n\n"
     )
@@ -257,6 +305,9 @@ def write_gaussian_coms_from_conformers(
     column (``rel_energy_kcalmol``) is recorded in the title line when present.
     A ``converged`` column (M-04), when present and False, tags the title with
     ``UNCONVERGED_FF_SEED`` so an unminimized best-effort start is visible.
+    ``pipeline_version``, ``pipeline_commit``, and ``rdkit_version`` are copied
+    from each row into the COM title section and the COM write log (M-14); a
+    missing commit is recorded in the COM as ``commit=unavailable``.
     Files are written as ``{base}_c{ii}_F.com``. The Link1 opt→freq checkpoint
     contract is unchanged — every keyword argument is forwarded to
     :func:`write_gaussian_com`, exactly as :func:`write_gaussian_coms` does.
@@ -285,6 +336,9 @@ def write_gaussian_coms_from_conformers(
             unconverged = conv.strip().lower() in ("false", "0", "no")
         else:
             unconverged = not bool(conv)
+        pipeline_version = _optional_text(row.get("pipeline_version"))
+        pipeline_commit = _optional_text(row.get("pipeline_commit"))
+        rdkit_version = _optional_text(row.get("rdkit_version"))
         try:
             com_path = write_gaussian_com(
                 name,
@@ -293,6 +347,9 @@ def write_gaussian_coms_from_conformers(
                 conformer_id=conformer_id,
                 rel_energy_kcalmol=rel_e,
                 unconverged=unconverged,
+                pipeline_version=pipeline_version,
+                pipeline_commit=pipeline_commit,
+                rdkit_version=rdkit_version,
                 **kwargs,
             )
             written.append({
@@ -300,6 +357,9 @@ def write_gaussian_coms_from_conformers(
                 "conformer_id": conformer_id,
                 "xyz_path": xyz_path,
                 "com_path": com_path,
+                "pipeline_version": pipeline_version,
+                "pipeline_commit": pipeline_commit or "",
+                "rdkit_version": rdkit_version,
             })
         except Exception as e:
             failed.append({

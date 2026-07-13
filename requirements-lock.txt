@@ -1,7 +1,7 @@
 # Pinned dependency stack for the v2.0.0 release (MIN-01).
 #
 # These are the exact versions the v2.0.0 test suite was run against
-# (pytest tests/ -q -> 165 passed, offline). RDKit's ETKDGv3 + MMFF embedding is
+# (pytest tests/ -q -> 173 passed, offline). RDKit's ETKDGv3 + MMFF embedding is
 # version-sensitive, so pinning it makes conformer geometries reproducible; the
 # resume logic also invalidates cached geometries when rdkit_version changes.
 #

@@ -10,8 +10,8 @@
 Maintained by the implementing agent (Claude Code). The reviewer (Codex) must
 verify these claims against the code, not trust them.
 
-**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 6
-(v2 conformer search + remediation rounds 01–06; released as v2.0.0). Works
+**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 7
+(v2 conformer search + remediation rounds 01–07; released as v2.0.0). Works
 against `docs/architecture.md` and `docs/implementation-plan.md`.
 
 ## 1. What was implemented
@@ -56,6 +56,15 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   `UNCONVERGED_FF_SEED` marker in the title. The Link1 opt→freq checkpoint
   contract is untouched. `write_gaussian_coms_from_conformers` writes one `.com`
   per `conformer_log.csv` row.
+- **Self-contained conformer COM provenance (round-07 M-14).** Every v2
+  conformer-derived `.com` copies `pipeline_version`, `pipeline_commit`, and
+  `rdkit_version` from its conformer-log row into a separate `provenance` line in
+  the Gaussian title section. A missing commit is explicit as
+  `commit=unavailable`; the same fields are retained in `com_write_log.csv`,
+  including its header-only zero-job schema. Legacy v1.1 output has no provenance
+  line unless those optional arguments are explicitly supplied. Route lines,
+  coordinates, charge/multiplicity, checkpoint names, and Link1 behavior are
+  unchanged.
 - **Notebook (round 01, M-02).** `notebooks/run_pipeline.ipynb` runs the
   conformer path by default; the v1.1 single-geometry path is a commented-out
   labeled legacy appendix.
@@ -122,8 +131,8 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   install step; README leads with the RDKit conformer flow, with Open Babel demoted
   to a labeled legacy v1.1 section.
 
-Required checks locally green after round 06 (rdkit 2025.09.3): `pytest tests/ -q`
-→ **165 passed**; `python scripts/check_invariants.py` → **passed**;
+Required checks locally green after round 07 (rdkit 2025.09.3): `pytest tests/ -q`
+→ **173 passed**; `python scripts/check_invariants.py` → **passed**;
 `git ls-files -ci --exclude-standard` → empty.
 
 ## 2. What was NOT implemented (and why)
@@ -131,18 +140,18 @@ Required checks locally green after round 06 (rdkit 2025.09.3): `pytest tests/ -
 - Out-of-scope-for-v2 items: rotatable-bond gating, xTB/CREST, energy-window
   logic, Boltzmann/entropy weighting, solvent-aware search, and any change to the
   level of theory or the Link1 contract. Deliberately omitted per architecture-v2.
-- Version/commit provenance in `com_write_log.csv` and `sdf_download_log.csv`
-  (and the `.com` title line) is deferred: round 03 (M-06) is scoped to the
-  conformer path only. AGENTS.md §3 applies to every generated output, so this is
-  tracked as a next-round candidate, not a silent omission.
+- Version/commit provenance in the legacy `sdf_download_log.csv` and unrelated
+  legacy v1.1 outputs remains deferred. Round-07 M-14 resolves the default v2
+  conformer path by stamping provenance into each COM and `com_write_log.csv`.
 - Post-optimization RMSD re-pruning is not added; distinctness relies on
   `pruneRmsThresh` at embed time (see §6).
 - **Remaining recorded deferrals:** the per-study `runs/` run-directory redesign;
   adding `pipeline_commit` to the resume key; replacing label-based filenames
   with a collision-proof internal identifier rather than rejecting collisions;
-  and extending version/commit provenance to `com_write_log.csv` /
-  `sdf_download_log.csv`. The round-04 `n_rows == n_kept` reconciliation is no
-  longer deferred: round-05 M-12 implements it with ID/path integrity checks.
+  and extending version/commit provenance to `sdf_download_log.csv` and unrelated
+  legacy outputs. The round-04 `n_rows == n_kept` reconciliation is no longer
+  deferred: round-05 M-12 implements it with ID/path integrity checks; v2 COM
+  provenance is likewise no longer deferred after round-07 M-14.
 - **Physical cleanup of stale XYZ/COM files is not implemented.** Reduced reruns
   make the current CSV logs and pruned `slurm_scripts/` authoritative, so old
   files in `conformer_xyz/` or `gaussian_inputs/` cannot enter the documented
@@ -234,13 +243,17 @@ title) and never mixed with DFT Hartree values.
   (`TestWriteGaussianComConformer`, `TestWriteGaussianComsFromConformers`);
   header-only legacy/conformer COM logs, all-write-failure behavior, and the
   all-ineligible conformer → Gaussian → SLURM zero-job path
-  (`TestEmptyComLogSchemas`).
+  (`TestEmptyComLogSchemas`). Round-07 tests verify direct and batch provenance,
+  explicit unavailable commits, expanded COM-log schemas, unchanged route/
+  charge/checkpoint/Link1 fields, and unchanged legacy output (M-14).
 - `tests/test_utils.py` — the offline provenance helper: git absent / non-zero /
   timeout give empty string, clean tree gives the SHA, dirty tree appends
   `.dirty` (`TestGitShortSha`, `TestPipelineProvenance`). No test asserts a
   concrete SHA.
 - `tests/test_check_invariants.py` — the status-doc drift guard fires on a
-  template and passes on a populated file (`TestStatusDocDriftGuard`).
+  template and passes on a populated file (`TestStatusDocDriftGuard`); an
+  AST-based M-14 guard verifies writer parameters, conformer-row reads,
+  forwarding, and the required title tokens (`TestGaussianProvenanceGuard`).
 
 RDKit-dependent tests use `pytest.importorskip("rdkit")` so a bare environment
 still runs the pure tests; CI installs rdkit so they execute there.
