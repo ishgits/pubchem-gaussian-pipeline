@@ -911,6 +911,41 @@ class TestPreserveUnrequestedBatch:
         assert set(log2["name"]) == {"Water", "Glycine", "Adenine"}
 
 
+class TestStaleFailedCsvCleared:
+    """MIN-02: a prior run's *_failed.csv must not survive a later clean run."""
+
+    def test_failed_csv_cleared_on_clean_rerun(self, tmp_path, monkeypatch):
+        import pandas as pd
+
+        import pipeline.conformers as C
+
+        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+        failed_csv = tmp_path / "conformer_search_failed.csv"
+        kw = dict(
+            xyz_dir=str(tmp_path / "xyz"),
+            log_csv=str(tmp_path / "conformer_log.csv"),
+            failed_csv=str(failed_csv),
+        )
+
+        # First run fails eligibility → a failure log is written.
+        monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: "no IsomericSMILES")
+        C.search_conformers(
+            pd.DataFrame([{"name": "Bad", "cid": 1, "IsomericSMILES": None}]), **kw
+        )
+        assert failed_csv.exists()
+
+        # Second run is clean → the stale failure log is cleared, not left behind.
+        monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
+        monkeypatch.setattr(
+            C, "generate_conformers",
+            lambda smiles, **k: ([[("O", 0.0, 0.0, 0.0)]], [0.0], "MMFF94", [True]),
+        )
+        C.search_conformers(
+            pd.DataFrame([{"name": "Good", "cid": 2, "IsomericSMILES": "O"}]), **kw
+        )
+        assert not failed_csv.exists()
+
+
 class TestParameterValidation:
     """MIN-03: invalid parameters raise ValueError at entry."""
 

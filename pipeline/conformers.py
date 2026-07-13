@@ -605,6 +605,12 @@ def search_conformers(
 
     ensure_dir(xyz_dir)
 
+    # Clear any stale failure log from a prior run (MIN-02) so a later clean run
+    # never leaves the notebook surfacing failures that no longer apply. Rewritten
+    # at the end only if this run actually has failures.
+    if os.path.exists(failed_csv):
+        os.remove(failed_csv)
+
     # Provenance captured once per run (M-06): pipeline version + best-effort git
     # commit, so conformer_log rows and XYZ files tie back to the code revision.
     pipeline_version, pipeline_commit = pipeline_provenance()

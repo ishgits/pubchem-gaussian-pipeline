@@ -1,4 +1,0 @@
-label,query,status,n_cids,selected_cid,selected_reason,warnings
-Water,Water,OK,1,962,score=10,[]
-Glycine,Glycine,OK,1,750,score=10,[]
-Adenine,Adenine,OK,1,190,score=10,[]

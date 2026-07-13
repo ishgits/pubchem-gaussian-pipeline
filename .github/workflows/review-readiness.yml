@@ -28,3 +28,14 @@ jobs:
 
       - name: Scientific invariant checks
         run: python scripts/check_invariants.py
+
+      - name: Repo hygiene — no ignored-but-tracked generated files (B-04)
+        run: |
+          tracked="$(git ls-files -ci --exclude-standard)"
+          if [ -n "$tracked" ]; then
+            echo "These generated files are ignored by .gitignore but still tracked:"
+            echo "$tracked"
+            echo "Run: git rm -r --cached <path> and commit."
+            exit 1
+          fi
+          test -z "$tracked"

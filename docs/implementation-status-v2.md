@@ -38,7 +38,13 @@ reproducibility and "no silent corruption" invariants rather than altering them.
 
 ### Commit 2 — repository cleanup (B-04, MIN-02)
 
-_Pending — recorded on landing._
+Verified with `git ls-files -ci --exclude-standard` → empty and
+`pytest tests/ -q` → **143 passed**.
+
+| ID | What changed | Verify |
+|----|--------------|--------|
+| B-04 | `.gitignore` gains the genuinely-missing patterns (`.claude/settings.local.json`, `conformer_xyz/`, `pubchem_sdf/`, `pubchem_xyz/`, `molecules_pubchem_*.csv`) and broadens `com_write_failed.csv`→`*_failed.csv`; no existing pattern duplicated. `git rm -r --cached` untracked the already-tracked generated dirs/files (`pipeline/__pycache__`, `notebooks/.ipynb_checkpoints`, `.pubchem_cache`, `gaussian_inputs`, `slurm_scripts`, `pubchem_sdf`, `pubchem_xyz`, and the tracked `notebooks/*_log.csv` + `molecules_pubchem_*.csv`) — local copies kept. New CI step in `review-readiness.yml` fails the floor if any ignored file is tracked. | `git ls-files -ci --exclude-standard` prints nothing; a fresh clone carries no `*.com`/`*.sdf`/`*.xyz` under `notebooks/` |
+| MIN-02 | `search_conformers` and both `write_gaussian_coms*` clear a stale `*_failed.csv` at stage start; rewritten only if the run actually fails. | `tests/test_conformers.py::TestStaleFailedCsvCleared` |
 
 ### Commit 3 — docs + versioning (MOD-01..MOD-04, MIN-01; MOD-05 PR body)
 

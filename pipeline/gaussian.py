@@ -204,6 +204,11 @@ def write_gaussian_coms(
 
     All keyword arguments are forwarded to :func:`write_gaussian_com`.
     """
+    # Clear any stale failure log from a prior run (MIN-02); rewritten below only
+    # if this run actually has failures.
+    if os.path.exists("com_write_failed.csv"):
+        os.remove("com_write_failed.csv")
+
     xyz_log = pd.read_csv(xyz_log_csv)
     written = []
     failed = []
@@ -249,6 +254,11 @@ def write_gaussian_coms_from_conformers(
     contract is unchanged — every keyword argument is forwarded to
     :func:`write_gaussian_com`, exactly as :func:`write_gaussian_coms` does.
     """
+    # Clear any stale failure log from a prior run (MIN-02); rewritten below only
+    # if this run actually has failures.
+    if os.path.exists("com_write_failed.csv"):
+        os.remove("com_write_failed.csv")
+
     conf_log = pd.read_csv(conformer_log_csv)
     written = []
     failed = []
