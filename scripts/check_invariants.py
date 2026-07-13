@@ -21,6 +21,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PIPELINE = ROOT / "pipeline"
 STATUS_DOC = ROOT / "docs" / "implementation-status.md"
+GITIGNORE = ROOT / ".gitignore"
 GAUSSIAN = PIPELINE / "gaussian.py"
 CONFORMERS = PIPELINE / "conformers.py"
 MANIFEST = PIPELINE / "manifest.py"
@@ -78,6 +79,29 @@ def check_route_constants() -> list[str]:
                     f"physics token(s): {', '.join(missing)}"
                 )
     return problems
+
+
+def _generated_artifact_ignore_problems(text: str) -> list[str]:
+    """Guard generated root-level run artifacts from dirtying source provenance."""
+    patterns = {
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    if "run_manifest.json" not in patterns:
+        return ["generated run_manifest.json is not ignored"]
+    return []
+
+
+def check_generated_artifact_ignores() -> list[str]:
+    if not GITIGNORE.exists():
+        return ["[generated-artifacts] .gitignore is missing"]
+    return [
+        f"[generated-artifacts] {problem}"
+        for problem in _generated_artifact_ignore_problems(
+            GITIGNORE.read_text(encoding="utf-8", errors="replace")
+        )
+    ]
 
 
 # 3) Canonical status-doc drift guard (M-07). AGENTS.md §5 names
@@ -571,6 +595,8 @@ def _frozen_matrix_problems(
         "def sha256_file(",
         "def require_exact_artifact_id_set(",
         "def _require_link1_checkpoint_reads(",
+        "sanitize_basename(",
+        "output_basenames",
         "def validate_manifest(",
         "def record_conformer_xyz(",
         "def record_child_artifact(",
@@ -643,6 +669,7 @@ def main() -> int:
     problems = (
         check_placeholders()
         + check_route_constants()
+        + check_generated_artifact_ignores()
         + check_status_doc()
         + check_gaussian_provenance()
         + check_append_integrity()

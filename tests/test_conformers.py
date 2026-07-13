@@ -1323,28 +1323,19 @@ class TestPreserveUnrequestedBatch:
             "cid": 2,
             "IsomericSMILES": "N",
         }])
-        kw = self._kw(
-            tmp_path,
-            manifest_table=pd.concat([first, second], ignore_index=True),
-        )
-        first_log = C.search_conformers(first, **kw)
-        log_path = tmp_path / "conformer_log.csv"
-        xyz_paths = [
-            tmp_path / "xyz" / os.path.basename(path)
-            for path in first_log["xyz_path"]
-        ]
-        before_log = log_path.read_bytes()
-        before_xyz = {path: path.read_bytes() for path in xyz_paths}
-        failed_path = tmp_path / "fail.csv"
-        failed_path.write_text("prior failure log\n")
-
         with pytest.raises(ValueError, match="both map to output basename"):
-            C.search_conformers(second, **self._kw(tmp_path, append=True))
+            self._kw(
+                tmp_path,
+                manifest_table=pd.concat([first, second], ignore_index=True),
+            )
 
-        assert len(calls) == 1  # the colliding molecule was never generated
-        assert log_path.read_bytes() == before_log
-        assert {path: path.read_bytes() for path in xyz_paths} == before_xyz
-        assert failed_path.read_text() == "prior failure log\n"
+        # The manifest boundary now rejects the invalid one-to-one mapping
+        # before conformer generation or any run-output mutation begins.
+        assert calls == []
+        assert not list(tmp_path.glob("run_manifest_*.json"))
+        assert not (tmp_path / "conformer_log.csv").exists()
+        assert not (tmp_path / "xyz").exists()
+        assert not (tmp_path / "fail.csv").exists()
 
     def test_already_corrupt_append_log_is_rejected_without_mutation(
         self, tmp_path

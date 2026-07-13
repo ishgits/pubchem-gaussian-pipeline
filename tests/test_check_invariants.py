@@ -65,6 +65,18 @@ class TestStatusDocDriftGuard:
         assert "empty bullet" in problems[0]
 
 
+class TestGeneratedArtifactIgnoreGuard:
+    def test_current_gitignore_passes(self):
+        text = (SCRIPT.parents[1] / ".gitignore").read_text()
+        assert check_invariants._generated_artifact_ignore_problems(text) == []
+
+    def test_detects_unignored_manifest(self):
+        problems = check_invariants._generated_artifact_ignore_problems(
+            "conformer_xyz/\ngaussian_inputs/\n"
+        )
+        assert any("run_manifest.json" in problem for problem in problems)
+
+
 class TestGaussianProvenanceGuard:
     """M-14/M-16/M-17: enforce provenance across batch and direct v2 paths."""
 
@@ -277,3 +289,11 @@ class TestFrozenManifestMatrixGuard:
             manifest, conformers, gaussian, slurm
         )
         assert any("_require_link1_checkpoint_reads" in problem for problem in problems)
+
+    def test_detects_missing_manifest_basename_collision_guard(self):
+        manifest, conformers, gaussian, slurm = self._sources()
+        manifest = manifest.replace("sanitize_basename(name)", "str(name)")
+        problems = check_invariants._frozen_matrix_problems(
+            manifest, conformers, gaussian, slurm
+        )
+        assert any("sanitize_basename" in problem for problem in problems)

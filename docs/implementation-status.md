@@ -116,6 +116,19 @@ gaps. They are resolved locally in this remediation pass:
   Valid-looking truncated and empty subset logs are rejected, preserving prior
   scripts, SLURM logs, and manifest lineage byte-for-byte.
 
+The next exact-head review identified two more stage-ordering violations. They
+are also resolved locally:
+
+- **B-09 — Resolved locally.** The documented root-level `run_manifest.json` is
+  now ignored as a generated run artifact. Creating the immutable manifest in a
+  clean checkout no longer makes the source tree appear dirty before conformer
+  generation recomputes pipeline provenance. A real temporary Git-repository
+  regression test exercises the exact manifest-then-provenance sequence.
+- **M-28 — Resolved locally.** Manifest creation now applies the same nonempty,
+  unique sanitized-basename rule as downstream conformer generation before the
+  manifest is written. Distinct labels such as `Water` and `water` therefore
+  fail without leaving an immutable manifest for an invalid one-to-one mapping.
+
 No known local frozen-contract Blocker or Major remains. This exact patched head
 still requires remote CI and one current-head review before the human merge
 decision; the status does not treat the prior review as approval of new code.
@@ -151,11 +164,11 @@ pytest 9.1.1
 Current local results:
 
 ```text
-pytest tests/ -q: 266 passed
+pytest tests/ -q: 272 passed
 python scripts/check_invariants.py: passed
 Python compilation: passed
 notebook JSON validation: passed
-clean package copy: 266 passed; invariant checks passed
+clean package copy: 272 passed; invariant checks passed
 ```
 
 The publication checkout also passed `git diff --check` and the

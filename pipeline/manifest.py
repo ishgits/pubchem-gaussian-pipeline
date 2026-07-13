@@ -21,7 +21,7 @@ from typing import Any
 
 import pandas as pd
 
-from .utils import pipeline_provenance
+from .utils import pipeline_provenance, sanitize_basename
 
 
 MANIFEST_SCHEMA = "2.0"
@@ -260,11 +260,26 @@ def _molecule_records(molecule_table) -> list[dict]:
     records = []
     names = set()
     identities = set()
+    output_basenames: dict[str, str] = {}
     for _, row in molecule_table.iterrows():
         name = str(row["name"])
         if name in names:
             raise ValueError(f"Duplicate molecule record/name: {name!r}.")
         names.add(name)
+        basename = sanitize_basename(name)
+        if basename == "":
+            raise ValueError(
+                f"Molecule label {name!r} sanitizes to an empty filename; give "
+                "it a name with at least one alphanumeric character."
+            )
+        if basename in output_basenames:
+            previous = output_basenames[basename]
+            raise ValueError(
+                f"Molecule labels {previous!r} and {name!r} both map to output "
+                f"basename {basename!r}. Use unique labels that remain distinct "
+                "after filename sanitization."
+            )
+        output_basenames[basename] = name
         cid = None if pd.isna(row["cid"]) else int(float(row["cid"]))
         smiles = "" if pd.isna(row["IsomericSMILES"]) else str(row["IsomericSMILES"])
         identity_hash = molecule_identity_hash(name, cid, smiles)
@@ -423,6 +438,23 @@ def validate_manifest(manifest: dict) -> None:
         duplicates = _duplicate_values(molecules, key)
         if duplicates:
             raise ValueError(f"Duplicate molecule {key} record(s): {sorted(duplicates)}")
+    output_basenames: dict[str, str] = {}
+    for molecule in molecules:
+        name = str(molecule.get("molecule_name", ""))
+        basename = sanitize_basename(name)
+        if basename == "":
+            raise ValueError(
+                f"Molecule label {name!r} sanitizes to an empty filename; give "
+                "it a name with at least one alphanumeric character."
+            )
+        if basename in output_basenames:
+            previous = output_basenames[basename]
+            raise ValueError(
+                f"Molecule labels {previous!r} and {name!r} both map to output "
+                f"basename {basename!r}. Use unique labels that remain distinct "
+                "after filename sanitization."
+            )
+        output_basenames[basename] = name
 
     configured_molecules = configuration.get("molecules")
     expected_configured_molecules = [

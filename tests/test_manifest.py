@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
+import subprocess
 
 import pandas as pd
 import pytest
+
+import pipeline.manifest as manifest_module
+from pipeline.utils import pipeline_provenance
 
 from pipeline.manifest import (
     canonical_json,
@@ -174,6 +179,87 @@ class TestManifestValidation:
         manifest["molecules"].append(deepcopy(manifest["molecules"][0]))
         with pytest.raises(ValueError, match="Duplicate molecule"):
             validate_manifest(manifest)
+
+    def test_manifest_creation_rejects_sanitized_basename_collision_before_write(
+        self, tmp_path
+    ):
+        conformer, gaussian, slurm = _configs()
+        table = pd.DataFrame([
+            {"name": "Water", "cid": 962, "IsomericSMILES": "O"},
+            {"name": "water", "cid": 962, "IsomericSMILES": "O"},
+        ])
+        path = tmp_path / "run_manifest.json"
+        with pytest.raises(ValueError, match="both map to output basename"):
+            create_run_manifest(
+                table,
+                conformer,
+                gaussian,
+                slurm,
+                path=str(path),
+                run_id="00000000-0000-4000-8000-000000000001",
+                pipeline_version="2.0.0",
+                pipeline_commit="abc1234",
+                rdkit_version="2025.09.3",
+            )
+        assert not path.exists()
+
+    def test_manifest_validation_rejects_tampered_basename_collision(self, tmp_path):
+        manifest = load_manifest(str(_create(tmp_path)))
+        first_name = manifest["molecules"][0]["molecule_name"]
+        manifest["molecules"][1]["molecule_name"] = first_name.swapcase()
+        with pytest.raises(ValueError, match="both map to output basename"):
+            validate_manifest(manifest)
+
+    def test_documented_manifest_does_not_dirty_clean_checkout(
+        self, tmp_path, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        project_root = Path(__file__).resolve().parents[1]
+        (repo / ".gitignore").write_text(
+            (project_root / ".gitignore").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "tests@example.invalid"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Offline Tests"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "test baseline"],
+            cwd=repo,
+            check=True,
+        )
+        before_version, before_commit = pipeline_provenance(cwd=str(repo))
+        assert before_commit and not before_commit.endswith(".dirty")
+
+        monkeypatch.setattr(
+            manifest_module,
+            "pipeline_provenance",
+            lambda: pipeline_provenance(cwd=str(repo)),
+        )
+        conformer, gaussian, slurm = _configs()
+        create_run_manifest(
+            _table(),
+            conformer,
+            gaussian,
+            slurm,
+            path=str(repo / "run_manifest.json"),
+            run_id="00000000-0000-4000-8000-000000000001",
+            rdkit_version="2025.09.3",
+        )
+
+        after_version, after_commit = pipeline_provenance(cwd=str(repo))
+        assert after_version == before_version
+        assert after_commit == before_commit
+        assert not after_commit.endswith(".dirty")
 
     def test_duplicate_artifact_id_and_path_rejected(self, tmp_path):
         path = _create(tmp_path)
