@@ -86,6 +86,24 @@ class TestScoreCandidateCurrentSchema:
         achiral_low_cid = self._prop(500, "C1C(C(C(C(O1)O)O)O)O")
         assert score_candidate(chiral) > score_candidate(achiral_low_cid)
 
+    def test_directional_bond_stereo_markers_receive_bonus(self):
+        flat = self._prop(50_000, "FC=CF", formula="C2H2F2")
+        for smiles in ("F/C=C/F", r"F\C=C\F"):
+            stereo = self._prop(50_000, smiles, formula="C2H2F2")
+            assert score_candidate(stereo) > score_candidate(flat)
+
+    def test_backslash_stereo_beats_lower_cid_stereo_free_candidate(self):
+        stereo = self._prop(50_000, r"F\C=C\F", formula="C2H2F2")
+        stereo_free = self._prop(1_000, "FC=CF", formula="C2H2F2")
+        assert score_candidate(stereo) > score_candidate(stereo_free)
+
+    def test_connectivity_smiles_never_supplies_stereo_bonus(self):
+        prop = self._prop(50_000, "FC=CF", formula="C2H2F2")
+        prop["ConnectivitySMILES"] = r"F\C=C\F"
+        assert score_candidate(prop, prefer_stereo=True) == score_candidate(
+            prop, prefer_stereo=False
+        )
+
 
 class TestIsomericSmiles:
     """B-01: read the stereo-bearing SMILES across PubChem's 2025 key rename."""

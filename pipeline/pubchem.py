@@ -163,7 +163,7 @@ def score_candidate(
         score += 100
 
     # Stereo bonus (indicates well-defined 3D structure)
-    if prefer_stereo and ("@" in iso or "/" in iso):
+    if prefer_stereo and any(marker in iso for marker in ("@", "/", "\\")):
         score += 20
 
     # Lower CID = more canonical record
