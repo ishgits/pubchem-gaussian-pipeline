@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pipeline.gaussian import (
     xyz_to_gaussian_coords,
     write_gaussian_com,
+    write_gaussian_coms,
     write_gaussian_coms_from_conformers,
 )
 
@@ -289,3 +290,119 @@ class TestWriteGaussianComsFromConformers:
                     text = f.read()
                 assert "--Link1--" in text
                 assert f"dE={deltas[row['conformer_id']]} kcal/mol" in text
+
+
+class TestEmptyComLogSchemas:
+    """M-11: zero writes remain valid, readable CSVs for downstream stages."""
+
+    def test_empty_legacy_log_keeps_headers(self, tmp_path, monkeypatch):
+        import pandas as pd
+
+        monkeypatch.chdir(tmp_path)
+        xyz_log = tmp_path / "xyz_log.csv"
+        pd.DataFrame(columns=["name", "xyz_path"]).to_csv(xyz_log, index=False)
+        com_log = tmp_path / "com_write_log.csv"
+
+        out = write_gaussian_coms(str(xyz_log), log_csv=str(com_log))
+
+        assert list(out.columns) == ["name", "xyz_path", "com_path"]
+        assert out.empty
+        assert list(pd.read_csv(com_log).columns) == ["name", "xyz_path", "com_path"]
+
+    def test_empty_conformer_log_keeps_headers(self, tmp_path, monkeypatch):
+        import pandas as pd
+
+        monkeypatch.chdir(tmp_path)
+        conformer_log = tmp_path / "conformer_log.csv"
+        pd.DataFrame(columns=["name", "conformer_id", "xyz_path"]).to_csv(
+            conformer_log, index=False
+        )
+        com_log = tmp_path / "com_write_log.csv"
+
+        out = write_gaussian_coms_from_conformers(
+            str(conformer_log), log_csv=str(com_log)
+        )
+
+        expected = ["name", "conformer_id", "xyz_path", "com_path"]
+        assert list(out.columns) == expected
+        assert out.empty
+        assert list(pd.read_csv(com_log).columns) == expected
+
+    def test_every_conformer_write_failure_keeps_headers(
+        self, tmp_path, monkeypatch
+    ):
+        import pandas as pd
+        import pipeline.gaussian as G
+
+        monkeypatch.chdir(tmp_path)
+        conformer_log = tmp_path / "conformer_log.csv"
+        pd.DataFrame([{
+            "name": "Water",
+            "conformer_id": 0,
+            "xyz_path": "missing.xyz",
+        }]).to_csv(conformer_log, index=False)
+        monkeypatch.setattr(
+            G,
+            "write_gaussian_com",
+            lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("bad XYZ")),
+        )
+        com_log = tmp_path / "com_write_log.csv"
+
+        out = G.write_gaussian_coms_from_conformers(
+            str(conformer_log), log_csv=str(com_log)
+        )
+
+        expected = ["name", "conformer_id", "xyz_path", "com_path"]
+        assert out.empty
+        assert list(pd.read_csv(com_log).columns) == expected
+        failures = pd.read_csv(tmp_path / "com_write_failed.csv")
+        assert len(failures) == 1
+
+    def test_all_ineligible_molecules_complete_zero_job_pipeline(
+        self, tmp_path, monkeypatch
+    ):
+        import pandas as pd
+        import pipeline.conformers as C
+        from pipeline.slurm import write_slurm_scripts
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+        monkeypatch.setattr(
+            C, "check_conformer_eligibility", lambda smiles: "undefined stereochemistry"
+        )
+        molecule_table = pd.DataFrame([{
+            "name": "Ambiguous",
+            "cid": 1,
+            "IsomericSMILES": "CC(F)Cl",
+        }])
+        conformer_log = tmp_path / "conformer_log.csv"
+        failed_log = tmp_path / "conformer_search_failed.csv"
+        C.search_conformers(
+            molecule_table,
+            xyz_dir=str(tmp_path / "xyz"),
+            log_csv=str(conformer_log),
+            failed_csv=str(failed_log),
+        )
+
+        com_log = tmp_path / "com_write_log.csv"
+        coms = write_gaussian_coms_from_conformers(
+            str(conformer_log), log_csv=str(com_log)
+        )
+        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_dir.mkdir()
+        (slurm_dir / "stale_F.sh").write_text("#!/bin/bash\n")
+        slurm_log = tmp_path / "slurm_write_log.csv"
+        scripts = write_slurm_scripts(
+            com_log_csv=str(com_log),
+            slurm_dir=str(slurm_dir),
+            log_csv=str(slurm_log),
+        )
+
+        assert pd.read_csv(conformer_log).empty
+        assert len(pd.read_csv(failed_log)) == 1
+        assert coms.empty
+        assert scripts.empty
+        assert list(slurm_dir.glob("*.sh")) == []
+        assert list(pd.read_csv(slurm_log).columns) == [
+            "jobname", "com_path", "sh_path", "status"
+        ]

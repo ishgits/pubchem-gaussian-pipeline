@@ -189,3 +189,71 @@ class TestWriteSlurmScriptsOverwrite:
                 text = f.read()
             assert "#SBATCH --account=new" in text
             assert "#SBATCH --account=old" not in text
+
+
+class TestWriteSlurmScriptsCurrentRunCleanup:
+    """B-06/M-11: disk scripts and log reflect only the current run."""
+
+    def _write_com_log(self, path, com_paths):
+        pd.DataFrame(
+            [
+                {"name": os.path.basename(p), "xyz_path": "x.xyz", "com_path": p}
+                for p in com_paths
+            ],
+            columns=["name", "xyz_path", "com_path"],
+        ).to_csv(path, index=False)
+
+    def test_smaller_rerun_prunes_stale_scripts(self, tmp_path):
+        com_dir = tmp_path / "gaussian_inputs"
+        slurm_dir = tmp_path / "slurm_scripts"
+        com_dir.mkdir()
+        com_log = tmp_path / "com_write_log.csv"
+        slurm_log = tmp_path / "slurm_write_log.csv"
+
+        first_paths = []
+        for name in ("water_F.com", "glycine_F.com"):
+            path = com_dir / name
+            path.write_text("")
+            first_paths.append(str(path))
+        self._write_com_log(com_log, first_paths)
+        write_slurm_scripts(
+            com_log_csv=str(com_log),
+            slurm_dir=str(slurm_dir),
+            log_csv=str(slurm_log),
+        )
+        assert {p.name for p in slurm_dir.glob("*.sh")} == {
+            "water_F.sh", "glycine_F.sh"
+        }
+
+        adenine = com_dir / "adenine_F.com"
+        adenine.write_text("")
+        self._write_com_log(com_log, [str(adenine)])
+        out = write_slurm_scripts(
+            com_log_csv=str(com_log),
+            slurm_dir=str(slurm_dir),
+            log_csv=str(slurm_log),
+        )
+
+        assert list(out["jobname"]) == ["adenine_F"]
+        assert {p.name for p in slurm_dir.glob("*.sh")} == {"adenine_F.sh"}
+        assert len(list(slurm_dir.glob("*.sh"))) == len(out)
+
+    def test_zero_job_rerun_prunes_all_and_keeps_log_schema(self, tmp_path):
+        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_dir.mkdir()
+        (slurm_dir / "old_F.sh").write_text("#!/bin/bash\n")
+        com_log = tmp_path / "com_write_log.csv"
+        self._write_com_log(com_log, [])
+        slurm_log = tmp_path / "slurm_write_log.csv"
+
+        out = write_slurm_scripts(
+            com_log_csv=str(com_log),
+            slurm_dir=str(slurm_dir),
+            log_csv=str(slurm_log),
+        )
+
+        expected = ["jobname", "com_path", "sh_path", "status"]
+        assert out.empty
+        assert list(out.columns) == expected
+        assert list(pd.read_csv(slurm_log).columns) == expected
+        assert list(slurm_dir.glob("*.sh")) == []

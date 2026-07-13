@@ -15,6 +15,9 @@ import pandas as pd
 from .utils import ensure_dir
 
 
+_SLURM_LOG_COLUMNS = ["jobname", "com_path", "sh_path", "status"]
+
+
 # ---------------------------------------------------------------------------
 # Default template — EDIT THIS for your cluster
 # ---------------------------------------------------------------------------
@@ -121,10 +124,14 @@ def write_slurm_scripts(
     never picked up. Passing *com_dir* switches to the legacy explicit mode that
     globs every ``*.com`` in that directory instead.
 
-    Existing ``.sh`` files are **overwritten** (M-03): regeneration is cheap and a
-    rerun with new SBATCH directives (account, resources) must not leave a stale
-    script behind. The log's ``status`` column reports ``WROTE`` for a new file
-    and ``OVERWROTE`` when a non-empty script was replaced.
+    Before writing, ``.sh`` files absent from the current COM set are removed
+    (B-06), so the dedicated output directory agrees with the current-run log and
+    a submission glob cannot include stale jobs. Current scripts are
+    **overwritten** (M-03): regeneration is cheap and a rerun with new SBATCH
+    directives (account, resources) must not leave a stale script behind. The
+    log's ``status`` column reports ``WROTE`` for a new file and ``OVERWROTE``
+    when a non-empty script was replaced. A zero-job run writes a header-only log
+    and leaves no ``.sh`` files (M-11).
     """
     ensure_dir(slurm_dir)
 
@@ -135,6 +142,17 @@ def write_slurm_scripts(
         # Default: consume the current run's com_write_log.csv.
         com_log = pd.read_csv(com_log_csv)
         com_paths = [str(p) for p in com_log["com_path"]]
+
+    expected_scripts = {
+        os.path.normcase(os.path.abspath(os.path.join(
+            slurm_dir,
+            f"{os.path.splitext(os.path.basename(com_path))[0]}.sh",
+        )))
+        for com_path in com_paths
+    }
+    for stale_path in glob.glob(os.path.join(slurm_dir, "*.sh")):
+        if os.path.normcase(os.path.abspath(stale_path)) not in expected_scripts:
+            os.remove(stale_path)
 
     rows = []
     for com_path in com_paths:
@@ -150,7 +168,7 @@ def write_slurm_scripts(
             "status": "OVERWROTE" if existed else "WROTE",
         })
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=_SLURM_LOG_COLUMNS)
     df.to_csv(log_csv, index=False)
     print(f"Wrote: {log_csv}")
     return df

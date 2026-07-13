@@ -17,6 +17,13 @@ from .conformers import UNCONVERGED_FF_SEED
 from .utils import ensure_dir, sanitize_basename
 
 
+# Fixed schemas keep a scientifically valid zero-job run machine-readable for
+# the next stage (M-11). The legacy writer has no conformer identifier; the v2
+# writer preserves it for traceability.
+_LEGACY_COM_LOG_COLUMNS = ["name", "xyz_path", "com_path"]
+_CONFORMER_COM_LOG_COLUMNS = ["name", "conformer_id", "xyz_path", "com_path"]
+
+
 def xyz_to_gaussian_coords(xyz_path: str) -> str:
     """
     Read an XYZ file and return the coordinate block formatted for a
@@ -222,7 +229,7 @@ def write_gaussian_coms(
         except Exception as e:
             failed.append({"name": name, "xyz_path": xyz_path, "error": repr(e)})
 
-    out_df = pd.DataFrame(written)
+    out_df = pd.DataFrame(written, columns=_LEGACY_COM_LOG_COLUMNS)
     out_df.to_csv(log_csv, index=False)
 
     if failed:
@@ -302,7 +309,7 @@ def write_gaussian_coms_from_conformers(
                 "error": repr(e),
             })
 
-    out_df = pd.DataFrame(written)
+    out_df = pd.DataFrame(written, columns=_CONFORMER_COM_LOG_COLUMNS)
     out_df.to_csv(log_csv, index=False)
 
     if failed:
