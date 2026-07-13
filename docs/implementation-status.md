@@ -10,8 +10,8 @@
 Maintained by the implementing agent (Claude Code). The reviewer (Codex) must
 verify these claims against the code, not trust them.
 
-**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 5
-(v2 conformer search + remediation rounds 01–05; released as v2.0.0). Works
+**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 6
+(v2 conformer search + remediation rounds 01–06; released as v2.0.0). Works
 against `docs/architecture.md` and `docs/implementation-plan.md`.
 
 ## 1. What was implemented
@@ -29,10 +29,13 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   stereochemistry, is skipped and logged to `conformer_search_failed.csv` rather
   than letting RDKit assign an arbitrary stereoisomer. No-stereocenter molecules
   proceed normally.
-- **PubChem SMILES sourcing (round 01/02, B-01/M-03).** The resolved molecule
-  table carries the stereo-bearing SMILES into an `IsomericSMILES` column via the
-  `_isomeric_smiles` helper, and `score_candidate` reads stereo through the same
-  helper. Both use PubChem's current `SMILES` key (see §3 deviation).
+- **PubChem SMILES sourcing and scoring (round 01/02/06, B-01/M-03/M-13).** The
+  resolved molecule table carries the stereo-bearing SMILES into an
+  `IsomericSMILES` column via the `_isomeric_smiles` helper, and
+  `score_candidate` reads stereo through the same helper. Both use PubChem's
+  current `SMILES` key (see §3 deviation). The stereo bonus recognizes
+  tetrahedral `@` and both directional-bond E/Z tokens (`/` and `\`), while
+  `ConnectivitySMILES` remains excluded from scoring.
 - **FF convergence handling (round 02, M-04/M-05).** `generate_conformers`
   captures each conformer's `not_converged` flag and retries only the failed
   conformers once with more iterations (`_optimize_single_conf`), so
@@ -80,6 +83,13 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   molecule labels that collapse to the same `sanitize_basename()` value (including
   punctuation/whitespace and case-only collisions). This prevents one molecule's
   XYZ/COM/checkpoint/SLURM files from overwriting another's.
+- **Append-union output identity (round-06 B-07).** `append=True` loads the
+  existing conformer log before any output mutation and validates one union of
+  current labels plus all unrequested labels that would be retained. The pure
+  `validate_unique_output_basenames()` helper rejects a new/current label that
+  collides with retained chemistry and also rejects an already-corrupt append
+  log. On failure, the prior conformer log, XYZ files, and failure log remain
+  unchanged.
 - **Physical-line XYZ parsing (round-04 B-01).** `xyz_to_gaussian_coords` reads
   line 1 = atom count, line 2 = comment (may be empty), then exactly that many
   coordinate rows; a count mismatch or malformed row raises `ValueError` instead
@@ -112,8 +122,8 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   install step; README leads with the RDKit conformer flow, with Open Babel demoted
   to a labeled legacy v1.1 section.
 
-Required checks locally green after round 05 (rdkit 2025.09.3): `pytest tests/ -q`
-→ **159 passed**; `python scripts/check_invariants.py` → **passed**;
+Required checks locally green after round 06 (rdkit 2025.09.3): `pytest tests/ -q`
+→ **165 passed**; `python scripts/check_invariants.py` → **passed**;
 `git ls-files -ci --exclude-standard` → empty.
 
 ## 2. What was NOT implemented (and why)
@@ -133,6 +143,11 @@ Required checks locally green after round 05 (rdkit 2025.09.3): `pytest tests/ -
   and extending version/commit provenance to `com_write_log.csv` /
   `sdf_download_log.csv`. The round-04 `n_rows == n_kept` reconciliation is no
   longer deferred: round-05 M-12 implements it with ID/path integrity checks.
+- **Physical cleanup of stale XYZ/COM files is not implemented.** Reduced reruns
+  make the current CSV logs and pruned `slurm_scripts/` authoritative, so old
+  files in `conformer_xyz/` or `gaussian_inputs/` cannot enter the documented
+  submission path. They may remain on disk; README documents this behavior and
+  recommends fresh output directories when studies require physical separation.
 
 ## 3. Deviations from architecture / plan
 
@@ -197,6 +212,10 @@ title) and never mixed with DFT Hartree values.
   accepted, while truncation, missing/duplicate IDs, inconsistent `n_kept`, and
   duplicate XYZ paths invalidate the group; a truncated three-conformer batch is
   regenerated to the full set (M-12).
+- `tests/test_conformers.py` round-06 — append-mode punctuation/whitespace and
+  case-only collisions raise before generation; prior log, XYZ, and failure-log
+  bytes remain unchanged; distinct basenames append successfully; and an already
+  corrupt retained-label set is rejected before mutation (B-07).
 - `tests/test_gaussian.py` — physical-line XYZ parsing: empty comment keeps all
   atoms, count-mismatch (either direction) and malformed/non-integer rows raise,
   trailing blank tolerated (`TestXyzParsingByPhysicalLine`).
@@ -208,7 +227,9 @@ title) and never mixed with DFT Hartree values.
   (`TestWriteSlurmScriptsCurrentRunCleanup`).
 - `tests/test_pubchem.py` — SMILES key handling (`TestIsomericSmiles`), resolved-row
   schema (`TestResolvedRow`), and current-schema scoring with the stereo bonus
-  (`TestScoreCandidateCurrentSchema`).
+  (`TestScoreCandidateCurrentSchema`), including `/` and backslash-only E/Z
+  markers, selection over a lower-CID stereo-free candidate, and explicit
+  exclusion of `ConnectivitySMILES` from scoring (M-13).
 - `tests/test_gaussian.py` — per-conformer filenames, ΔE in title, Link1 intact
   (`TestWriteGaussianComConformer`, `TestWriteGaussianComsFromConformers`);
   header-only legacy/conformer COM logs, all-write-failure behavior, and the
@@ -233,6 +254,10 @@ still runs the pure tests; CI installs rdkit so they execute there.
 - Fixed `N_GENERATE=20` may under-sample very flexible molecules.
 - These are FF starting geometries, not optimized minima — DFT makes the final
   call among the carried candidates.
+- Reduced reruns may leave prior pipeline-generated XYZ/COM files on disk. They
+  are not referenced by the current logs or pruned SLURM directory and therefore
+  are not submitted by the documented workflow; use fresh output directories per
+  study if those artifacts must be physically isolated.
 - **Reproducibility of `pipeline_commit`.** It pins code identity only when the
   tree is clean. A `.dirty` suffix means uncommitted edits produced the output,
   so that output is not fully reproducible from the commit alone. An empty

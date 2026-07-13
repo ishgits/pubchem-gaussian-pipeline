@@ -55,6 +55,12 @@ Open `notebooks/run_pipeline.ipynb` and:
 for f in slurm_scripts/*.sh; do sbatch "$f"; done
 ```
 
+The current-run CSV logs and `slurm_scripts/` are authoritative. Reduced reruns
+prune obsolete scripts, but prior XYZ/COM files may remain in `conformer_xyz/`
+and `gaussian_inputs/`; they are not submitted by the log-driven workflow. Use
+fresh output directories per study when generated files must be physically
+separated.
+
 ## Repository Structure
 
 ```
