@@ -538,3 +538,52 @@ class TestConvergenceBatch:
             com_text = f.read()
         assert UNCONVERGED_FF_SEED in com_text
         assert "--Link1--" in com_text  # Link1 contract still intact
+
+
+class TestProvenanceLogging:
+    """M-06: pipeline version + commit recorded in conformer_log.csv and XYZ.
+
+    RDKit is stubbed out (synthetic/offline); the real `pipeline_provenance`
+    runs, so `pipeline_commit` is whatever git reports here (may be empty) — we
+    never assert a concrete SHA."""
+
+    def _run(self, tmp_path, monkeypatch):
+        import pandas as pd
+
+        import pipeline.conformers as C
+
+        monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
+        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+        coords = [[("O", 0.0, 0.0, 0.0), ("H", 0.0, 0.0, 0.96)]]
+        monkeypatch.setattr(
+            C, "generate_conformers",
+            lambda smiles, **kw: (coords, [1.23], "MMFF94", [True]),
+        )
+        table = pd.DataFrame([{"name": "Water", "cid": 962, "IsomericSMILES": "O"}])
+        return C.search_conformers(
+            table,
+            xyz_dir=str(tmp_path / "xyz"),
+            log_csv=str(tmp_path / "conformer_log.csv"),
+            failed_csv=str(tmp_path / "fail.csv"),
+        )
+
+    def test_pipeline_version_on_every_row(self, tmp_path, monkeypatch):
+        import pipeline
+
+        log = self._run(tmp_path, monkeypatch)
+        assert len(log) >= 1
+        assert (log["pipeline_version"] == pipeline.__version__).all()
+
+    def test_pipeline_commit_present_and_str(self, tmp_path, monkeypatch):
+        # Present and a string (possibly empty) — never assert a concrete SHA.
+        log = self._run(tmp_path, monkeypatch)
+        assert "pipeline_commit" in log.columns
+        for v in log["pipeline_commit"]:
+            assert isinstance(v, str)
+
+    def test_xyz_comment_has_provenance_tokens(self, tmp_path, monkeypatch):
+        log = self._run(tmp_path, monkeypatch)
+        with open(log.iloc[0]["xyz_path"]) as f:
+            comment = f.read().splitlines()[1]  # line 2 of an XYZ file is the comment
+        assert "pver=" in comment
+        assert "pcommit=" in comment

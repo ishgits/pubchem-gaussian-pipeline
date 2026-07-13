@@ -27,7 +27,7 @@ import os
 
 import pandas as pd
 
-from .utils import ensure_dir, sanitize_basename
+from .utils import ensure_dir, pipeline_provenance, sanitize_basename
 
 # Locked defaults (docs/implementation-plan.md v2 — confirm at approval).
 N_GENERATE = 20
@@ -378,6 +378,8 @@ _LOG_COLUMNS = [
     "rel_energy_kcalmol",
     "xyz_path",
     "rdkit_version",
+    "pipeline_version",
+    "pipeline_commit",
     "seed",
     "method",
     "n_generated",
@@ -439,7 +441,11 @@ def search_conformers(
         log_rows = []
 
     failed = []
+    # Provenance captured once per run (M-06): pipeline version + best-effort git
+    # commit, so conformer_log rows and XYZ files tie back to the code revision.
     rdkit_ver = None
+    pipeline_version = None
+    pipeline_commit = None
 
     for _, row in molecule_table.iterrows():
         name = row.get("name")
@@ -468,6 +474,7 @@ def search_conformers(
         try:
             if rdkit_ver is None:
                 rdkit_ver = _rdkit_version()
+                pipeline_version, pipeline_commit = pipeline_provenance()
             coords_list, energies_kcal, method, converged = generate_conformers(
                 str(smiles),
                 n_generate=n_generate,
@@ -510,7 +517,8 @@ def search_conformers(
                 coords_list[conf_idx],
                 comment=(
                     f"{base} c{ii:02d} dE={rel_e:.4f} kcal/mol "
-                    f"method={method} seed={seed}{unconv_tag}"
+                    f"method={method} seed={seed} "
+                    f"pver={pipeline_version} pcommit={pipeline_commit}{unconv_tag}"
                 ),
             )
             log_rows.append({
@@ -521,6 +529,8 @@ def search_conformers(
                 "rel_energy_kcalmol": round(rel_e, 6),
                 "xyz_path": xyz_path,
                 "rdkit_version": rdkit_ver,
+                "pipeline_version": pipeline_version,
+                "pipeline_commit": pipeline_commit,
                 "seed": seed,
                 "method": method,
                 "n_generated": n_generated,

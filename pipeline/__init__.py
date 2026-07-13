@@ -18,6 +18,12 @@ The v1.1 path (PubChem 3D SDF → Open Babel XYZ, via ``download_sdfs`` /
 ``convert_sdfs_to_xyz``) remains available for single-geometry use.
 """
 
+# Pipeline version for provenance (M-06). Bump manually when the code that
+# produces scientific outputs changes; the v2 conformer track starts at 0.2.0.
+# Recorded in conformer_log.csv alongside a best-effort git commit so two runs
+# from different revisions are distinguishable.
+__version__ = "0.2.0"
+
 from .pubchem import (
     build_molecule_table,
     download_sdfs,
@@ -41,4 +47,10 @@ from .gaussian import (
     write_gaussian_coms_from_conformers,
 )
 from .slurm import write_slurm_script, write_slurm_scripts
-from .utils import sanitize_basename, ensure_dir, normalize_cid
+from .utils import (
+    sanitize_basename,
+    ensure_dir,
+    normalize_cid,
+    git_short_sha,
+    pipeline_provenance,
+)
