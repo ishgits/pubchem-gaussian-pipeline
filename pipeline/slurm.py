@@ -18,6 +18,7 @@ from .manifest import (
     record_child_artifact,
     relative_artifact_path,
     remove_artifacts_by_kind,
+    require_exact_artifact_id_set,
     sha256_file,
     slurm_template_identity,
     stable_record_id,
@@ -121,6 +122,23 @@ def _validated_logged_com_paths(
             "Cannot write SLURM scripts from invalid COM log entries: "
             + "; ".join(problems)
         )
+
+    # The COM log must also be a complete index of this run's manifest COM
+    # layer.  Do this after row validation so malformed paths/hashes receive
+    # their precise diagnostic, but still before any output mutation.  A valid
+    # subset or empty damaged log would otherwise prune scripts and silently
+    # drop supported jobs.
+    observed_com_ids = (
+        com_log["artifact_id"].tolist()
+        if "artifact_id" in com_log.columns
+        else []
+    )
+    require_exact_artifact_id_set(
+        manifest,
+        "com",
+        observed_com_ids,
+        source_label="com_write_log.csv",
+    )
     return prepared
 
 

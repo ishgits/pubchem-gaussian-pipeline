@@ -569,9 +569,13 @@ def _frozen_matrix_problems(
         "def configuration_hash(",
         "def stable_record_id(",
         "def sha256_file(",
+        "def require_exact_artifact_id_set(",
+        "def _require_link1_checkpoint_reads(",
         "def validate_manifest(",
         "def record_conformer_xyz(",
         "def record_child_artifact(",
+        '"Geom=AllChk"',
+        '"Guess=Read"',
         '"molecule_identity_hash"',
         '"conformer_record_id"',
         '"parent_artifact_id"',
@@ -601,6 +605,8 @@ def _frozen_matrix_problems(
     for token in ("manifest_path", "record_child_artifact", "sha256_file"):
         if token not in gaussian_text:
             problems.append(f"Gaussian manifest boundary omits {token!r}")
+    if "require_exact_artifact_id_set(" not in gaussian_text:
+        problems.append("Gaussian boundary omits exact manifest XYZ-set validation")
 
     sh_fields = (
         "# run_id=", "# artifact_id=", "# source_com_relative_path=",
@@ -612,6 +618,7 @@ def _frozen_matrix_problems(
     for token in (
         "zero-byte com_path", "duplicate normalized com_path",
         "collapse to script basename", "record_child_artifact",
+        "require_exact_artifact_id_set(",
     ):
         if token not in slurm_text:
             problems.append(f"SLURM one-to-one validation omits {token!r}")

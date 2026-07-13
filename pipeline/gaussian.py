@@ -21,6 +21,7 @@ from .manifest import (
     record_child_artifact,
     relative_artifact_path,
     remove_artifacts_by_kind,
+    require_exact_artifact_id_set,
     sha256_file,
     stable_record_id,
 )
@@ -587,6 +588,22 @@ def write_gaussian_coms_from_conformers(
             manifest["run_id"], "com", xyz_artifact_id
         )
         prepared.append((row, xyz_artifact, com_path, com_artifact_id))
+
+    # A stage CSV is a subordinate index, not an independent source of truth.
+    # After validating each present row, reject a valid-looking subset or extra
+    # row before removing prior COM/SH lineage or touching any output.  Empty
+    # zero-job logs remain valid when the manifest contains no XYZ artifacts.
+    observed_xyz_ids = (
+        conf_log["artifact_id"].tolist()
+        if "artifact_id" in conf_log.columns
+        else []
+    )
+    require_exact_artifact_id_set(
+        manifest,
+        "xyz",
+        observed_xyz_ids,
+        source_label="conformer_log.csv",
+    )
 
     # Clear any stale failure log from a prior run (MIN-02); rewritten below only
     # if this run actually has failures.

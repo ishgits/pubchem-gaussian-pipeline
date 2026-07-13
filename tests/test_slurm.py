@@ -387,26 +387,11 @@ class TestWriteSlurmScriptsCurrentRunCleanup:
         slurm_log = tmp_path / "slurm_write_log.csv"
         com_log, manifest_path = write_linked_com_log(
             tmp_path,
-            [
-                {"name": "Water", "com_path": tmp_path / "gaussian_inputs" / "water_F.com"},
-                {"name": "Glycine", "com_path": tmp_path / "gaussian_inputs" / "glycine_F.com"},
-                {"name": "Adenine", "com_path": tmp_path / "gaussian_inputs" / "adenine_F.com"},
-            ],
+            [{"name": "Water", "com_path": tmp_path / "gaussian_inputs" / "water_F.com"}],
             SAMPLE_XYZ,
         )
-        all_rows = pd.read_csv(com_log)
-        all_rows.iloc[:2].to_csv(com_log, index=False)
-        write_slurm_scripts(
-            com_log_csv=str(com_log),
-            slurm_dir=str(slurm_dir),
-            log_csv=str(slurm_log),
-            manifest_path=manifest_path,
-        )
-        assert {p.name for p in slurm_dir.glob("*.sh")} == {
-            "water_F.sh", "glycine_F.sh"
-        }
-
-        all_rows.iloc[[2]].to_csv(com_log, index=False)
+        slurm_dir.mkdir()
+        (slurm_dir / "stale_F.sh").write_text("#!/bin/bash\n")
         out = write_slurm_scripts(
             com_log_csv=str(com_log),
             slurm_dir=str(slurm_dir),
@@ -414,9 +399,51 @@ class TestWriteSlurmScriptsCurrentRunCleanup:
             manifest_path=manifest_path,
         )
 
-        assert list(out["jobname"]) == ["adenine_F"]
-        assert {p.name for p in slurm_dir.glob("*.sh")} == {"adenine_F.sh"}
+        assert list(out["jobname"]) == ["water_F"]
+        assert {p.name for p in slurm_dir.glob("*.sh")} == {"water_F.sh"}
         assert len(list(slurm_dir.glob("*.sh"))) == len(out)
+
+    @pytest.mark.parametrize("retained_rows", [1, 0])
+    def test_truncated_com_log_rejected_before_script_or_manifest_mutation(
+        self, tmp_path, retained_rows
+    ):
+        com_log, manifest_path = write_linked_com_log(
+            tmp_path,
+            [
+                {"name": "Water", "com_path": tmp_path / "gaussian_inputs" / "water_F.com"},
+                {"name": "Glycine", "com_path": tmp_path / "gaussian_inputs" / "glycine_F.com"},
+            ],
+            SAMPLE_XYZ,
+        )
+        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_log = tmp_path / "slurm_write_log.csv"
+        first = write_slurm_scripts(
+            com_log_csv=str(com_log),
+            slurm_dir=str(slurm_dir),
+            log_csv=str(slurm_log),
+            manifest_path=manifest_path,
+        )
+        manifest_before = open(manifest_path, "rb").read()
+        log_before = slurm_log.read_bytes()
+        script_bytes = {
+            path: path.read_bytes() for path in slurm_dir.glob("*.sh")
+        }
+
+        rows = pd.read_csv(com_log)
+        rows.iloc[:retained_rows].to_csv(com_log, index=False)
+
+        with pytest.raises(ValueError, match="does not exactly match manifest com artifacts"):
+            write_slurm_scripts(
+                com_log_csv=str(com_log),
+                slurm_dir=str(slurm_dir),
+                log_csv=str(slurm_log),
+                manifest_path=manifest_path,
+            )
+
+        assert open(manifest_path, "rb").read() == manifest_before
+        assert slurm_log.read_bytes() == log_before
+        assert len(first) == 2
+        assert {path: path.read_bytes() for path in slurm_dir.glob("*.sh")} == script_bytes
 
     def test_zero_job_rerun_prunes_all_and_keeps_log_schema(self, tmp_path):
         slurm_dir = tmp_path / "slurm_scripts"

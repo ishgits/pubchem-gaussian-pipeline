@@ -47,6 +47,71 @@ _SLURM_CONFIG_KEYS = {
 }
 
 
+def _require_link1_checkpoint_reads(route_freq: str) -> None:
+    """Require the v2 Link1 frequency route to read checkpoint state.
+
+    The generated Link1 frequency section deliberately omits title,
+    charge/multiplicity, and coordinates.  It is therefore valid only when the
+    route reads both geometry and wavefunction from the optimization
+    checkpoint.  Match the required assignments case-insensitively while
+    allowing ordinary Gaussian whitespace.
+    """
+    route = str(route_freq)
+    required = {
+        "Geom=AllChk": r"(?<![A-Za-z0-9_])geom\s*=\s*allchk(?![A-Za-z0-9_])",
+        "Guess=Read": r"(?<![A-Za-z0-9_])guess\s*=\s*read(?![A-Za-z0-9_])",
+    }
+    missing = [
+        label for label, pattern in required.items()
+        if re.search(pattern, route, flags=re.IGNORECASE) is None
+    ]
+    if missing:
+        raise ValueError(
+            "The v2 Link1 frequency route must contain checkpoint-read "
+            "keyword(s): " + ", ".join(missing) + "."
+        )
+
+
+def require_exact_artifact_id_set(
+    manifest: dict,
+    kind: str,
+    observed_ids,
+    *,
+    source_label: str,
+) -> None:
+    """Require a stage index to cover exactly the manifest artifacts of *kind*.
+
+    Stage CSVs are subordinate indexes under the frozen v2 contract.  Accepting
+    a truncated CSV would silently drop downstream scientific or operational
+    artifacts, so both missing and extra identifiers are fatal before mutation.
+    Duplicate rows remain the responsibility of the caller's row-level checks.
+    """
+    if kind not in {"xyz", "com", "sh"}:
+        raise ValueError(f"Unsupported manifest artifact kind: {kind!r}.")
+    expected = {
+        str(artifact["artifact_id"])
+        for artifact in manifest.get("artifacts", [])
+        if artifact.get("kind") == kind
+    }
+    observed = {
+        str(value).strip()
+        for value in observed_ids
+        if value is not None and str(value).strip()
+    }
+    missing = sorted(expected - observed)
+    extra = sorted(observed - expected)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing {kind} artifact_id(s) {missing}")
+        if extra:
+            details.append(f"extra {kind} artifact_id(s) {extra}")
+        raise ValueError(
+            f"{source_label} does not exactly match manifest {kind} artifacts: "
+            + "; ".join(details)
+        )
+
+
 def sha256_file(path: str | os.PathLike[str]) -> str:
     """Return the SHA-256 digest of a regular file's bytes."""
     digest = hashlib.sha256()
@@ -258,6 +323,7 @@ def create_run_manifest(
             raise ValueError(f"Gaussian {route_field} must be a nonblank route line.")
     if gaussian_config["link1"] is not True:
         raise ValueError("The v2 manifest requires the Link1 opt→freq contract.")
+    _require_link1_checkpoint_reads(gaussian_config["route_freq"])
     slurm_config = _require_exact_config("SLURM", slurm, _SLURM_CONFIG_KEYS)
 
     configured_molecules = [
@@ -348,6 +414,7 @@ def validate_manifest(manifest: dict) -> None:
     for route_field in ("route_opt", "route_freq"):
         if not str(configuration["gaussian"].get(route_field, "")).strip():
             raise ValueError(f"Manifest Gaussian {route_field} must be nonblank.")
+    _require_link1_checkpoint_reads(configuration["gaussian"]["route_freq"])
 
     molecules = manifest["molecules"]
     if not isinstance(molecules, list):

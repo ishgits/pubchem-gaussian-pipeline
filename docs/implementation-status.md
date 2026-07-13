@@ -6,8 +6,8 @@
 
 **PR:** #3
 **Branch:** `feat/conformer-search-v2`
-**Current phase:** v2.0 final re-review
-**Merge status:** **implementation complete; awaiting green remote CI and Ish's final approval**
+**Current phase:** v2.0 final remediation
+**Merge status:** **local remediation complete; requires push, green remote CI, one current-head re-review, and Ish's final approval**
 
 This status is governed by `docs/architecture.md`,
 `docs/implementation-plan.md`, and `docs/release-contract-v2.0.md`.
@@ -100,8 +100,25 @@ resolved two new Major traceability issues before the final re-review:
   `pipeline/manifest.py:488-506`, with regression coverage in
   `tests/test_manifest.py:147-170`.
 
-Final re-review result: no frozen-contract Blocker or Major remains. The local
-implementation is ready for remote CI and Ish's human merge decision.
+The subsequent current-head review identified three additional contract-level
+gaps. They are resolved locally in this remediation pass:
+
+- **B-08 — Resolved locally.** Manifest creation and validation now reject a
+  Link1 frequency route unless it contains both `Geom=AllChk` and `Guess=Read`
+  (case-insensitive, ordinary whitespace allowed). This prevents the generated
+  title/charge/coordinate-free frequency section from becoming an invalid job.
+- **M-26 — Resolved locally.** Before any Gaussian output or manifest mutation,
+  `conformer_log.csv` must contain exactly the manifest's XYZ artifact-ID set.
+  Valid-looking truncated and empty subset logs are rejected, preserving prior
+  COM files, logs, failure logs, and manifest lineage byte-for-byte.
+- **M-27 — Resolved locally.** Before script pruning or writing,
+  `com_write_log.csv` must contain exactly the manifest's COM artifact-ID set.
+  Valid-looking truncated and empty subset logs are rejected, preserving prior
+  scripts, SLURM logs, and manifest lineage byte-for-byte.
+
+No known local frozen-contract Blocker or Major remains. This exact patched head
+still requires remote CI and one current-head review before the human merge
+decision; the status does not treat the prior review as approval of new code.
 
 ## 2. Prior finding disposition
 
@@ -134,11 +151,11 @@ pytest 9.1.1
 Current local results:
 
 ```text
-pytest tests/ -q: 255 passed
+pytest tests/ -q: 266 passed
 python scripts/check_invariants.py: passed
 Python compilation: passed
 notebook JSON validation: passed
-clean git archive: 255 passed; invariant checks passed
+clean package copy: 266 passed; invariant checks passed
 ```
 
 The publication checkout also passed `git diff --check` and the

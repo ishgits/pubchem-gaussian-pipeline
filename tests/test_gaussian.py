@@ -686,6 +686,58 @@ class TestEmptyComLogSchemas:
             )
         assert com_log.read_bytes() == b"prior log\n"
 
+    @pytest.mark.parametrize("retained_rows", [1, 0])
+    def test_truncated_conformer_log_rejected_before_downstream_mutation(
+        self, tmp_path, monkeypatch, retained_rows
+    ):
+        import pandas as pd
+
+        monkeypatch.chdir(tmp_path)
+        conformer_log, manifest_path = write_linked_conformer_log(
+            tmp_path,
+            [
+                {"name": "Ribose", "conformer_id": 0},
+                {"name": "Ribose", "conformer_id": 1, "rel_energy_kcalmol": 0.4},
+            ],
+            SAMPLE_XYZ,
+        )
+        com_log = tmp_path / "com_write_log.csv"
+        outdir = tmp_path / "gaussian_inputs"
+        first = write_gaussian_coms_from_conformers(
+            conformer_log,
+            outdir=str(outdir),
+            log_csv=str(com_log),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            manifest_path=manifest_path,
+        )
+        failure_log = tmp_path / "com_write_failed.csv"
+        failure_log.write_bytes(b"prior failure\n")
+        manifest_before = Path(manifest_path).read_bytes()
+        log_before = com_log.read_bytes()
+        com_bytes = {
+            Path(path): Path(path).read_bytes() for path in first["com_path"]
+        }
+
+        rows = pd.read_csv(conformer_log)
+        rows.iloc[:retained_rows].to_csv(conformer_log, index=False)
+
+        with pytest.raises(ValueError, match="does not exactly match manifest xyz artifacts"):
+            write_gaussian_coms_from_conformers(
+                conformer_log,
+                outdir=str(outdir),
+                log_csv=str(com_log),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                manifest_path=manifest_path,
+            )
+
+        assert Path(manifest_path).read_bytes() == manifest_before
+        assert com_log.read_bytes() == log_before
+        assert failure_log.read_bytes() == b"prior failure\n"
+        for path, expected in com_bytes.items():
+            assert path.read_bytes() == expected
+
     def test_all_ineligible_molecules_complete_zero_job_pipeline(
         self, tmp_path, monkeypatch
     ):

@@ -114,6 +114,61 @@ class TestManifestValidation:
         with pytest.raises(FileExistsError):
             _create(tmp_path)
 
+    @pytest.mark.parametrize(
+        "route_freq,missing_token",
+        [
+            ("# freq b3lyp/6-31g(d) Guess=Read", "Geom=AllChk"),
+            ("# freq b3lyp/6-31g(d) Geom=AllChk", "Guess=Read"),
+            ("# freq b3lyp/6-31g(d)", "Geom=AllChk"),
+        ],
+    )
+    def test_manifest_creation_requires_link1_checkpoint_reads(
+        self, tmp_path, route_freq, missing_token
+    ):
+        conformer, gaussian, slurm = _configs()
+        gaussian["route_freq"] = route_freq
+        with pytest.raises(ValueError, match=missing_token):
+            create_run_manifest(
+                _table(),
+                conformer,
+                gaussian,
+                slurm,
+                path=str(tmp_path / "bad_manifest.json"),
+                run_id="00000000-0000-4000-8000-000000000001",
+                pipeline_version="2.0.0",
+                pipeline_commit="abc1234",
+                rdkit_version="2025.09.3",
+            )
+        assert not (tmp_path / "bad_manifest.json").exists()
+
+    def test_manifest_validation_rejects_tampered_link1_route(self, tmp_path):
+        manifest = load_manifest(str(_create(tmp_path)))
+        manifest["configuration"]["gaussian"]["route_freq"] = (
+            "# freq b3lyp/6-31g(d)"
+        )
+        manifest["config_hash"] = configuration_hash(manifest["configuration"])
+        with pytest.raises(ValueError, match="Geom=AllChk"):
+            validate_manifest(manifest)
+
+    def test_link1_checkpoint_keywords_are_case_insensitive(self, tmp_path):
+        conformer, gaussian, slurm = _configs()
+        gaussian["route_freq"] = (
+            "# freq b3lyp/6-31g(d) geom = allchk guess = read"
+        )
+        path = tmp_path / "case_manifest.json"
+        create_run_manifest(
+            _table(),
+            conformer,
+            gaussian,
+            slurm,
+            path=str(path),
+            run_id="00000000-0000-4000-8000-000000000001",
+            pipeline_version="2.0.0",
+            pipeline_commit="abc1234",
+            rdkit_version="2025.09.3",
+        )
+        assert path.exists()
+
     def test_duplicate_molecule_record_rejected(self, tmp_path):
         manifest = load_manifest(str(_create(tmp_path)))
         manifest["molecules"].append(deepcopy(manifest["molecules"][0]))

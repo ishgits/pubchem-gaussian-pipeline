@@ -255,3 +255,25 @@ class TestFrozenManifestMatrixGuard:
             manifest, conformers, gaussian, slurm
         )
         assert any("zero-byte com_path" in problem for problem in problems)
+
+    def test_detects_missing_exact_xyz_set_guard(self):
+        manifest, conformers, gaussian, slurm = self._sources()
+        gaussian = gaussian.replace(
+            "require_exact_artifact_id_set(", "removed_exact_set_guard(", 1
+        )
+        problems = check_invariants._frozen_matrix_problems(
+            manifest, conformers, gaussian, slurm
+        )
+        assert any("exact manifest XYZ-set" in problem for problem in problems)
+
+    def test_detects_missing_link1_checkpoint_guard(self):
+        manifest, conformers, gaussian, slurm = self._sources()
+        manifest = manifest.replace(
+            "def _require_link1_checkpoint_reads(",
+            "def removed_link1_checkpoint_guard(",
+            1,
+        )
+        problems = check_invariants._frozen_matrix_problems(
+            manifest, conformers, gaussian, slurm
+        )
+        assert any("_require_link1_checkpoint_reads" in problem for problem in problems)
