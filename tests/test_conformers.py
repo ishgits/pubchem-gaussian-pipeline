@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pipeline.conformers import (
     UNCONVERGED_FF_SEED,
     _finalize_convergence,
+    _resume_group_is_complete,
     _resume_partition,
     _row_config_matches,
     _row_identity_matches,
@@ -680,11 +681,15 @@ class TestResumePartition:
         import pandas as pd
 
         rows = []
+        counts = {name: sum(spec_name == name for spec_name, _ in specs) for name, _ in specs}
+        next_id = {name: 0 for name, _ in specs}
         for i, (name, override) in enumerate(specs):
             xyz = tmp_path / f"{name}_{i}.xyz"
             xyz.write_text("1\n\nO 0 0 0\n")
             row = dict(_CFG, name=name, cid=1, smiles="O",
-                       conformer_id=0, xyz_path=str(xyz))
+                       conformer_id=next_id[name], n_kept=counts[name],
+                       xyz_path=str(xyz))
+            next_id[name] += 1
             row.update(override)
             rows.append(row)
         return pd.DataFrame(rows)
@@ -749,6 +754,52 @@ class TestResumePartition:
         assert done == set()
         assert stale == {"A"}
         assert kept == []
+
+
+class TestResumeGroupCompleteness:
+    """M-12: resume only complete, self-consistent conformer groups."""
+
+    def _rows(self, tmp_path):
+        rows = []
+        for conformer_id in range(3):
+            xyz = tmp_path / f"a_{conformer_id}.xyz"
+            xyz.write_text("1\n\nO 0 0 0\n")
+            rows.append(dict(
+                _CFG,
+                name="A",
+                cid=1,
+                smiles="O",
+                conformer_id=conformer_id,
+                n_kept=3,
+                xyz_path=str(xyz),
+            ))
+        return rows
+
+    def test_intact_group_is_complete(self, tmp_path):
+        assert _resume_group_is_complete(self._rows(tmp_path)) is True
+
+    def test_deleted_last_row_is_incomplete(self, tmp_path):
+        rows = self._rows(tmp_path)[:-1]
+        assert _resume_group_is_complete(rows) is False
+
+    def test_missing_middle_id_is_incomplete(self, tmp_path):
+        rows = self._rows(tmp_path)
+        assert _resume_group_is_complete([rows[0], rows[2]]) is False
+
+    def test_duplicate_conformer_row_is_incomplete(self, tmp_path):
+        rows = self._rows(tmp_path)
+        rows[1] = dict(rows[0])
+        assert _resume_group_is_complete(rows) is False
+
+    def test_disagreeing_n_kept_is_incomplete(self, tmp_path):
+        rows = self._rows(tmp_path)
+        rows[1]["n_kept"] = 2
+        assert _resume_group_is_complete(rows) is False
+
+    def test_duplicate_xyz_path_is_incomplete(self, tmp_path):
+        rows = self._rows(tmp_path)
+        rows[1]["xyz_path"] = rows[0]["xyz_path"]
+        assert _resume_group_is_complete(rows) is False
 
 
 class TestResumeConfigValidationBatch:
@@ -853,6 +904,30 @@ class TestResumeConfigValidationBatch:
         }]).to_csv(log_csv, index=False)
         C.search_conformers(self._table(), **self._kw(tmp_path))
         assert len(calls) == 1  # name present but stale → regenerated
+
+    def test_truncated_three_conformer_log_regenerates(self, tmp_path, monkeypatch):
+        import pandas as pd
+
+        calls = []
+        C = self._patch(monkeypatch, calls)
+
+        def gen_three(smiles, **kw):
+            calls.append(smiles)
+            coords = [[("O", float(i), 0.0, 0.0)] for i in range(3)]
+            return coords, [0.0, 0.5, 1.0], "MMFF94", [True, True, True]
+
+        monkeypatch.setattr(C, "generate_conformers", gen_three)
+        kw = self._kw(tmp_path)
+        first = C.search_conformers(self._table(), **kw)
+        assert len(first) == 3
+
+        # Simulate a truncated but still parseable log: surviving rows and XYZ
+        # files are individually valid, but the group declares n_kept=3.
+        first.iloc[[0, 2]].to_csv(kw["log_csv"], index=False)
+        second = C.search_conformers(self._table(), **kw)
+        assert len(calls) == 2
+        assert list(second["conformer_id"]) == [0, 1, 2]
+        assert set(second["n_kept"].astype(int)) == {3}
 
 
 class TestPreserveUnrequestedBatch:
@@ -997,3 +1072,45 @@ class TestParameterValidation:
         table = self._table([{"name": "!!!", "cid": 1, "IsomericSMILES": "O"}])
         with pytest.raises(ValueError):
             search_conformers(table, **self._kw(tmp_path))
+
+    @pytest.mark.parametrize(
+        "first,second",
+        [("A+B", "A B"), ("Water", "water")],
+    )
+    def test_sanitized_basename_collision_raises_before_writes(
+        self, tmp_path, first, second
+    ):
+        from pipeline.conformers import search_conformers
+
+        table = self._table([
+            {"name": first, "cid": 1, "IsomericSMILES": "O"},
+            {"name": second, "cid": 2, "IsomericSMILES": "N"},
+        ])
+        kw = self._kw(tmp_path)
+        with pytest.raises(ValueError, match="both map to output basename"):
+            search_conformers(table, **kw)
+        assert not (tmp_path / "xyz").exists()
+        assert not (tmp_path / "conformer_log.csv").exists()
+        assert not (tmp_path / "fail.csv").exists()
+
+    def test_distinct_sanitized_basenames_succeed(self, tmp_path, monkeypatch):
+        import pipeline.conformers as C
+
+        monkeypatch.setattr(C, "check_conformer_eligibility", lambda smiles: None)
+        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+        monkeypatch.setattr(
+            C,
+            "generate_conformers",
+            lambda smiles, **kw: (
+                [[("O", 0.0, 0.0, 0.0)]], [0.0], "MMFF94", [True]
+            ),
+        )
+        table = self._table([
+            {"name": "Water", "cid": 1, "IsomericSMILES": "O"},
+            {"name": "Ammonia", "cid": 2, "IsomericSMILES": "N"},
+        ])
+        out = C.search_conformers(table, **self._kw(tmp_path))
+        assert {os.path.basename(path) for path in out["xyz_path"]} == {
+            "water_c00.xyz",
+            "ammonia_c00.xyz",
+        }

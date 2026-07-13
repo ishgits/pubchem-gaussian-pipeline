@@ -468,6 +468,57 @@ def _row_xyz_present(row: dict) -> bool:
     return os.path.exists(str(path)) and os.path.getsize(str(path)) > 0
 
 
+def _integer_key(value):
+    """Normalize an integer-like CSV value; return ``None`` when invalid."""
+    if isinstance(value, bool):
+        return None
+    try:
+        if value is None or pd.isna(value):
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _resume_group_is_complete(rows: list[dict]) -> bool:
+    """
+    Validate that one molecule's resume rows form a complete conformer set.
+
+    A resumable group must contain the number of rows declared by ``n_kept``;
+    every row must agree on that positive count; conformer IDs must be the unique
+    contiguous set ``0..n_kept-1``; and XYZ paths must be unique, present, and
+    non-empty (M-12). This rejects truncated, duplicated, or manually damaged
+    logs even when each surviving row is individually valid.
+    """
+    if not rows:
+        return False
+
+    n_kept_values = [_integer_key(row.get("n_kept")) for row in rows]
+    if any(value is None or value < 1 for value in n_kept_values):
+        return False
+    if len(set(n_kept_values)) != 1:
+        return False
+    n_kept = n_kept_values[0]
+    if len(rows) != n_kept:
+        return False
+
+    conformer_ids = [_integer_key(row.get("conformer_id")) for row in rows]
+    if any(value is None or value < 0 for value in conformer_ids):
+        return False
+    if sorted(conformer_ids) != list(range(n_kept)):
+        return False
+
+    xyz_paths = []
+    for row in rows:
+        if not _row_xyz_present(row):
+            return False
+        xyz_paths.append(os.path.normcase(os.path.abspath(str(row["xyz_path"]))))
+    return len(set(xyz_paths)) == len(xyz_paths)
+
+
 def _resume_partition(
     existing, config: dict, requested: dict, preserve_unrequested: bool = False
 ):
@@ -479,10 +530,10 @@ def _resume_partition(
     matched against the requested molecule, not a run-level config.
 
     Groups rows by molecule name and, for each molecule **requested this run**,
-    keeps it only if *every* row (a) matches the run-level *config* (search knobs,
-    pipeline + RDKit version — M-09 / B-02), (b) matches the requested molecule's
-    ``cid``/``smiles`` identity, and (c) references an XYZ file that exists and is
-    non-empty.
+    keeps it only if (a) its rows form the complete, self-consistent conformer
+    group declared by ``n_kept`` (M-12), (b) every row matches the run-level
+    *config* (search knobs, pipeline + RDKit version — M-09 / B-02), and (c)
+    every row matches the requested molecule's ``cid``/``smiles`` identity.
 
     Molecules **not requested this run** are dropped from the new log by default
     (M-02 call 2a): the conformer log represents the molecules requested this run,
@@ -509,10 +560,9 @@ def _resume_partition(
             continue
         cid = requested[name].get("cid")
         smiles = requested[name].get("smiles")
-        if all(
+        if _resume_group_is_complete(rows) and all(
             _row_config_matches(r, config)
             and _row_identity_matches(r, cid, smiles)
-            and _row_xyz_present(r)
             for r in rows
         ):
             done_names.add(name)
@@ -559,12 +609,13 @@ def search_conformers(
     Resume-safe (M-09 / B-02): a molecule already in *log_csv* is skipped **only**
     when its recorded run-level config (``seed``, ``n_generate``, ``top_n``,
     ``rmsd_prune``, ``pipeline_version``, ``rdkit_version``) *and* per-molecule
-    identity (``cid``, ``smiles``) match this call and every recorded ``xyz_path``
-    still exists and is non-empty. If any differ — or the log predates those
-    provenance columns — its rows are treated as stale, dropped, and the molecule
-    is regenerated (with a warning), so downstream Gaussian inputs are never built
-    from conformers produced under a different configuration or for a different
-    (corrected) structure.
+    identity (``cid``, ``smiles``) match this call; its rows form the complete set
+    declared by ``n_kept`` with unique contiguous IDs and unique XYZ paths; and
+    every recorded ``xyz_path`` still exists and is non-empty. If any condition
+    fails — or the log predates those provenance columns — its rows are treated as
+    stale, dropped, and the molecule is regenerated (with a warning), so
+    downstream Gaussian inputs are never built from conformers produced under a
+    different configuration, for a different structure, or from a damaged log.
 
     Scope of the new log (M-02 call 2a): by default the conformer log represents
     the molecules requested **this run** — molecules present in the log but not in
@@ -586,6 +637,7 @@ def search_conformers(
     if rmsd_prune < 0:
         raise ValueError(f"rmsd_prune must be >= 0, got {rmsd_prune}.")
     seen_labels: set = set()
+    seen_basenames: dict[str, str] = {}
     for _, row in molecule_table.iterrows():
         name = row.get("name")
         if name is None:
@@ -597,11 +649,20 @@ def search_conformers(
                 f"must be unique so each molecule maps to a distinct output set."
             )
         seen_labels.add(label)
-        if sanitize_basename(label) == "":
+        basename = sanitize_basename(label)
+        if basename == "":
             raise ValueError(
                 f"Molecule label {label!r} sanitizes to an empty filename; give "
                 f"it a name with at least one alphanumeric character."
             )
+        if basename in seen_basenames:
+            previous = seen_basenames[basename]
+            raise ValueError(
+                f"Molecule labels {previous!r} and {label!r} both map to output "
+                f"basename {basename!r}. Use unique labels that remain distinct "
+                f"after filename sanitization."
+            )
+        seen_basenames[basename] = label
 
     ensure_dir(xyz_dir)
 
@@ -654,10 +715,10 @@ def search_conformers(
         )
         for name in sorted(stale_names):
             print(
-                f"WARNING: {name!r} in {log_csv} was produced with a different "
-                f"conformer-search config or pipeline version; regenerating "
-                f"(stale rows dropped) so downstream inputs are not built on "
-                f"outdated conformers."
+                f"WARNING: {name!r} in {log_csv} has stale config/identity, "
+                f"missing geometry, or an incomplete conformer group; "
+                f"regenerating (stale rows dropped) so downstream inputs are "
+                f"not built on invalid conformers."
             )
     else:
         done_names = set()
