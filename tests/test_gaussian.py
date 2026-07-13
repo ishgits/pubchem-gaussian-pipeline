@@ -4,6 +4,8 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pipeline.gaussian import (
@@ -13,6 +15,13 @@ from pipeline.gaussian import (
 )
 
 SAMPLE_XYZ = os.path.join(os.path.dirname(__file__), "sample_data", "water.xyz")
+
+
+def _write_xyz(tmpdir, contents):
+    path = os.path.join(tmpdir, "mol.xyz")
+    with open(path, "w") as f:
+        f.write(contents)
+    return path
 
 
 class TestXyzToGaussianCoords:
@@ -35,6 +44,83 @@ class TestXyzToGaussianCoords:
             float(parts[1])
             float(parts[2])
             float(parts[3])
+
+
+class TestXyzParsingByPhysicalLine:
+    """B-01: parse by physical line so an empty comment never drops an atom, and
+    a declared/actual count mismatch raises instead of silently truncating."""
+
+    def test_empty_comment_keeps_all_atoms(self):
+        # Line 2 (the comment) is legitimately empty. All 3 atoms must survive —
+        # the old blank-line filter dropped the count line + first atom here.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xyz = _write_xyz(
+                tmpdir,
+                "3\n\n"
+                "O    0.0  0.0  0.117\n"
+                "H    0.0  0.757 -0.469\n"
+                "H    0.0 -0.757 -0.469\n",
+            )
+            coords = xyz_to_gaussian_coords(xyz)
+            lines = coords.strip().split("\n")
+            assert len(lines) == 3
+            assert [ln.split()[0] for ln in lines] == ["O", "H", "H"]
+
+    def test_count_greater_than_rows_raises(self):
+        # Declares 4 atoms but only 3 coordinate rows are present.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xyz = _write_xyz(
+                tmpdir,
+                "4\nwater\n"
+                "O    0.0  0.0  0.117\n"
+                "H    0.0  0.757 -0.469\n"
+                "H    0.0 -0.757 -0.469\n",
+            )
+            with pytest.raises(ValueError):
+                xyz_to_gaussian_coords(xyz)
+
+    def test_count_less_than_rows_raises(self):
+        # Declares 2 atoms but 3 rows follow — a naive slice would silently drop
+        # the extra atom; we require an exact match and raise.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xyz = _write_xyz(
+                tmpdir,
+                "2\nwater\n"
+                "O    0.0  0.0  0.117\n"
+                "H    0.0  0.757 -0.469\n"
+                "H    0.0 -0.757 -0.469\n",
+            )
+            with pytest.raises(ValueError):
+                xyz_to_gaussian_coords(xyz)
+
+    def test_trailing_blank_line_tolerated(self):
+        # A trailing newline / blank line is normal and must not trip the count.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xyz = _write_xyz(
+                tmpdir,
+                "2\nH2\n"
+                "H  0.0 0.0 0.0\n"
+                "H  0.0 0.0 0.74\n\n",
+            )
+            coords = xyz_to_gaussian_coords(xyz)
+            assert len(coords.strip().split("\n")) == 2
+
+    def test_malformed_coordinate_row_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xyz = _write_xyz(
+                tmpdir,
+                "2\nbad\n"
+                "O    0.0  0.0  0.117\n"
+                "H    0.0  not_a_number -0.469\n",
+            )
+            with pytest.raises(ValueError):
+                xyz_to_gaussian_coords(xyz)
+
+    def test_noninteger_count_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xyz = _write_xyz(tmpdir, "notanumber\ncomment\nO 0 0 0\n")
+            with pytest.raises(ValueError):
+                xyz_to_gaussian_coords(xyz)
 
 
 class TestWriteGaussianCom:

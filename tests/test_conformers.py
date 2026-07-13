@@ -18,6 +18,8 @@ from pipeline.conformers import (
     _finalize_convergence,
     _resume_partition,
     _row_config_matches,
+    _row_identity_matches,
+    _row_xyz_present,
     check_conformer_eligibility,
     select_converged_top_n,
     select_top_n,
@@ -596,7 +598,7 @@ class TestProvenanceLogging:
 # ---------------------------------------------------------------------------
 
 _CFG = {"seed": 42, "n_generate": 20, "top_n": 3, "rmsd_prune": 0.5,
-        "pipeline_version": "0.2.0"}
+        "pipeline_version": "0.2.0", "rdkit_version": "2024.03.1"}
 
 
 class TestRowConfigMatches:
@@ -622,6 +624,10 @@ class TestRowConfigMatches:
     def test_pipeline_version_mismatch(self):
         assert _row_config_matches(self._row(pipeline_version="0.1.0"), _CFG) is False
 
+    def test_rdkit_version_mismatch(self):
+        # B-02: ETKDGv3+MMFF geometry is RDKit-version-dependent.
+        assert _row_config_matches(self._row(rdkit_version="2020.09.1"), _CFG) is False
+
     def test_rmsd_within_float_tolerance(self):
         assert _row_config_matches(self._row(rmsd_prune=0.5 + 1e-12), _CFG) is True
 
@@ -633,37 +639,112 @@ class TestRowConfigMatches:
         del row["top_n"]  # pre-provenance / older-schema log
         assert _row_config_matches(row, _CFG) is False
 
+    def test_missing_rdkit_version_is_mismatch(self):
+        row = self._row()
+        del row["rdkit_version"]  # log predates the rdkit_version guard
+        assert _row_config_matches(row, _CFG) is False
+
+
+class TestRowIdentityAndXyz:
+    """Pure per-molecule identity + XYZ-existence predicates (B-02, no RDKit)."""
+
+    def test_cid_matches_across_int_and_float_string(self):
+        assert _row_identity_matches({"cid": 190, "smiles": "O"}, 190.0, "O") is True
+        assert _row_identity_matches({"cid": "190", "smiles": "O"}, 190, "O") is True
+
+    def test_changed_cid_mismatch(self):
+        assert _row_identity_matches({"cid": 190, "smiles": "O"}, 191, "O") is False
+
+    def test_changed_smiles_mismatch(self):
+        assert _row_identity_matches({"cid": 190, "smiles": "O"}, 190, "[OH2]") is False
+
+    def test_xyz_present_true_for_nonempty(self, tmp_path):
+        p = tmp_path / "a.xyz"
+        p.write_text("3\n\nO 0 0 0\n")
+        assert _row_xyz_present({"xyz_path": str(p)}) is True
+
+    def test_xyz_present_false_for_missing(self, tmp_path):
+        assert _row_xyz_present({"xyz_path": str(tmp_path / "nope.xyz")}) is False
+
+    def test_xyz_present_false_for_empty(self, tmp_path):
+        p = tmp_path / "empty.xyz"
+        p.write_text("")
+        assert _row_xyz_present({"xyz_path": str(p)}) is False
+
 
 class TestResumePartition:
     """Pure partition of an existing log into done / kept / stale (no RDKit)."""
 
-    def test_partition(self):
+    def _rows_with_xyz(self, tmp_path, *specs):
+        """Build rows with a real, non-empty xyz_path per spec (name, **override)."""
         import pandas as pd
 
-        rows = [
-            dict(_CFG, name="A", conformer_id=0),           # requested, matches
-            dict(_CFG, name="B", conformer_id=0, seed=7),   # requested, drift
-            dict(_CFG, name="C", conformer_id=0),           # NOT requested
-        ]
-        existing = pd.DataFrame(rows)
+        rows = []
+        for i, (name, override) in enumerate(specs):
+            xyz = tmp_path / f"{name}_{i}.xyz"
+            xyz.write_text("1\n\nO 0 0 0\n")
+            row = dict(_CFG, name=name, cid=1, smiles="O",
+                       conformer_id=0, xyz_path=str(xyz))
+            row.update(override)
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    def _requested(self, *names):
+        return {n: {"cid": 1, "smiles": "O"} for n in names}
+
+    def test_partition_default_drops_unrequested(self, tmp_path):
+        existing = self._rows_with_xyz(
+            tmp_path,
+            ("A", {}),            # requested, matches
+            ("B", {"seed": 7}),   # requested, config drift
+            ("C", {}),            # NOT requested
+        )
         done, kept, stale = _resume_partition(
-            existing, _CFG, requested_names={"A", "B"}
+            existing, _CFG, self._requested("A", "B")
         )
         assert done == {"A"}
         assert stale == {"B"}
-        # A (resumed) and C (untouched) are kept; B's stale rows are dropped.
+        # M-02 default: unrequested C is dropped; only resumed A is kept.
+        assert {r["name"] for r in kept} == {"A"}
+
+    def test_preserve_unrequested_keeps_carry_forward(self, tmp_path):
+        existing = self._rows_with_xyz(
+            tmp_path, ("A", {}), ("C", {}),
+        )
+        done, kept, stale = _resume_partition(
+            existing, _CFG, self._requested("A"), preserve_unrequested=True
+        )
+        assert done == {"A"}
+        # append=True: unrequested C carried forward alongside resumed A.
         assert {r["name"] for r in kept} == {"A", "C"}
 
-    def test_all_rows_of_a_molecule_must_match(self):
+    def test_changed_identity_is_stale(self, tmp_path):
+        # Same name A, but recorded cid differs from requested → stale.
+        existing = self._rows_with_xyz(tmp_path, ("A", {"cid": 999}))
+        done, kept, stale = _resume_partition(
+            existing, _CFG, self._requested("A")
+        )
+        assert done == set()
+        assert stale == {"A"}
+
+    def test_missing_xyz_is_stale(self, tmp_path):
         import pandas as pd
 
-        # Two rows for A: one matches, one drifted → A is stale (regenerate all).
-        rows = [
-            dict(_CFG, name="A", conformer_id=0),
-            dict(_CFG, name="A", conformer_id=1, top_n=1),
-        ]
+        row = dict(_CFG, name="A", cid=1, smiles="O",
+                   conformer_id=0, xyz_path=str(tmp_path / "gone.xyz"))
         done, kept, stale = _resume_partition(
-            pd.DataFrame(rows), _CFG, requested_names={"A"}
+            pd.DataFrame([row]), _CFG, self._requested("A")
+        )
+        assert stale == {"A"}
+        assert done == set()
+
+    def test_all_rows_of_a_molecule_must_match(self, tmp_path):
+        # Two rows for A: one matches, one drifted → A is stale (regenerate all).
+        existing = self._rows_with_xyz(
+            tmp_path, ("A", {}), ("A", {"top_n": 1}),
+        )
+        done, kept, stale = _resume_partition(
+            existing, _CFG, self._requested("A")
         )
         assert done == set()
         assert stale == {"A"}
@@ -673,11 +754,11 @@ class TestResumePartition:
 class TestResumeConfigValidationBatch:
     """search_conformers end-to-end with RDKit stubbed (synthetic/offline)."""
 
-    def _patch(self, monkeypatch, calls):
+    def _patch(self, monkeypatch, calls, rdkit_version="test-rdkit"):
         import pipeline.conformers as C
 
         monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
-        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+        monkeypatch.setattr(C, "_rdkit_version", lambda: rdkit_version)
 
         def gen(smiles, **kw):
             calls.append(smiles)
@@ -686,10 +767,10 @@ class TestResumeConfigValidationBatch:
         monkeypatch.setattr(C, "generate_conformers", gen)
         return C
 
-    def _table(self, name="Water", smiles="O"):
+    def _table(self, name="Water", smiles="O", cid=1):
         import pandas as pd
 
-        return pd.DataFrame([{"name": name, "cid": 1, "IsomericSMILES": smiles}])
+        return pd.DataFrame([{"name": name, "cid": cid, "IsomericSMILES": smiles}])
 
     def _kw(self, tmp_path, **over):
         kw = dict(
@@ -724,6 +805,41 @@ class TestResumeConfigValidationBatch:
         C.search_conformers(self._table(), **self._kw(tmp_path, top_n=3))
         assert len(calls) == 2  # the TOP_N=1→3 case from the finding
 
+    def test_changed_cid_regenerates(self, tmp_path, monkeypatch):
+        # B-02: same name + knobs but a corrected CID must NOT reuse the geometry.
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        C.search_conformers(self._table(cid=1), **self._kw(tmp_path))
+        log2 = C.search_conformers(self._table(cid=2), **self._kw(tmp_path))
+        assert len(calls) == 2
+        assert set(log2[log2["name"] == "Water"]["cid"].astype(int)) == {2}
+
+    def test_changed_smiles_regenerates(self, tmp_path, monkeypatch):
+        # B-02: same name + knobs but a corrected SMILES must regenerate.
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        C.search_conformers(self._table(smiles="O"), **self._kw(tmp_path))
+        C.search_conformers(self._table(smiles="[OH2]"), **self._kw(tmp_path))
+        assert len(calls) == 2
+
+    def test_changed_rdkit_version_regenerates(self, tmp_path, monkeypatch):
+        # B-02: a different RDKit build changes ETKDGv3+MMFF geometry → regenerate.
+        calls = []
+        C = self._patch(monkeypatch, calls, rdkit_version="2024.03.1")
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        C = self._patch(monkeypatch, calls, rdkit_version="2020.09.1")
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        assert len(calls) == 2
+
+    def test_deleted_xyz_regenerates(self, tmp_path, monkeypatch):
+        # B-02: identity + config match, but the recorded XYZ is gone → regenerate.
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        log1 = C.search_conformers(self._table(), **self._kw(tmp_path))
+        os.remove(log1.iloc[0]["xyz_path"])  # user cleaned the geometry away
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        assert len(calls) == 2
+
     def test_pre_provenance_log_regenerates(self, tmp_path, monkeypatch):
         import pandas as pd
 
@@ -738,18 +854,111 @@ class TestResumeConfigValidationBatch:
         C.search_conformers(self._table(), **self._kw(tmp_path))
         assert len(calls) == 1  # name present but stale → regenerated
 
-    def test_molecule_not_in_table_is_preserved(self, tmp_path, monkeypatch):
-        calls = []
-        C = self._patch(monkeypatch, calls)
+
+class TestPreserveUnrequestedBatch:
+    """M-02 call 2a: the conformer log represents molecules requested this run."""
+
+    def _patch(self, monkeypatch, calls):
+        import pipeline.conformers as C
+
+        monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
+        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+
+        def gen(smiles, **kw):
+            calls.append(smiles)
+            return ([[("O", 0.0, 0.0, 0.0)]], [0.0], "MMFF94", [True])
+
+        monkeypatch.setattr(C, "generate_conformers", gen)
+        return C
+
+    def _kw(self, tmp_path, **over):
+        kw = dict(
+            xyz_dir=str(tmp_path / "xyz"),
+            log_csv=str(tmp_path / "conformer_log.csv"),
+            failed_csv=str(tmp_path / "fail.csv"),
+            seed=42, n_generate=20, top_n=3, rmsd_prune=0.5,
+        )
+        kw.update(over)
+        return kw
+
+    def _two(self):
         import pandas as pd
 
-        two = pd.DataFrame([
-            {"name": "A", "cid": 1, "IsomericSMILES": "O"},
-            {"name": "B", "cid": 2, "IsomericSMILES": "O"},
+        return pd.DataFrame([
+            {"name": "Water", "cid": 1, "IsomericSMILES": "O"},
+            {"name": "Glycine", "cid": 2, "IsomericSMILES": "O"},
         ])
-        C.search_conformers(two, **self._kw(tmp_path, seed=42))
-        # Rerun with only A under a new seed: A regenerates, B is left untouched.
-        log2 = C.search_conformers(self._table(name="A"), **self._kw(tmp_path, seed=99))
-        assert "B" in set(log2["name"])
-        assert set(log2[log2["name"] == "A"]["seed"].astype(int)) == {99}
-        assert set(log2[log2["name"] == "B"]["seed"].astype(int)) == {42}
+
+    def _one(self):
+        import pandas as pd
+
+        return pd.DataFrame([{"name": "Adenine", "cid": 3, "IsomericSMILES": "O"}])
+
+    def test_default_drops_unrequested(self, tmp_path, monkeypatch):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        C.search_conformers(self._two(), **self._kw(tmp_path))
+        log2 = C.search_conformers(self._one(), **self._kw(tmp_path))
+        # Default: only the molecule requested this run remains in the log.
+        assert set(log2["name"]) == {"Adenine"}
+
+    def test_append_retains_all(self, tmp_path, monkeypatch):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        C.search_conformers(self._two(), **self._kw(tmp_path))
+        log2 = C.search_conformers(self._one(), **self._kw(tmp_path, append=True))
+        # append=True: prior molecules carried forward alongside the new one.
+        assert set(log2["name"]) == {"Water", "Glycine", "Adenine"}
+
+
+class TestParameterValidation:
+    """MIN-03: invalid parameters raise ValueError at entry."""
+
+    def _table(self, rows=None):
+        import pandas as pd
+
+        return pd.DataFrame(rows or [{"name": "Water", "cid": 1, "IsomericSMILES": "O"}])
+
+    def _kw(self, tmp_path, **over):
+        kw = dict(
+            xyz_dir=str(tmp_path / "xyz"),
+            log_csv=str(tmp_path / "conformer_log.csv"),
+            failed_csv=str(tmp_path / "fail.csv"),
+        )
+        kw.update(over)
+        return kw
+
+    def test_n_generate_below_one_raises(self, tmp_path):
+        from pipeline.conformers import search_conformers
+
+        with pytest.raises(ValueError):
+            search_conformers(self._table(), **self._kw(tmp_path, n_generate=0))
+
+    def test_top_n_below_one_raises(self, tmp_path):
+        from pipeline.conformers import search_conformers
+
+        with pytest.raises(ValueError):
+            search_conformers(self._table(), **self._kw(tmp_path, top_n=0))
+
+    def test_negative_rmsd_prune_raises(self, tmp_path):
+        from pipeline.conformers import search_conformers
+
+        with pytest.raises(ValueError):
+            search_conformers(self._table(), **self._kw(tmp_path, rmsd_prune=-0.1))
+
+    def test_duplicate_labels_raise(self, tmp_path):
+        from pipeline.conformers import search_conformers
+
+        table = self._table([
+            {"name": "Water", "cid": 1, "IsomericSMILES": "O"},
+            {"name": "Water", "cid": 2, "IsomericSMILES": "O"},
+        ])
+        with pytest.raises(ValueError):
+            search_conformers(table, **self._kw(tmp_path))
+
+    def test_empty_sanitized_label_raises(self, tmp_path):
+        from pipeline.conformers import search_conformers
+
+        table = self._table([{"name": "!!!", "cid": 1, "IsomericSMILES": "O"}])
+        with pytest.raises(ValueError):
+            search_conformers(table, **self._kw(tmp_path))

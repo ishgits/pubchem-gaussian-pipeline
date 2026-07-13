@@ -28,18 +28,64 @@ def xyz_to_gaussian_coords(xyz_path: str) -> str:
         <comment line>
         Element  x  y  z
         ...
+
+    Parsing is by **physical line**, never by "non-blank line" (B-01): line 1 is
+    the atom count ``N``, line 2 is the comment (which may legitimately be empty),
+    and the next ``N`` lines are coordinates. Filtering blank lines first would
+    drop an empty comment line and silently shift the atom count / first atom out
+    of the geometry — corrupting the molecule sent to Gaussian. Any count mismatch
+    or malformed coordinate row raises ``ValueError`` rather than dropping atoms.
     """
     with open(xyz_path, "r") as f:
-        lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+        raw_lines = f.read().splitlines()
 
-    body = lines[2:]  # skip atom count + comment
+    if len(raw_lines) < 2:
+        raise ValueError(
+            f"XYZ file {xyz_path!r} is too short: expected an atom-count line, a "
+            f"comment line, then coordinates (got {len(raw_lines)} line(s))."
+        )
+
+    count_str = raw_lines[0].strip()
+    try:
+        n_atoms = int(count_str)
+    except ValueError:
+        raise ValueError(
+            f"XYZ file {xyz_path!r} line 1 is not an integer atom count: "
+            f"{count_str!r}."
+        )
+    if n_atoms < 1:
+        raise ValueError(
+            f"XYZ file {xyz_path!r} declares a non-positive atom count: {n_atoms}."
+        )
+
+    # Line 2 is the comment (may be empty); everything after it is coordinates.
+    # Only purely-trailing blank lines are tolerated (a trailing newline is
+    # normal); any other count mismatch raises rather than dropping/padding atoms.
+    coord_lines = raw_lines[2:]
+    while coord_lines and coord_lines[-1].strip() == "":
+        coord_lines.pop()
+    if len(coord_lines) != n_atoms:
+        raise ValueError(
+            f"XYZ file {xyz_path!r} declares {n_atoms} atom(s) but {len(coord_lines)} "
+            f"coordinate row(s) are present (declared count ≠ actual rows)."
+        )
+
     out_lines = []
-    for ln in body:
+    for i, ln in enumerate(coord_lines, 1):
         parts = ln.split()
         if len(parts) < 4:
-            continue
+            raise ValueError(
+                f"XYZ file {xyz_path!r} coordinate row {i} is malformed "
+                f"(need 'Element x y z'): {ln!r}."
+            )
         sym = parts[0]
-        x, y, z = map(float, parts[1:4])
+        try:
+            x, y, z = map(float, parts[1:4])
+        except ValueError:
+            raise ValueError(
+                f"XYZ file {xyz_path!r} coordinate row {i} has non-numeric "
+                f"coordinates: {ln!r}."
+            )
         out_lines.append(f"{sym:<2} {x:>16.8f} {y:>12.8f} {z:>12.8f}")
     return "\n".join(out_lines)
 

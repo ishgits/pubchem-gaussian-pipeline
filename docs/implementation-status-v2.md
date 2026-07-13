@@ -11,6 +11,39 @@ This is the **working** status file. It is synced into the canonical
 round; `scripts/check_invariants.py` fails if the canonical file drifts back to
 the template.
 
+## 0a. Round-04 remediation (PR #3 v2-release review — 12 + 3 findings)
+
+Implements `docs/remediation-plan-round-04-v2.md` in three commits. **Resolved
+only after the listed verify step passed**, not on code change alone.
+
+### Commit 1 — correctness hardening (B-01, B-02, B-03, M-01, M-02, M-03, MIN-03)
+
+Verified with `pytest tests/ -q` → **142 passed** and
+`python scripts/check_invariants.py` → passed (rdkit 2025.09.3, offline).
+
+| ID | What changed | Verify (tests) |
+|----|--------------|----------------|
+| B-01 | `xyz_to_gaussian_coords` parses by **physical line** (L1 = count `N`, L2 = comment which may be empty, next `N` = coords); count mismatch or malformed row raises `ValueError` instead of silently dropping atoms. Only trailing blank lines tolerated. | `tests/test_gaussian.py::TestXyzParsingByPhysicalLine` (empty comment keeps all atoms; count≠rows both directions raise; malformed/non-integer raise; trailing blank tolerated) |
+| B-02 | Resume now invalidates on per-molecule **`cid`/`smiles`** identity (matched against the requested molecule) and run-level **`rdkit_version`**, and requires each recorded `xyz_path` to exist and be non-empty. `pipeline_commit`-in-key / row-count reconcile / duplicate-label keying explicitly deferred (call 1b). | `tests/test_conformers.py::TestRowIdentityAndXyz`, `::TestRowConfigMatches::test_rdkit_version_mismatch`, `::TestResumePartition`, `::TestResumeConfigValidationBatch` (changed cid/smiles/rdkit/deleted-xyz each regenerate; unchanged skips) |
+| B-03 | SLURM template resolves the `.com` **relative to the script's own location** (`os.path.relpath(com_path, slurm_dir)`), `cd`s into the input's directory and runs `g16` on the basename — submission is directory-independent, custom dir names preserved (no hardcoded `../gaussian_inputs`). | `tests/test_slurm.py::TestSlurmScriptResolvesInput` |
+| M-01 | `write_slurm_scripts` **defaults** to consuming the current run's `com_write_log.csv`; `com_dir` glob kept as an explicit non-default mode; notebook default switched. | `tests/test_slurm.py::TestWriteSlurmScriptsLogDriven` (3 logged + 1 stale `.com` → 3 scripts; legacy glob still reachable) |
+| M-02 | `_resume_partition` gains `preserve_unrequested: bool = False` (default drops unrequested molecules from the new log); `search_conformers(append=True)` retains carry-forward (call 2a). | `tests/test_conformers.py::TestPreserveUnrequestedBatch`, `::TestResumePartition::test_*_unrequested` |
+| M-03 | `write_slurm_scripts` **overwrites** `.sh` by default (dropped `SKIPPED_EXISTS`); status column reports `WROTE`/`OVERWROTE` (call 4a). | `tests/test_slurm.py::TestWriteSlurmScriptsOverwrite` |
+| MIN-03 | `search_conformers` validates at entry: `n_generate<1`, `top_n<1`, `rmsd_prune<0`, duplicate molecule labels, empty sanitized filename → `ValueError`. | `tests/test_conformers.py::TestParameterValidation` |
+
+No scientific invariant (§2) changed: route lines, charge/mult, units, and the
+Link1 opt→freq contract are untouched. B-01/B-02 make previously-silent geometry
+corruption/reuse loud (`ValueError` / regeneration), strengthening the
+reproducibility and "no silent corruption" invariants rather than altering them.
+
+### Commit 2 — repository cleanup (B-04, MIN-02)
+
+_Pending — recorded on landing._
+
+### Commit 3 — docs + versioning (MOD-01..MOD-04, MIN-01; MOD-05 PR body)
+
+_Pending — recorded on landing._
+
 ## 0c. Round-03 remediation (Codex findings M-06, M-07)
 
 Both findings from `docs/remediation-plan-round-03-v2.md` are addressed as
