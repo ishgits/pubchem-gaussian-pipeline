@@ -3,8 +3,13 @@
 Maintained by the implementing agent (Claude Code). The reviewer (Codex) must
 verify these claims against the code, not trust them.
 
-**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 1 (+ round-01 & round-02 remediation)
+**PR:** #3   **Branch:** `feat/conformer-search-v2`   **Round:** 1 (+ round-01, 02 & 03 remediation)
 Works against `docs/architecture-v2.md` and `docs/implementation-plan-v2.md`.
+
+This is the **working** status file. It is synced into the canonical
+`docs/implementation-status.md` (the AGENTS.md §5 merge gate) each remediation
+round; `scripts/check_invariants.py` fails if the canonical file drifts back to
+the template.
 
 ## 0b. Round-02 remediation (Codex findings M-03, M-04)
 
@@ -99,9 +104,18 @@ code change alone.
   caveat; states the three retained limitations honestly. (Plan Task 7.)
 - **Tests** — `tests/test_conformers.py` (new) and conformer cases added to
   `tests/test_gaussian.py`. See §4.
+- **Round-03 (M-06)** — `pipeline.__version__ = "0.2.0"`; a `pipeline_provenance`
+  helper (`utils.py`) returns `(version, best-effort git commit)`, offline-safe
+  (`""` when git is absent, `.dirty` on an uncommitted tree). `search_conformers`
+  records `pipeline_version` + `pipeline_commit` on every `conformer_log.csv` row
+  and appends `pver=`/`pcommit=` to each XYZ comment line. Conformer path only.
+- **Round-03 (M-07)** — canonical `docs/implementation-status.md` is populated
+  and synced from this file; `scripts/check_invariants.py` gained a drift guard
+  that fails when the canonical file still contains template markers; `WORKFLOW.md`
+  records the sync step.
 
-Required checks locally green after round-02 remediation (incl. M-05):
-`pytest tests/ -q` → **81 passed**; `python scripts/check_invariants.py` →
+Required checks locally green after round-03 remediation (incl. M-06/M-07):
+`pytest tests/ -q` → **91 passed**; `python scripts/check_invariants.py` →
 **passed**.
 
 ## 2. What was NOT implemented (and why)
@@ -157,6 +171,21 @@ Required checks locally green after round-02 remediation (incl. M-05):
   FF geometry (not fabricated), explicitly marked `converged=False` in the log,
   warned at runtime, and tagged `UNCONVERGED_FF_SEED` in the `.com` title. The DFT
   optimization is expected to refine it; the FF energy is labeled unreliable.
+
+### Round-03 remediation deviations
+
+- **M-06 — additive provenance columns + extended XYZ comment format.**
+  `conformer_log.csv` gains `pipeline_version` and `pipeline_commit`; each
+  per-conformer XYZ comment line gains `pver=<version> pcommit=<commit>` tokens.
+  Both are additive: existing columns, ordering, ΔE values, and the top-3
+  selection are unchanged versus round 02. Log/geometry-comment only — no route
+  line, unit, charge/multiplicity, or Link1 edit.
+- **M-06 — reproducibility caveat.** `pipeline_commit` pins code identity **only
+  when the tree is clean**. A `.dirty` suffix means uncommitted edits produced the
+  output, so that output is *not* fully reproducible from the commit alone — the
+  flag makes this visible rather than hiding it. An empty `pipeline_commit`
+  (no git) falls back to `pipeline_version`, which is only as precise as manual
+  bumping. A recorded commit is therefore **not** a guarantee of exact code.
 
 ### Round-01 remediation deviations
 
@@ -235,6 +264,20 @@ energies are labeled kcal/mol at every surface (CSV column name, XYZ comment,
     `"SMILES"`, no legacy key) earns the stereo bonus, and a chiral higher-CID
     candidate outscores a lower-CID achiral one; both fail under the old dead-key
     read. **(M-03)**
+- `tests/test_conformers.py` (continued)
+  - `TestProvenanceLogging::*` — `conformer_log.csv` has `pipeline_version` ==
+    `pipeline.__version__` on every row, `pipeline_commit` present and a `str`
+    (never a concrete SHA asserted), and the XYZ comment carries `pver=`/`pcommit=`
+    tokens. **(M-06)**
+- `tests/test_utils.py` **(M-06)**
+  - `TestGitShortSha::*` — `""` when git is absent / non-zero / times out; the SHA
+    on a clean tree; SHA + `.dirty` on a mocked dirty tree. Offline (subprocess
+    mocked); no concrete SHA asserted.
+  - `TestPipelineProvenance::*` — returns `(pipeline.__version__, commit)` and
+    falls back to `""` commit when git fails.
+- `tests/test_check_invariants.py` **(M-07)**
+  - `TestStatusDocDriftGuard::*` — the guard fires on a template file (angle-bracket
+    placeholders + empty bullets) and passes on a populated one.
 - `tests/test_gaussian.py`
   - `TestWriteGaussianComConformer::*` — conformer filename/chk (`ribose_c00_F`),
     ΔE in title (`dE=1.2345 kcal/mol`), Link1 preserved, and `conformer_id=None`
@@ -254,6 +297,9 @@ still runs the pure tests; CI installs rdkit so they execute there.
 - Fixed `N_GENERATE=20` may under-sample very flexible molecules.
 - These are FF starting geometries, not optimized minima — DFT makes the final
   call among carried candidates.
+- `pipeline_commit` reproducibility (M-06): a recorded commit pins code only when
+  clean; `.dirty` means not reproducible from the commit alone; empty means the
+  fallback to the manually bumped `pipeline_version`. See §3 round-03 deviations.
 
 ## 6. Questions requiring scientific judgment  ← Ish reads this FIRST
 
@@ -284,8 +330,10 @@ still runs the pure tests; CI installs rdkit so they execute there.
 
 ## Provenance
 
-- pipeline version: v2.0 (branch `feat/conformer-search-v2`; base v1.1,
-  Zenodo 10.5281/zenodo.18894724).
+- pipeline version: `pipeline.__version__ = "0.2.0"` (M-06), recorded per-row in
+  `conformer_log.csv` `pipeline_version`, with a best-effort git short SHA in
+  `pipeline_commit` (`.dirty` on an uncommitted tree, `""` when git is absent).
+  Branch `feat/conformer-search-v2`; base v1.1, Zenodo 10.5281/zenodo.18894724.
 - RDKit version used for local test run: 2025.09.3 (recorded per-row in
   `conformer_log.csv` `rdkit_version` at runtime).
 - Conformer stage config: `N_GENERATE=20`, `TOP_N=3`, `RMSD_PRUNE=0.5 Å`,

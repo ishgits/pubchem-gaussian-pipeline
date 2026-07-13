@@ -40,9 +40,16 @@ Code     push → CI floor reruns → Codex diff-based re-review (round NN+1)
   required checks, definition of done, Codex review guidelines.
 - `CLAUDE.md` — thin pointer + Claude-Code implementer role.
 - `docs/architecture.md` / `implementation-plan.md` — the two gate-1 artifacts.
-- `docs/implementation-status.md` — implementer's self-report (reviewer verifies,
-  never trusts). §6 "questions requiring scientific judgment" is what Ish reads
-  first.
+- `docs/implementation-status.md` — implementer's self-report and the AGENTS.md
+  §5 **merge gate** (reviewer verifies, never trusts). §6 "questions requiring
+  scientific judgment" is what Ish reads first. **Each remediation round, sync it
+  from the working file `docs/implementation-status-v2.md`** so the canonical gate
+  never goes stale — `scripts/check_invariants.py` fails the floor if this file
+  still holds template placeholders.
+- `docs/implementation-status-v2.md` — the working status file for the v2
+  conformer track; carries the per-round evidence tables (commit + verification).
+  Sync its content into `docs/implementation-status.md` before opening/updating
+  the PR.
 - `reviews/*-template.md` — the review and remediation artifact formats.
 - `prompts/*.md` — the versioned brief each agent gets, so handoffs are identical
   every time (kills "no universal handoff format" + "context trapped in chats").

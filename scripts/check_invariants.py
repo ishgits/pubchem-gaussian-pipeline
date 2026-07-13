@@ -19,6 +19,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PIPELINE = ROOT / "pipeline"
+STATUS_DOC = ROOT / "docs" / "implementation-status.md"
 
 # 1) Placeholder science: real API results / coordinates / energies must never
 #    be replaced by hardcoded, illustrative, random, or mocked values in a
@@ -74,8 +75,38 @@ def check_route_constants() -> list[str]:
     return problems
 
 
+# 3) Canonical status-doc drift guard (M-07). AGENTS.md §5 names
+#    docs/implementation-status.md as the merge gate. It must never sit as the
+#    empty template while the real status lives in implementation-status-v2.md, so
+#    reviewers/maintainers following the mandated gate can't miss v2 deviations.
+#    This turns "canonical went stale" from a reviewer catch into a floor failure.
+def _status_doc_problems(text: str) -> list[str]:
+    """Return template-marker problems in a status-doc string (pure, testable)."""
+    problems = []
+    # Angle-bracket template placeholders: <n>, <name>, <none | ...>, <>, <e.g...>.
+    # The populated status doc must contain no bare angle-bracket tokens.
+    for m in re.finditer(r"<[^>\n]*>", text):
+        problems.append(f"template placeholder {m.group(0)!r}")
+    # Empty bullets: a list line that is just "-" / "- " with nothing after it.
+    for i, line in enumerate(text.splitlines(), 1):
+        if re.match(r"^\s*-\s*$", line):
+            problems.append(f"empty bullet at line {i}")
+    return problems
+
+
+def check_status_doc() -> list[str]:
+    if not STATUS_DOC.exists():
+        return [f"[status-doc] {STATUS_DOC.name} is missing"]
+    text = STATUS_DOC.read_text(encoding="utf-8", errors="replace")
+    return [
+        f"[status-doc] docs/implementation-status.md still has {p} "
+        f"(sync it from implementation-status-v2.md — AGENTS.md §5 gate)"
+        for p in _status_doc_problems(text)
+    ]
+
+
 def main() -> int:
-    problems = check_placeholders() + check_route_constants()
+    problems = check_placeholders() + check_route_constants() + check_status_doc()
     if problems:
         print("SCIENTIFIC INVARIANT CHECK FAILED:\n")
         for p in problems:
