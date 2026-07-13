@@ -11,6 +11,26 @@ This is the **working** status file. It is synced into the canonical
 round; `scripts/check_invariants.py` fails if the canonical file drifts back to
 the template.
 
+## 0c. Round-03 remediation (Codex findings M-06, M-07)
+
+Both findings from `docs/remediation-plan-round-03-v2.md` are addressed as
+separate commits. **Resolved only after the listed verify step passed** — not on
+code change alone.
+
+| ID | Commit | Verification run | Result |
+|----|--------|------------------|--------|
+| M-06 | `83cc915` | `pytest tests/ -q` → 91 passed (incl. `TestProvenanceLogging`, `TestGitShortSha`, `TestPipelineProvenance`); `check_invariants.py` → passed; offline ribose run — `pipeline_version=0.2.0` + `pipeline_commit` on every `conformer_log.csv` row, XYZ header carries `pver=/pcommit=`, no-git branch → `""` | **Resolved** |
+| M-07 | `b98581f` | canonical `implementation-status.md` populated (grep: no `<` placeholders, no empty bullets); drift guard fails on the template (12 violations) / passes on the populated file; `pytest tests/ -q` → 95 passed (incl. `TestStatusDocDriftGuard`); `check_invariants.py` → passed | **Resolved** |
+
+- **M-06** — `pipeline.__version__ = "0.2.0"` + a best-effort, offline-safe
+  `pipeline_provenance` helper; `conformer_log.csv` gains `pipeline_version` and
+  `pipeline_commit` columns and each XYZ comment gains `pver=`/`pcommit=` tokens.
+  Conformer path only (com/sdf logs out of scope). Additive; ΔE and top-3
+  selection unchanged. Reproducibility caveat recorded in §3/§5.
+- **M-07** — canonical `docs/implementation-status.md` populated and synced from
+  this file; `scripts/check_invariants.py` drift guard makes canonical staleness
+  an objective floor failure; `WORKFLOW.md` records the sync step.
+
 ## 0b. Round-02 remediation (Codex findings M-03, M-04)
 
 Both findings from `docs/remediation-plan-round-02-v2.md` are addressed as
