@@ -242,22 +242,26 @@ class TestSearchConformers:
         assert all(name.startswith("adenine") for name in written)
         assert not any("undefsugar" in f for f in os.listdir(xyz_dir))
 
-    def test_resume_skips_completed(self, tmp_path):
+    def test_resume_skips_completed(self, tmp_path, monkeypatch):
         pytest.importorskip("rdkit")
-        from pipeline.conformers import search_conformers
+        import pipeline.conformers as C
+
+        monkeypatch.setattr(
+            C, "pipeline_provenance", lambda: ("2.0.0", "test-clean-commit")
+        )
 
         log_csv = tmp_path / "conformer_log.csv"
         xyz_dir = tmp_path / "conf_xyz"
         table = self._table()
 
-        first = search_conformers(
+        first = C.search_conformers(
             table,
             xyz_dir=str(xyz_dir),
             log_csv=str(log_csv),
             failed_csv=str(tmp_path / "fail.csv"),
         )
         # Rerun with the same table: nothing new appended (both already done).
-        second = search_conformers(
+        second = C.search_conformers(
             table,
             xyz_dir=str(xyz_dir),
             log_csv=str(log_csv),
@@ -594,6 +598,7 @@ class TestProvenanceLogging:
             comment = f.read().splitlines()[1]  # line 2 of an XYZ file is the comment
         assert "pver=" in comment
         assert "pcommit=" in comment
+        assert "rdkit=test-rdkit" in comment
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +606,8 @@ class TestProvenanceLogging:
 # ---------------------------------------------------------------------------
 
 _CFG = {"seed": 42, "n_generate": 20, "top_n": 3, "rmsd_prune": 0.5,
-        "pipeline_version": "0.2.0", "rdkit_version": "2024.03.1"}
+        "pipeline_version": "0.2.0", "pipeline_commit": "abc1234",
+        "rdkit_version": "2024.03.1"}
 
 
 class TestRowConfigMatches:
@@ -630,6 +636,30 @@ class TestRowConfigMatches:
     def test_rdkit_version_mismatch(self):
         # B-02: ETKDGv3+MMFF geometry is RDKit-version-dependent.
         assert _row_config_matches(self._row(rdkit_version="2020.09.1"), _CFG) is False
+
+    def test_clean_pipeline_commit_mismatch(self):
+        assert _row_config_matches(
+            self._row(pipeline_commit="def5678"), _CFG
+        ) is False
+
+    def test_missing_pipeline_commit_uses_version_fallback(self):
+        row = self._row()
+        del row["pipeline_commit"]
+        assert _row_config_matches(row, _CFG) is True
+
+    @pytest.mark.parametrize(
+        ("row_commit", "config_commit"),
+        [
+            ("abc1234.dirty", "abc1234"),
+            ("abc1234", "abc1234.dirty"),
+            ("abc1234.dirty", ""),
+            ("", "abc1234.dirty"),
+        ],
+    )
+    def test_dirty_pipeline_commit_never_reuses(self, row_commit, config_commit):
+        row = self._row(pipeline_commit=row_commit)
+        config = dict(_CFG, pipeline_commit=config_commit)
+        assert _row_config_matches(row, config) is False
 
     def test_rmsd_within_float_tolerance(self):
         assert _row_config_matches(self._row(rmsd_prune=0.5 + 1e-12), _CFG) is True
@@ -866,15 +896,31 @@ class TestCarryForwardGroupValidation:
             row["pipeline_commit"] = ""
         assert _carry_forward_group_is_valid(rows, _CFG) is True
 
+    def test_dirty_commit_group_is_not_reusable(self, tmp_path):
+        rows = self._rows(tmp_path)
+        config = dict(_CFG, pipeline_commit="abc1234.dirty")
+        for row in rows:
+            row["pipeline_commit"] = "abc1234.dirty"
+        assert _carry_forward_group_is_valid(rows, config) is False
+
 
 class TestResumeConfigValidationBatch:
     """search_conformers end-to-end with RDKit stubbed (synthetic/offline)."""
 
-    def _patch(self, monkeypatch, calls, rdkit_version="test-rdkit"):
+    def _patch(
+        self,
+        monkeypatch,
+        calls,
+        rdkit_version="test-rdkit",
+        pipeline_commit="test-clean-commit",
+    ):
         import pipeline.conformers as C
 
         monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
         monkeypatch.setattr(C, "_rdkit_version", lambda: rdkit_version)
+        monkeypatch.setattr(
+            C, "pipeline_provenance", lambda: ("2.0.0", pipeline_commit)
+        )
 
         def gen(smiles, **kw):
             calls.append(smiles)
@@ -947,6 +993,30 @@ class TestResumeConfigValidationBatch:
         C.search_conformers(self._table(), **self._kw(tmp_path))
         assert len(calls) == 2
 
+    def test_changed_clean_pipeline_commit_regenerates(self, tmp_path, monkeypatch):
+        calls = []
+        C = self._patch(monkeypatch, calls, pipeline_commit="abc1234")
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        C = self._patch(monkeypatch, calls, pipeline_commit="def5678")
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        assert len(calls) == 2
+
+    def test_dirty_pipeline_commit_never_resumes(self, tmp_path, monkeypatch):
+        calls = []
+        C = self._patch(monkeypatch, calls, pipeline_commit="abc1234.dirty")
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        assert len(calls) == 2
+
+    def test_missing_pipeline_commit_keeps_version_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        C = self._patch(monkeypatch, calls, pipeline_commit="")
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        C.search_conformers(self._table(), **self._kw(tmp_path))
+        assert len(calls) == 1
+
     def test_deleted_xyz_regenerates(self, tmp_path, monkeypatch):
         # B-02: identity + config match, but the recorded XYZ is gone → regenerate.
         calls = []
@@ -1003,6 +1073,9 @@ class TestPreserveUnrequestedBatch:
 
         monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
         monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+        monkeypatch.setattr(
+            C, "pipeline_provenance", lambda: ("2.0.0", "test-clean-commit")
+        )
 
         def gen(smiles, **kw):
             calls.append(smiles)
@@ -1060,6 +1133,7 @@ class TestPreserveUnrequestedBatch:
             "top_n",
             "rmsd_prune",
             "pipeline_version",
+            "pipeline_commit",
             "rdkit_version",
             "pre_provenance",
             "inconsistent_cid",
@@ -1107,6 +1181,7 @@ class TestPreserveUnrequestedBatch:
                 "top_n": 1,
                 "rmsd_prune": 0.75,
                 "pipeline_version": "1.9.0",
+                "pipeline_commit": "other-clean-commit",
                 "rdkit_version": "old-rdkit",
             }
             existing.loc[water_index, corruption] = mismatches[corruption]

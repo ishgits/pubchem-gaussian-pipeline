@@ -156,7 +156,7 @@ class TestGaussianProvenanceGuard:
 
 
 class TestAppendIntegrityGuard:
-    """M-15: the floor checks retained-group validation before mutation."""
+    """M-15/M-19/M-20: guard reuse and generated XYZ provenance."""
 
     @staticmethod
     def _source():
@@ -185,3 +185,31 @@ class TestAppendIntegrityGuard:
         broken = self._source().replace('"pipeline_commit" in row', '"other" in row', 1)
         problems = check_invariants._append_integrity_problems(broken)
         assert any("omits pipeline_commit" in p for p in problems)
+
+    def test_detects_missing_resume_commit_comparison(self):
+        broken = self._source().replace(
+            'row.get("pipeline_commit")', 'row.get("other_commit")', 1
+        )
+        problems = check_invariants._append_integrity_problems(broken)
+        assert any("matching omits pipeline_commit" in p for p in problems)
+
+    def test_detects_missing_dirty_commit_rejection(self):
+        broken = self._source().replace('.endswith(".dirty")', '.endswith(".other")')
+        problems = check_invariants._append_integrity_problems(broken)
+        assert any("omits dirty-commit rejection" in p for p in problems)
+
+    def test_detects_missing_commit_in_run_config(self):
+        broken = self._source().replace(
+            '        "pipeline_commit": pipeline_commit,\n', "", 1
+        )
+        problems = check_invariants._append_integrity_problems(broken)
+        assert any("run_config omits pipeline_commit" in p for p in problems)
+
+    def test_detects_missing_rdkit_xyz_token(self):
+        broken = self._source().replace(
+            'f"method={method} rdkit={rdkit_ver} seed={seed} "',
+            'f"method={method} seed={seed} "',
+            1,
+        )
+        problems = check_invariants._append_integrity_problems(broken)
+        assert any("XYZ provenance omits rdkit=" in p for p in problems)

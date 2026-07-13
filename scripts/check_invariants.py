@@ -360,9 +360,11 @@ def check_gaussian_provenance() -> list[str]:
     ]
 
 
-# 5) Append carry-forward integrity (M-15). Unrequested groups cannot be
-# regenerated from the current molecule table, so append mode must validate and
-# reject them before any output mutation rather than copying them untouched.
+# 5) Conformer reuse/output provenance (M-15/M-19/M-20). Unrequested groups
+# cannot be regenerated from the current molecule table, so append mode must
+# validate and reject them before any output mutation rather than copying them
+# untouched. Generated XYZ comments must identify RDKit, and cached clean commit
+# provenance must match while dirty worktrees are never reusable.
 def _append_integrity_problems(text: str) -> list[str]:
     """Return missing M-15 append-boundary semantics in conformer source text."""
     try:
@@ -374,18 +376,37 @@ def _append_integrity_problems(text: str) -> list[str]:
         node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
     }
     carry = functions.get("_carry_forward_group_is_valid")
+    config_match = functions.get("_row_config_matches")
     partition = functions.get("_resume_partition")
     search = functions.get("search_conformers")
     problems = []
     for name, function in (
         ("_carry_forward_group_is_valid", carry),
+        ("_row_config_matches", config_match),
         ("_resume_partition", partition),
         ("search_conformers", search),
     ):
         if function is None:
             problems.append(f"{name} is missing")
-    if carry is None or partition is None or search is None:
+    if carry is None or config_match is None or partition is None or search is None:
         return problems
+
+    config_literals = _function_runtime_literals(config_match)
+    commit_getters = {
+        node.func.value.id
+        for node in ast.walk(config_match)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and isinstance(node.func.value, ast.Name)
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "pipeline_commit"
+    }
+    if not {"row", "config"}.issubset(commit_getters):
+        problems.append("resume config matching omits pipeline_commit")
+    if ".dirty" not in config_literals:
+        problems.append("resume config matching omits dirty-commit rejection")
 
     carry_calls = {
         node.func.id
@@ -401,6 +422,27 @@ def _append_integrity_problems(text: str) -> list[str]:
             problems.append(f"carry-forward validation omits {required}")
     if "pipeline_commit" not in _function_runtime_literals(carry):
         problems.append("carry-forward validation omits pipeline_commit field presence")
+
+    search_literals = _function_runtime_literals(search)
+    if "rdkit=" not in search_literals:
+        problems.append("generated XYZ provenance omits rdkit= token")
+
+    run_config_keys = set()
+    for node in ast.walk(search):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "run_config"
+            for target in node.targets
+        ):
+            continue
+        run_config_keys.update(
+            key.value
+            for key in node.value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        )
+    if "pipeline_commit" not in run_config_keys:
+        problems.append("search_conformers run_config omits pipeline_commit")
 
     partition_calls = {
         node.func.id

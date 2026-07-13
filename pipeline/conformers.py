@@ -395,14 +395,24 @@ _LOG_COLUMNS = [
 # molecule may be skipped ONLY if its existing rows were produced with the same
 # values for all of these; otherwise its rows are stale and it is regenerated
 # (M-09). `seed`, `n_generate`, `top_n`, `rmsd_prune` are the requested search
-# knobs; `pipeline_version` and `rdkit_version` are run-level guards — a code
-# change to the generation logic (`pipeline_version`) or a different RDKit
-# (ETKDGv3+MMFF geometry is RDKit-version-dependent, B-02 call 1b) both invalidate
-# a cached geometry. `cid`/`smiles` are per-molecule identity and are checked
-# separately in `_resume_partition`, not here.
+# knobs; `pipeline_version`, `pipeline_commit`, and `rdkit_version` are run-level
+# guards — a code change to the generation logic or a different RDKit
+# (ETKDGv3+MMFF geometry is RDKit-version-dependent, B-02 call 1b) invalidates a
+# cached geometry. Clean nonblank commits must match; dirty commits are never
+# reusable because one ``sha.dirty`` marker cannot identify working-tree content
+# (M-20). `cid`/`smiles` are per-molecule identity and are checked separately in
+# `_resume_partition`, not here.
 _RESUME_CONFIG_FIELDS = (
-    "seed", "n_generate", "top_n", "rmsd_prune", "pipeline_version", "rdkit_version",
+    "seed", "n_generate", "top_n", "rmsd_prune", "pipeline_version",
+    "pipeline_commit", "rdkit_version",
 )
+
+
+def _commit_key(value) -> str:
+    """Normalize best-effort commit provenance; missing/NaN becomes blank."""
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
 
 
 def _row_config_matches(row: dict, config: dict) -> bool:
@@ -413,8 +423,11 @@ def _row_config_matches(row: dict, config: dict) -> bool:
     count as a mismatch, so such rows are conservatively regenerated rather than
     trusted. `rmsd_prune` is compared with a small float tolerance; the ints
     (seed/n_generate/top_n) and strings (`pipeline_version`, `rdkit_version`) are
-    compared exactly. Per-molecule identity (`cid`/`smiles`) is validated by the
-    caller, not here.
+    compared exactly. When both source commits are available they must also match;
+    a dirty commit on either side always invalidates reuse because the marker does
+    not identify the uncommitted content (M-20). If either commit is unavailable,
+    the documented pipeline-version fallback remains. Per-molecule identity
+    (`cid`/`smiles`) is validated by the caller, not here.
     """
     try:
         for field in ("pipeline_version", "rdkit_version"):
@@ -428,6 +441,13 @@ def _row_config_matches(row: dict, config: dict) -> bool:
         ):
             return False
     except (KeyError, TypeError, ValueError):
+        return False
+
+    row_commit = _commit_key(row.get("pipeline_commit"))
+    config_commit = _commit_key(config.get("pipeline_commit"))
+    if row_commit.endswith(".dirty") or config_commit.endswith(".dirty"):
+        return False
+    if row_commit and config_commit and row_commit != config_commit:
         return False
     return True
 
@@ -758,6 +778,7 @@ def search_conformers(
         "top_n": top_n,
         "rmsd_prune": rmsd_prune,
         "pipeline_version": pipeline_version,
+        "pipeline_commit": pipeline_commit,
         "rdkit_version": rdkit_ver,
     }
     # Per-molecule identity requested this run (B-02): name → {cid, smiles}. Resume
@@ -890,7 +911,7 @@ def search_conformers(
                 coords_list[conf_idx],
                 comment=(
                     f"{base} c{ii:02d} dE={rel_e:.4f} kcal/mol "
-                    f"method={method} seed={seed} "
+                    f"method={method} rdkit={rdkit_ver} seed={seed} "
                     f"pver={pipeline_version} pcommit={pipeline_commit}{unconv_tag}"
                 ),
             )

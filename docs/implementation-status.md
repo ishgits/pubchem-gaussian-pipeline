@@ -48,8 +48,8 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   `"2.0.0"` (round-04 MOD-01); `pipeline_provenance()` returns that version plus a best-effort git
   short SHA (`.dirty` suffix on an uncommitted tree, empty string when git is
   absent). `search_conformers` records `pipeline_version` and `pipeline_commit`
-  on every `conformer_log.csv` row and appends `pver=`/`pcommit=` tokens to each
-  per-conformer XYZ comment line.
+  on every `conformer_log.csv` row and appends RDKit, pipeline-version, and
+  pipeline-commit tokens to each per-conformer XYZ comment line.
 - **Gaussian writer (extended).** `write_gaussian_com` gained optional
   `conformer_id`, `rel_energy_kcalmol`, and `unconverged` parameters:
   per-conformer basenames `{base}_c{ii}_F.com` / `.chk`, the ΔE (kcal/mol) and any
@@ -88,13 +88,16 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
 - **Identity/config-validated resume (M-09 + round-04 B-02).** `search_conformers`
   skips a molecule only when all its existing rows match this run's run-level
   config (`seed`, `n_generate`, `top_n`, `rmsd_prune`, `pipeline_version`,
-  **`rdkit_version`**) *and* the requested per-molecule identity (**`cid`**,
-  **`smiles`**), and every recorded **`xyz_path` exists and is non-empty**. Rows
-  from a different config/identity, a stale RDKit build, a missing geometry, or a
-  pre-provenance log are dropped and regenerated with a warning, so downstream
-  Gaussian inputs are never built on outdated or wrong-structure conformers. By
-  default (round-04 M-02) the log holds exactly the molecules requested this run;
-  `append=True` retains unrequested molecules' rows.
+  **`rdkit_version`**) *and*, when available, a matching clean
+  **`pipeline_commit`**, plus the requested per-molecule identity (**`cid`**,
+  **`smiles`**), and every recorded **`xyz_path` exists and is non-empty**. A
+  `.dirty` commit is never reusable because the marker cannot identify the
+  working-tree content; if either commit is unavailable, the documented
+  pipeline-version fallback applies. Rows from a different config/identity, a
+  stale RDKit build, a missing geometry, or a pre-provenance log are dropped and
+  regenerated with a warning. By default (round-04 M-02) the log holds exactly
+  the molecules requested this run; `append=True` retains unrequested molecules'
+  rows only after the same validation.
 - **Complete-group resume validation (round-05 M-12).** A requested molecule is
   resumable only when every row has a parseable, agreeing `n_kept`; the group has
   exactly that many rows; `conformer_id` values are the unique contiguous set
@@ -140,6 +143,14 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   to an existing file. A damaged/stale COM log fails with row-level details
   rather than reporting `WROTE` for a job that cannot start. The explicit legacy
   `com_dir` glob remains unchanged.
+- **Complete XYZ software provenance (round-08 M-19).** Generated conformer XYZ
+  comments now record the exact RDKit version alongside the force-field method,
+  seed, pipeline version, and pipeline commit, making each geometry artifact
+  self-describing without its CSV sidecar.
+- **Commit-aware conformer reuse (round-08 M-20).** Resume and append reuse now
+  require matching clean nonblank pipeline commits when both are available.
+  Any `.dirty` commit on the retained row or current run forces regeneration;
+  missing commit provenance retains the documented pipeline-version fallback.
 - **Stable zero-result schemas (round-05 M-11).** Both the legacy and conformer
   Gaussian batch writers emit header-only, readable COM logs when zero files are
   written (including all-write-failure batches). The SLURM writer likewise emits
@@ -159,7 +170,7 @@ against `docs/architecture.md` and `docs/implementation-plan.md`.
   to a labeled legacy v1.1 section.
 
 Required checks locally green after round 08 (RDKit 2025.03.3):
-`pytest tests/ -q` → **220 passed**; `python scripts/check_invariants.py` →
+`pytest tests/ -q` → **235 passed**; `python scripts/check_invariants.py` →
 **passed**; `git diff --check` → **passed**;
 `git ls-files -ci --exclude-standard` → empty.
 
@@ -182,6 +193,13 @@ Required checks locally green after round 08 (RDKit 2025.03.3):
   `com_path` entries before output-directory creation, stale-script pruning, or
   SLURM-log rewrites. This prevents fresh scripts and `WROTE` records that point
   to absent Gaussian inputs; the explicit legacy glob path remains unchanged.
+- **M-19 — Resolved:** conformer XYZ comments now include the source RDKit
+  version together with the existing pipeline version/commit, force-field
+  method, and seed provenance.
+- **M-20 — Resolved:** retained conformers produced by a different clean commit
+  are regenerated, and `.dirty` commit provenance is never reusable. When one
+  side has no commit, exact pipeline-version and RDKit-version matching remains
+  the conservative available fallback.
 
 ## 2. What was NOT implemented (and why)
 
@@ -194,12 +212,13 @@ Required checks locally green after round 08 (RDKit 2025.03.3):
 - Post-optimization RMSD re-pruning is not added; distinctness relies on
   `pruneRmsThresh` at embed time (see §6).
 - **Remaining recorded deferrals:** the per-study `runs/` run-directory redesign;
-  adding `pipeline_commit` to the resume key; replacing label-based filenames
-  with a collision-proof internal identifier rather than rejecting collisions;
-  and extending version/commit provenance to `sdf_download_log.csv` and unrelated
-  legacy outputs. The round-04 `n_rows == n_kept` reconciliation is no longer
-  deferred: round-05 M-12 implements it with ID/path integrity checks; v2 COM
-  provenance is likewise no longer deferred after round-07 M-14.
+  replacing label-based filenames with a collision-proof internal identifier
+  rather than rejecting collisions; and extending version/commit provenance to
+  `sdf_download_log.csv` and unrelated legacy outputs. The round-04
+  `n_rows == n_kept` reconciliation is no longer deferred: round-05 M-12
+  implements it with ID/path integrity checks; v2 COM provenance is likewise no
+  longer deferred after round-07 M-14, and round-08 M-20 makes commit provenance
+  part of resume validation.
 - **Physical cleanup of stale XYZ/COM files is not implemented.** Reduced reruns
   make the current CSV logs and pruned `slurm_scripts/` authoritative, so old
   files in `conformer_xyz/` or `gaussian_inputs/` cannot enter the documented
@@ -232,10 +251,12 @@ Required checks locally green after round 08 (RDKit 2025.03.3):
   n_kept, rmsd_prune, converged`. `converged` (M-04), `pipeline_version` /
   `pipeline_commit` (M-06), and the requested `n_generate` / `top_n` (M-09) are
   additive; existing columns and the top-3 selection for a given config are
-  unchanged. The XYZ comment format is likewise extended with `pver=`/`pcommit=`
-  tokens (M-06). `n_generate` and `top_n` record the *requested* search knobs
-  (distinct from the result columns `n_generated` / `n_kept`) so a resumed run can
-  validate that stale rows match the current config (M-09).
+  unchanged. The XYZ comment format is likewise extended with `rdkit=`, `pver=`,
+  and `pcommit=` tokens (M-06/M-19). `n_generate` and `top_n` record the
+  *requested* search knobs (distinct from the result columns `n_generated` /
+  `n_kept`) so a resumed run can validate that stale rows match the current
+  config (M-09); clean commit identity is also checked when available, while
+  dirty commits are never reused (M-20).
 - **All-fail best-effort seed (M-04 decision 2b).** When no conformer converges,
   one real (not fabricated) FF geometry is still handed to DFT, explicitly flagged
   `converged=False`, warned at runtime, and tagged `UNCONVERGED_FF_SEED`. An
@@ -283,7 +304,10 @@ title) and never mixed with DFT Hartree values.
   truncate a group, remove an XYZ, remove provenance columns, and mix CID/SMILES
   identities; every case asserts the conformer log, surviving XYZ files, failure
   log, and full output file set remain byte-for-byte unchanged (M-15). A valid
-  retained group still appends successfully.
+  retained group still appends successfully. Follow-up coverage verifies RDKit
+  in every generated XYZ comment, different clean commits regenerating, dirty
+  commits never resuming or carrying forward, and missing commits retaining the
+  version-based fallback (M-19/M-20).
 - `tests/test_gaussian.py` — physical-line XYZ parsing: empty comment keeps all
   atoms, count-mismatch (either direction) and malformed/non-integer rows raise,
   trailing blank tolerated (`TestXyzParsingByPhysicalLine`).
@@ -327,8 +351,9 @@ title) and never mixed with DFT Hartree values.
   template and passes on a populated file (`TestStatusDocDriftGuard`); AST-based
   guards verify M-14 provenance threading/title tokens, M-16 required-version
   batch validation before mutation, M-17 conditional direct-writer validation
-  before mutation, and M-15 complete/config/identity/provenance carry-forward
-  validation plus fail-before-mutation ordering.
+  before mutation, M-15 complete/config/identity/provenance carry-forward
+  validation plus fail-before-mutation ordering, M-19 RDKit tokens in generated
+  XYZ comments, and M-20 commit-aware/dirty-rejecting resume configuration.
 
 RDKit-dependent tests use `pytest.importorskip("rdkit")` so a bare environment
 still runs the pure tests; CI installs rdkit so they execute there.
@@ -348,10 +373,10 @@ still runs the pure tests; CI installs rdkit so they execute there.
   study if those artifacts must be physically isolated.
 - **Reproducibility of `pipeline_commit`.** It pins code identity only when the
   tree is clean. A `.dirty` suffix means uncommitted edits produced the output,
-  so that output is not fully reproducible from the commit alone. An empty
-  `pipeline_commit` (no git) falls back to `pipeline_version`, which is only as
-  precise as manual version bumping. A recorded commit is therefore not a
-  guarantee of exact code.
+  so that output is not fully reproducible from the commit alone; such rows are
+  never reused by resume or append. An empty `pipeline_commit` (no git) falls
+  back to `pipeline_version`, which is only as precise as manual version bumping.
+  A recorded commit is therefore not by itself a guarantee of exact code.
 - **Nonempty pre-round-08 conformer logs without source-version provenance cannot
   be converted to v2 COM files.** They must be regenerated or repaired from
   trustworthy records; the Gaussian stage intentionally does not infer historical
