@@ -110,8 +110,8 @@ used.
 A change is done only when:
 
 1. required checks are green;
-2. the implementation matches `docs/architecture.md`,
-   `docs/implementation-plan.md`, and `docs/release-contract-v2.0.md`;
+2. the implementation matches `docs/architecture-v2.1.md`,
+   `docs/implementation-plan-v2.1.md`, and `docs/release-contract-v2.1.md`;
 3. `docs/implementation-status.md` accurately distinguishes implemented,
    pending, rejected, and deferred work;
 4. all contract-level Blocker and Major findings are resolved or rejected with
@@ -138,7 +138,6 @@ file hashes
 one-to-one path mapping
 collision handling
 failure-before-mutation
-resume and append behavior
 zero-job behavior
 clean-archive reproducibility
 ```
@@ -164,7 +163,7 @@ reuse, or non-runnable supported jobs as Majors.
 Do **not** report absence of every duplicated search knob inside an XYZ or COM as
 a finding when the artifact satisfies the exact per-artifact matrix and links to
 a complete valid manifest. Suggestions that broaden the frozen contract belong
-in a deferred v2.1 section unless Ish explicitly approves the expansion.
+in a deferred future-release section unless Ish explicitly approves the expansion.
 
 ### Finding format and re-review
 
@@ -180,5 +179,5 @@ in a deferred v2.1 section unless Ish explicitly approves the expansion.
 
 After the implementation is aligned to the frozen contract, conduct one
 holistic audit and one final re-review. Recommendations that do not demonstrate a
-contract violation are recorded for v2.1 and do not keep v2.0 in an open-ended
-review loop.
+contract violation are recorded for a future release and do not keep the current
+release candidate in an open-ended review loop.
