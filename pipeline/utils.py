@@ -3,10 +3,52 @@ Shared utility functions used across the pipeline.
 """
 
 import os
+import math
+import numbers
 import re
 import subprocess
 
 import pandas as pd
+
+
+def parse_strict_bool(value, *, field_name: str) -> bool:
+    """Parse an explicit boolean without falling back to Python truthiness.
+
+    This accepts the representations emitted by JSON and ordinary CSV readers,
+    while rejecting missing values, non-finite values, and arbitrary nonzero
+    numbers.  ``field_name`` is included in every error so callers can identify
+    the damaged provenance field or row.
+    """
+    try:
+        if value is None or pd.isna(value):
+            raise ValueError(f"{field_name} is missing; expected true or false.")
+    except (TypeError, ValueError):
+        # Array-like values are never valid scalar boolean provenance.
+        raise ValueError(
+            f"{field_name} has invalid value {value!r}; expected true or false."
+        )
+
+    if isinstance(value, bool):
+        return value
+    if hasattr(value, "item"):
+        scalar = value.item()
+        if scalar is not value:
+            return parse_strict_bool(scalar, field_name=field_name)
+    if isinstance(value, numbers.Integral) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, numbers.Real):
+        numeric = float(value)
+        if math.isfinite(numeric) and numeric in (0.0, 1.0):
+            return bool(int(numeric))
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    raise ValueError(
+        f"{field_name} has invalid value {value!r}; expected true or false."
+    )
 
 
 def git_short_sha(cwd: str | None = None) -> str:

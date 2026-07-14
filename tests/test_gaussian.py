@@ -335,6 +335,26 @@ class TestWriteGaussianComConformer:
             )
         assert not outdir.exists()
 
+    def test_nan_direct_convergence_fails_before_output_mutation(self, tmp_path):
+        xyz_path, linkage = direct_com_context(tmp_path, SAMPLE_XYZ)
+        outdir = tmp_path / "gaussian_inputs"
+        with pytest.raises(ValueError, match="unconverged"):
+            write_gaussian_com(
+                name="Ribose",
+                xyz_path=xyz_path,
+                outdir=str(outdir),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                conformer_id=0,
+                rel_energy_kcalmol=0.0,
+                unconverged=float("nan"),
+                pipeline_version="2.0.0",
+                pipeline_commit="abc1234",
+                rdkit_version="2025.09.3",
+                **linkage,
+            )
+        assert not outdir.exists()
+
     def test_provenance_is_stamped_only_in_title_section(self):
         route_opt = "# opt b3lyp/6-31g(d)"
         route_freq = "# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read"

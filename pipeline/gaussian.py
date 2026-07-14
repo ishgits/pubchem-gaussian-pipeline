@@ -25,7 +25,7 @@ from .manifest import (
     sha256_file,
     stable_record_id,
 )
-from .utils import ensure_dir, sanitize_basename
+from .utils import ensure_dir, parse_strict_bool, sanitize_basename
 
 
 # Fixed schemas keep a scientifically valid zero-job run machine-readable for
@@ -69,23 +69,8 @@ def _optional_text(value) -> str | None:
 
 def _parse_converged_flag(value, *, row_index: int) -> bool:
     """Parse one manifest-linked convergence flag without permissive fallback."""
-    if value is None or pd.isna(value):
-        raise ValueError(f"Conformer row {row_index} converged value is missing.")
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and value in (0, 1):
-        return bool(value)
-    if isinstance(value, float) and value in (0.0, 1.0):
-        return bool(int(value))
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "1", "yes"}:
-            return True
-        if normalized in {"false", "0", "no"}:
-            return False
-    raise ValueError(
-        f"Conformer row {row_index} has invalid converged value {value!r}; "
-        "expected true/false."
+    return parse_strict_bool(
+        value, field_name=f"Conformer row {row_index} converged"
     )
 
 def _validate_required_conformer_provenance(conf_log: pd.DataFrame) -> None:
@@ -322,6 +307,12 @@ def write_gaussian_com(
     # calls that bypass the validated batch writer. Require its source versions
     # before creating a directory or writing any file. Legacy v1.1 calls keep
     # optional provenance exactly as before.
+    unconverged_value = unconverged
+    if conformer_id is not None:
+        unconverged_value = parse_strict_bool(
+            unconverged, field_name="Direct COM unconverged"
+        )
+
     _validate_direct_conformer_provenance(
         conformer_id,
         pipeline_version,
@@ -387,7 +378,7 @@ def write_gaussian_com(
             - float(conformer_record["relative_energy_kcalmol"])
         ) > 1e-9:
             raise ValueError("Direct COM relative energy disagrees with run manifest.")
-        if bool(unconverged) == bool(conformer_record["converged"]):
+        if unconverged_value == conformer_record["converged"]:
             raise ValueError("Direct COM convergence marker disagrees with run manifest.")
 
     base = sanitize_basename(name)
@@ -411,7 +402,7 @@ def write_gaussian_com(
     if rel_energy_kcalmol is not None:
         # Units labeled explicitly; FF energy, never a DFT Hartree value.
         title = f"{title} dE={rel_energy_kcalmol:.4f} kcal/mol".strip()
-    if unconverged:
+    if unconverged_value:
         # Make the unconverged FF start explicit on the input itself (M-04 2b).
         title = f"{title} {UNCONVERGED_FF_SEED}".strip()
 
@@ -597,7 +588,7 @@ def write_gaussian_coms_from_conformers(
         if int(row["conformer_id"]) != conformer_record["conformer_id"]:
             raise ValueError(f"Conformer row {int(index)} ID disagrees with manifest.")
         converged = _parse_converged_flag(row.get("converged"), row_index=int(index))
-        if converged is not bool(conformer_record["converged"]):
+        if converged is not conformer_record["converged"]:
             raise ValueError(
                 f"Conformer row {int(index)} convergence disagrees with manifest."
             )

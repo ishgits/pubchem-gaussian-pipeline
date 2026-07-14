@@ -9,6 +9,7 @@ pure tests.
 import os
 import sys
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -1018,6 +1019,36 @@ class TestResumeConfigValidationBatch:
         C.search_conformers(self._table(), **self._kw(tmp_path))
         C.search_conformers(self._table(), **self._kw(tmp_path))  # same config
         assert len(calls) == 1  # second run resumed; molecule NOT regenerated
+
+    @pytest.mark.parametrize(
+        "damaged_value", [None, float("nan"), "", "unknown", False]
+    )
+    def test_damaged_convergence_never_resumes(
+        self, tmp_path, monkeypatch, damaged_value
+    ):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        kw = self._kw(tmp_path)
+        C.search_conformers(self._table(), **kw)
+        rows = pd.read_csv(kw["log_csv"]).astype({"converged": object})
+        rows.loc[0, "converged"] = damaged_value
+        rows.to_csv(kw["log_csv"], index=False)
+
+        C.search_conformers(self._table(), **kw)
+        assert len(calls) == 2
+
+    def test_missing_convergence_column_never_resumes(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        kw = self._kw(tmp_path)
+        C.search_conformers(self._table(), **kw)
+        rows = pd.read_csv(kw["log_csv"]).drop(columns=["converged"])
+        rows.to_csv(kw["log_csv"], index=False)
+
+        C.search_conformers(self._table(), **kw)
+        assert len(calls) == 2
 
     def test_changed_seed_regenerates(self, tmp_path, monkeypatch, capsys):
         calls = []

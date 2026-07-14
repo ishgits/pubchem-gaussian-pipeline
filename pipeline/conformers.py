@@ -40,7 +40,13 @@ from .manifest import (
     sha256_file,
     stable_record_id,
 )
-from .utils import ensure_dir, normalize_cid, pipeline_provenance, sanitize_basename
+from .utils import (
+    ensure_dir,
+    normalize_cid,
+    parse_strict_bool,
+    pipeline_provenance,
+    sanitize_basename,
+)
 
 # Locked defaults (docs/implementation-plan.md v2 — confirm at approval).
 N_GENERATE = 20
@@ -506,10 +512,11 @@ def _row_manifest_matches(row: dict, manifest_path: str, manifest: dict) -> bool
             abs_tol=1e-9,
         ):
             return False
-        converged_value = row.get("converged")
-        if isinstance(converged_value, str):
-            converged_value = converged_value.strip().lower() in {"true", "1", "yes"}
-        if bool(converged_value) != conformer["converged"]:
+        converged_value = parse_strict_bool(
+            row.get("converged"),
+            field_name=f"Conformer row {row.get('conformer_id')!r} converged",
+        )
+        if converged_value is not conformer["converged"]:
             return False
         if str(row["xyz_sha256"]) != artifact["sha256"]:
             return False

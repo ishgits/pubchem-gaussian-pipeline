@@ -1,6 +1,7 @@
 """Tests for pipeline.utils"""
 
 import subprocess
+import math
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -8,10 +9,59 @@ import pipeline
 from pipeline.utils import (
     sanitize_basename,
     normalize_cid,
+    parse_strict_bool,
     git_short_sha,
     pipeline_provenance,
 )
 import pipeline.utils as _utils
+import pandas as pd
+import pytest
+
+
+class TestParseStrictBool:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (True, True),
+            (False, False),
+            ("true", True),
+            ("false", False),
+            ("TRUE", True),
+            ("FALSE", False),
+            ("1", True),
+            ("0", False),
+            ("yes", True),
+            ("no", False),
+            (" yes ", True),
+            (1, True),
+            (0, False),
+            (1.0, True),
+            (0.0, False),
+        ],
+    )
+    def test_accepted_explicit_values(self, value, expected):
+        assert parse_strict_bool(value, field_name="converged") is expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            float("nan"),
+            pd.NA,
+            "",
+            "   ",
+            "unknown",
+            "truthy",
+            2,
+            -1,
+            0.5,
+            math.inf,
+            -math.inf,
+        ],
+    )
+    def test_rejected_ambiguous_or_missing_values(self, value):
+        with pytest.raises(ValueError, match="converged"):
+            parse_strict_bool(value, field_name="converged")
 
 
 class TestSanitizeBasename:

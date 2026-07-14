@@ -161,6 +161,32 @@ are also resolved locally:
   subdirectory manifest package; its fixture was corrected to root both
   manifests at the shared package directory, preserving the test's intent.
 
+The targeted reviewed-head remediation is also complete:
+
+- **B-11 — Resolved.** PubChem JSON caches now use a readable prefix plus the
+  SHA-256 of the complete canonical GET request, store a schema-2 request/response
+  envelope, and treat legacy, malformed, or request-mismatched entries as misses.
+- **M-31 — Resolved.** Artifact resolution rechecks the final real path against
+  the manifest package root, rejecting direct and parent-directory symlink escapes
+  before verification or finalization while retaining internal symlink support.
+- **M-32 — Resolved.** One shared strict boolean parser now governs conformer
+  resume, direct and batch Gaussian preflight, manifest recording, and manifest
+  validation; blank, missing, NaN, infinite, malformed, and ambiguous values
+  cannot pass by Python truthiness.
+- **M-33 — Resolved.** Every manifest conformer requires the complete frozen
+  record schema, strict types and finite values, stable identity, agreement with
+  authoritative search configuration, and exactly one matching XYZ artifact;
+  shared, orphaned, missing, wrong-kind, or mismatched XYZ lineage is rejected.
+- **MOD-06 / MIN-07 / MIN-08 — Resolved.** Molecule rows record the PubChem query
+  that actually succeeded, DOI targets are consistent, and the notebook states
+  the supported Python >=3.11 floor.
+
+The holistic re-review additionally closed **M-34**, a frozen-contract manifest
+consistency gap: duplicated per-conformer search knobs could previously disagree
+with `configuration.conformer` without invalidating the manifest. Validation now
+rejects that internal provenance drift. Regression coverage exercises every item
+above on both normal and failure-atomic paths.
+
 No known local frozen-contract Blocker or Major remains. This exact patched head
 still requires remote CI and one current-head review before the human merge
 decision; the status does not treat the prior review as approval of new code.
@@ -196,11 +222,11 @@ pytest 9.1.1
 Current local results:
 
 ```text
-pytest tests/ -q: 284 passed
+pytest tests/ -q: 378 passed
 python scripts/check_invariants.py: passed
 Python compilation: passed
 notebook JSON validation: passed
-clean package copy: 284 passed; invariant checks passed
+clean `git archive`: 378 passed; invariant checks and compilation passed
 ```
 
 The M-30 re-verification above (284 passed, six new package-boundary cases)

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
+import shutil
 import subprocess
 
 import pandas as pd
@@ -13,6 +15,7 @@ import pipeline.manifest as manifest_module
 from pipeline.utils import pipeline_provenance
 
 from pipeline.manifest import (
+    artifact_abspath,
     canonical_json,
     configuration_hash,
     create_run_manifest,
@@ -20,6 +23,7 @@ from pipeline.manifest import (
     load_manifest,
     molecule_identity_hash,
     record_conformer_xyz,
+    record_child_artifact,
     slurm_template_identity,
     stable_record_id,
     validate_manifest,
@@ -79,6 +83,57 @@ def _create(tmp_path, table=None):
         rdkit_version="2025.09.3",
     )
     return path
+
+
+def _create_with_xyz(tmp_path, *, conformer_id=0):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    path = _create(
+        tmp_path,
+        table=pd.DataFrame([
+            {"name": "Water", "cid": 962, "IsomericSMILES": "O"}
+        ]),
+    )
+    manifest = load_manifest(str(path))
+    molecule = next(
+        record for record in manifest["molecules"]
+        if record["molecule_name"] == "Water"
+    )
+    conformer_record_id = stable_record_id(
+        manifest["run_id"],
+        "conformer",
+        f"{molecule['molecule_identity_hash']}:{conformer_id}",
+    )
+    artifact_id = stable_record_id(
+        manifest["run_id"], "xyz", conformer_record_id
+    )
+    xyz = tmp_path / "conformer_xyz" / f"water_c{conformer_id:02d}.xyz"
+    xyz.parent.mkdir(parents=True, exist_ok=True)
+    xyz.write_text(
+        f"1\nlinked starting geometry\nO {float(conformer_id)} 0 0\n",
+        encoding="utf-8",
+    )
+    record_conformer_xyz(
+        str(path),
+        name="Water",
+        cid=962,
+        smiles="O",
+        conformer_id=conformer_id,
+        method="MMFF94",
+        n_generated=1,
+        n_kept=1,
+        relative_energy_kcalmol=float(conformer_id),
+        converged=True,
+        xyz_path=str(xyz),
+        artifact_id=artifact_id,
+    )
+    return path, xyz, artifact_id
+
+
+def _write_unvalidated(path, manifest):
+    path.write_text(
+        json.dumps(manifest, sort_keys=True, indent=2, allow_nan=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 class TestCanonicalConfigurationHash:
@@ -262,50 +317,16 @@ class TestManifestValidation:
         assert not after_commit.endswith(".dirty")
 
     def test_duplicate_artifact_id_and_path_rejected(self, tmp_path):
-        path = _create(tmp_path)
+        path, _, _ = _create_with_xyz(tmp_path)
         manifest = load_manifest(str(path))
-        molecule = manifest["molecules"][0]
-        conformer_record_id = stable_record_id(
-            manifest["run_id"],
-            "conformer",
-            f"{molecule['molecule_identity_hash']}:0",
-        )
-        molecule["conformers"].append({
-            "conformer_record_id": conformer_record_id,
-            "conformer_id": 0,
-        })
-        artifact = {
-            "artifact_id": "xyz-duplicate",
-            "kind": "xyz",
-            "conformer_record_id": conformer_record_id,
-            "relative_path": "xyz/water.xyz",
-            "sha256": "a" * 64,
-        }
-        manifest["artifacts"] = [artifact, deepcopy(artifact)]
+        manifest["artifacts"].append(deepcopy(manifest["artifacts"][0]))
         with pytest.raises(ValueError, match="Duplicate artifact"):
             validate_manifest(manifest)
 
     def test_artifact_path_cannot_escape_run_package(self, tmp_path):
-        manifest = load_manifest(str(_create(tmp_path)))
-        molecule = manifest["molecules"][0]
-        conformer_record_id = stable_record_id(
-            manifest["run_id"],
-            "conformer",
-            f"{molecule['molecule_identity_hash']}:0",
-        )
-        molecule["conformers"].append({
-            "conformer_record_id": conformer_record_id,
-            "conformer_id": 0,
-        })
-        manifest["artifacts"].append({
-            "artifact_id": stable_record_id(
-                manifest["run_id"], "xyz", conformer_record_id
-            ),
-            "kind": "xyz",
-            "conformer_record_id": conformer_record_id,
-            "relative_path": "../water.xyz",
-            "sha256": "a" * 64,
-        })
+        path, _, _ = _create_with_xyz(tmp_path)
+        manifest = load_manifest(str(path))
+        manifest["artifacts"][0]["relative_path"] = "../water.xyz"
         with pytest.raises(ValueError, match="inside the run package"):
             validate_manifest(manifest)
 
@@ -354,3 +375,248 @@ class TestArtifactLineageAndHashes:
         xyz.write_text("1\ntampered\nO 1 0 0\n")
         with pytest.raises(ValueError, match="hash mismatch"):
             verify_artifact(str(path), artifact_id)
+
+
+class TestCompleteConformerSchema:
+    @pytest.mark.parametrize(
+        "field,value", [("seed", 7), ("n_generate", 19), ("top_n", 2), ("rmsd_prune", 0.4)]
+    )
+    def test_conformer_search_knobs_must_match_authoritative_config(
+        self, tmp_path, field, value
+    ):
+        path, _, _ = _create_with_xyz(tmp_path)
+        manifest = load_manifest(str(path))
+        manifest["molecules"][0]["conformers"][0][field] = value
+        with pytest.raises(ValueError, match="configuration.conformer"):
+            validate_manifest(manifest)
+
+    def test_recording_rejects_nan_convergence_before_manifest_mutation(
+        self, tmp_path
+    ):
+        path = _create(
+            tmp_path,
+            table=pd.DataFrame([
+                {"name": "Water", "cid": 962, "IsomericSMILES": "O"}
+            ]),
+        )
+        manifest = load_manifest(str(path))
+        molecule = manifest["molecules"][0]
+        conformer_record_id = stable_record_id(
+            manifest["run_id"],
+            "conformer",
+            f"{molecule['molecule_identity_hash']}:0",
+        )
+        artifact_id = stable_record_id(
+            manifest["run_id"], "xyz", conformer_record_id
+        )
+        xyz = tmp_path / "conformer_xyz" / "water_c00.xyz"
+        xyz.parent.mkdir()
+        xyz.write_text("1\nseed\nO 0 0 0\n", encoding="utf-8")
+        before = path.read_bytes()
+
+        with pytest.raises(ValueError, match="converged"):
+            record_conformer_xyz(
+                str(path),
+                name="Water",
+                cid=962,
+                smiles="O",
+                conformer_id=0,
+                method="MMFF94",
+                n_generated=1,
+                n_kept=1,
+                relative_energy_kcalmol=0.0,
+                converged=float("nan"),
+                xyz_path=str(xyz),
+                artifact_id=artifact_id,
+            )
+        assert path.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "conformer_record_id",
+            "conformer_id",
+            "method",
+            "seed",
+            "n_generate",
+            "n_generated",
+            "top_n",
+            "n_kept",
+            "rmsd_prune",
+            "relative_energy_kcalmol",
+            "converged",
+            "xyz_artifact_id",
+        ],
+    )
+    @pytest.mark.parametrize("operation", ["load", "finalize"])
+    def test_missing_required_field_is_rejected_without_rewrite(
+        self, tmp_path, field, operation
+    ):
+        package = tmp_path / f"{field}_{operation}"
+        path, _, _ = _create_with_xyz(package)
+        manifest = load_manifest(str(path))
+        del manifest["molecules"][0]["conformers"][0][field]
+        _write_unvalidated(path, manifest)
+        before = path.read_bytes()
+
+        with pytest.raises(ValueError, match="missing field"):
+            if operation == "load":
+                load_manifest(str(path))
+            else:
+                finalize_manifest(str(path))
+        assert path.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        "field,value,match",
+        [
+            ("conformer_record_id", "   ", "nonblank"),
+            ("method", "", "nonblank"),
+            ("xyz_artifact_id", " ", "nonblank"),
+            ("conformer_id", True, "integer"),
+            ("seed", 1.5, "integer"),
+            ("n_generate", -1, "nonnegative"),
+            ("n_generated", 21, "n_generated"),
+            ("n_kept", 3, "n_kept"),
+            ("top_n", -1, "nonnegative"),
+            ("rmsd_prune", float("nan"), "finite"),
+            ("rmsd_prune", float("inf"), "finite"),
+            ("rmsd_prune", -0.1, "nonnegative"),
+            ("relative_energy_kcalmol", float("nan"), "finite"),
+            ("relative_energy_kcalmol", float("-inf"), "finite"),
+            ("relative_energy_kcalmol", "0.0", "finite"),
+            ("converged", "true", "JSON boolean"),
+            ("converged", None, "converged"),
+        ],
+    )
+    def test_invalid_conformer_values_are_rejected(
+        self, tmp_path, field, value, match
+    ):
+        path, _, _ = _create_with_xyz(tmp_path)
+        manifest = load_manifest(str(path))
+        manifest["molecules"][0]["conformers"][0][field] = value
+        with pytest.raises(ValueError, match=match):
+            validate_manifest(manifest)
+
+
+class TestExactConformerXyzLineage:
+    def test_nonexistent_xyz_reference_is_rejected(self, tmp_path):
+        path, _, _ = _create_with_xyz(tmp_path)
+        manifest = load_manifest(str(path))
+        manifest["molecules"][0]["conformers"][0]["xyz_artifact_id"] = (
+            "xyz-does-not-exist"
+        )
+        with pytest.raises(ValueError, match="does not exist"):
+            validate_manifest(manifest)
+
+    def test_non_xyz_reference_is_rejected(self, tmp_path):
+        path, _, xyz_artifact_id = _create_with_xyz(tmp_path)
+        manifest = load_manifest(str(path))
+        conformer_record_id = manifest["molecules"][0]["conformers"][0][
+            "conformer_record_id"
+        ]
+        com_id = stable_record_id(manifest["run_id"], "com", xyz_artifact_id)
+        com_path = tmp_path / "gaussian_inputs" / "water.com"
+        com_path.parent.mkdir()
+        com_path.write_text("valid com placeholder for lineage test\n", encoding="utf-8")
+        record_child_artifact(
+            str(path),
+            kind="com",
+            artifact_id=com_id,
+            parent_artifact_id=xyz_artifact_id,
+            conformer_record_id=conformer_record_id,
+            path=str(com_path),
+        )
+        manifest = load_manifest(str(path))
+        manifest["molecules"][0]["conformers"][0]["xyz_artifact_id"] = com_id
+        with pytest.raises(ValueError, match="XYZ artifact"):
+            validate_manifest(manifest)
+
+    def test_two_conformers_cannot_share_one_xyz(self, tmp_path):
+        path, _, first_xyz_id = _create_with_xyz(tmp_path)
+        manifest = load_manifest(str(path))
+        molecule = manifest["molecules"][0]
+        second_record_id = stable_record_id(
+            manifest["run_id"],
+            "conformer",
+            f"{molecule['molecule_identity_hash']}:1",
+        )
+        second_xyz_id = stable_record_id(manifest["run_id"], "xyz", second_record_id)
+        second_xyz = tmp_path / "conformer_xyz" / "water_c01.xyz"
+        second_xyz.write_text("1\nsecond\nO 1 0 0\n", encoding="utf-8")
+        record_conformer_xyz(
+            str(path),
+            name="Water",
+            cid=962,
+            smiles="O",
+            conformer_id=1,
+            method="MMFF94",
+            n_generated=2,
+            n_kept=2,
+            relative_energy_kcalmol=1.0,
+            converged=True,
+            xyz_path=str(second_xyz),
+            artifact_id=second_xyz_id,
+        )
+        manifest = load_manifest(str(path))
+        manifest["molecules"][0]["conformers"][1]["xyz_artifact_id"] = first_xyz_id
+        with pytest.raises(ValueError, match="lineage|same XYZ"):
+            validate_manifest(manifest)
+
+    def test_orphan_xyz_is_rejected(self, tmp_path):
+        path, _, _ = _create_with_xyz(tmp_path)
+        manifest = load_manifest(str(path))
+        manifest["molecules"][0]["conformers"] = []
+        with pytest.raises(ValueError, match="conformer record|orphan"):
+            validate_manifest(manifest)
+
+    def test_second_xyz_for_one_conformer_is_rejected(self, tmp_path):
+        path, _, _ = _create_with_xyz(tmp_path)
+        manifest = load_manifest(str(path))
+        duplicate = deepcopy(manifest["artifacts"][0])
+        duplicate["artifact_id"] = "xyz-" + "f" * 24
+        duplicate["relative_path"] = "conformer_xyz/duplicate.xyz"
+        manifest["artifacts"].append(duplicate)
+        with pytest.raises(ValueError, match="stable|multiple XYZ"):
+            validate_manifest(manifest)
+
+
+class TestResolvedArtifactContainment:
+    def test_parent_directory_symlink_escape_fails_atomically(self, tmp_path):
+        package = tmp_path / "run"
+        path, xyz, artifact_id = _create_with_xyz(package)
+        external_dir = tmp_path / "external_xyz"
+        shutil.move(str(xyz.parent), external_dir)
+        xyz.parent.symlink_to(external_dir, target_is_directory=True)
+        external_file = external_dir / xyz.name
+        external_before = external_file.read_bytes()
+        manifest_before = path.read_bytes()
+
+        for operation in (
+            lambda: artifact_abspath(str(path), f"conformer_xyz/{xyz.name}"),
+            lambda: verify_artifact(str(path), artifact_id),
+            lambda: finalize_manifest(str(path)),
+        ):
+            with pytest.raises(ValueError, match="inside the run package"):
+                operation()
+        assert path.read_bytes() == manifest_before
+        assert external_file.read_bytes() == external_before
+
+    def test_direct_file_symlink_escape_is_rejected(self, tmp_path):
+        package = tmp_path / "run"
+        path, xyz, artifact_id = _create_with_xyz(package)
+        external = tmp_path / "external.xyz"
+        external.write_bytes(xyz.read_bytes())
+        xyz.unlink()
+        xyz.symlink_to(external)
+        with pytest.raises(ValueError, match="inside the run package"):
+            verify_artifact(str(path), artifact_id)
+
+    def test_internal_symlink_remains_supported(self, tmp_path):
+        package = tmp_path / "run"
+        path, xyz, artifact_id = _create_with_xyz(package)
+        internal = package / "stored" / xyz.name
+        internal.parent.mkdir()
+        shutil.move(str(xyz), internal)
+        xyz.symlink_to(internal)
+        assert artifact_abspath(str(path), f"conformer_xyz/{xyz.name}") == str(internal)
+        assert verify_artifact(str(path), artifact_id)["artifact_id"] == artifact_id

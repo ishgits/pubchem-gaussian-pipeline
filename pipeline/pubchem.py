@@ -9,8 +9,10 @@ to handle flaky connections and respect PubChem rate limits.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import tempfile
 import time
 from urllib.parse import quote
 
@@ -32,9 +34,51 @@ _DEFAULT_HEADERS = {
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _cache_path(cache_dir: str, key: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", key)[:180]
-    return os.path.join(cache_dir, safe + ".json")
+_CACHE_SCHEMA = 2
+
+
+def _cache_request(url: str) -> dict:
+    """Return the complete canonical identity of one cacheable request."""
+    return {"cache_schema": _CACHE_SCHEMA, "method": "GET", "url": url}
+
+
+def _cache_request_identity(url: str) -> str:
+    payload = json.dumps(
+        _cache_request(url), sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cache_path(cache_dir: str, key: str, url: str) -> str:
+    """Return a readable, collision-resistant path bound to the full request."""
+    readable = re.sub(r"[^a-zA-Z0-9_.-]+", "_", key)[:120].strip("._-")
+    readable = readable or "request"
+    return os.path.join(
+        cache_dir, f"{readable}__{_cache_request_identity(url)}.json"
+    )
+
+
+def _write_cache(path: str, request: dict, response: dict) -> None:
+    """Atomically write a request-bound cache envelope."""
+    fd, temporary = tempfile.mkstemp(prefix=".pubchem_cache.", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "cache_schema": _CACHE_SCHEMA,
+                    "request": request,
+                    "response": response,
+                },
+                handle,
+                sort_keys=True,
+            )
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _get_json(
@@ -56,10 +100,22 @@ def _get_json(
 
     if cache_key:
         ensure_dir(cache_dir)
-        cp = _cache_path(cache_dir, cache_key)
+        request_identity = _cache_request(url)
+        cp = _cache_path(cache_dir, cache_key, url)
         if os.path.exists(cp):
-            with open(cp, "r") as f:
-                return json.load(f)
+            try:
+                with open(cp, encoding="utf-8") as f:
+                    envelope = json.load(f)
+                if (
+                    isinstance(envelope, dict)
+                    and envelope.get("cache_schema") == _CACHE_SCHEMA
+                    and envelope.get("request") == request_identity
+                    and isinstance(envelope.get("response"), dict)
+                ):
+                    return envelope["response"]
+            except (OSError, TypeError, ValueError):
+                # Legacy, malformed, or unverifiable entries are cache misses.
+                pass
 
     last_err = None
     for attempt in range(max_retries):
@@ -69,8 +125,7 @@ def _get_json(
             if r.status_code == 200:
                 data = r.json()
                 if cache_key:
-                    with open(_cache_path(cache_dir, cache_key), "w") as f:
-                        json.dump(data, f)
+                    _write_cache(cp, request_identity, data)
                 return data
             last_err = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
         except Exception as e:
@@ -378,7 +433,7 @@ def build_molecule_table(
             **kwargs,
         )
         diagnostics.append(info)
-        rows.append(_resolved_row(label, query, prop, info))
+        rows.append(_resolved_row(label, info.get("query", query), prop, info))
 
     return pd.DataFrame(rows, columns=MOLECULE_TABLE_COLUMNS), pd.DataFrame(diagnostics)
 

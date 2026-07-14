@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import numbers
 import os
 import re
 import tempfile
@@ -21,7 +22,7 @@ from typing import Any
 
 import pandas as pd
 
-from .utils import pipeline_provenance, sanitize_basename
+from .utils import parse_strict_bool, pipeline_provenance, sanitize_basename
 
 
 MANIFEST_SCHEMA = "2.0"
@@ -45,6 +46,50 @@ _GAUSSIAN_CONFIG_KEYS = {
 _SLURM_CONFIG_KEYS = {
     "account", "cpus", "mem", "time", "template_sha256",
 }
+_CONFORMER_RECORD_FIELDS = {
+    "conformer_record_id",
+    "conformer_id",
+    "method",
+    "seed",
+    "n_generate",
+    "n_generated",
+    "top_n",
+    "n_kept",
+    "rmsd_prune",
+    "relative_energy_kcalmol",
+    "converged",
+    "xyz_artifact_id",
+}
+
+
+def _require_nonblank_text(record: dict, field: str, *, label: str) -> str:
+    value = record[field]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} {field} must be a nonblank string.")
+    return value
+
+
+def _require_integer(
+    record: dict, field: str, *, label: str, minimum: int | None = None
+) -> int:
+    value = record[field]
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise ValueError(f"{label} {field} must be an integer, not {value!r}.")
+    integer = int(value)
+    if minimum is not None and integer < minimum:
+        constraint = "nonnegative" if minimum == 0 else f">= {minimum}"
+        raise ValueError(f"{label} {field} must be {constraint}.")
+    return integer
+
+
+def _require_finite_number(record: dict, field: str, *, label: str) -> float:
+    value = record[field]
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{label} {field} must be a finite number, not {value!r}.")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError(f"{label} {field} must be a finite number.")
+    return numeric
 
 
 def _require_link1_checkpoint_reads(route_freq: str) -> None:
@@ -480,7 +525,69 @@ def validate_manifest(manifest: dict) -> None:
         if molecule["molecule_identity_hash"] != expected_identity:
             raise ValueError("Manifest molecule identity hash mismatch.")
         molecule_conformers = molecule["conformers"]
-        conformer_ids = [record.get("conformer_id") for record in molecule_conformers]
+        if not isinstance(molecule_conformers, list):
+            raise ValueError("Manifest molecule conformers must be a list.")
+        for record in molecule_conformers:
+            if not isinstance(record, dict):
+                raise ValueError("Manifest conformer record must be a dictionary.")
+            missing_fields = sorted(_CONFORMER_RECORD_FIELDS - set(record))
+            if missing_fields:
+                raise ValueError(
+                    "Manifest conformer record is missing field(s): "
+                    + ", ".join(missing_fields)
+                )
+            label = f"Manifest conformer {record.get('conformer_record_id')!r}"
+            _require_nonblank_text(record, "conformer_record_id", label=label)
+            _require_nonblank_text(record, "method", label=label)
+            _require_nonblank_text(record, "xyz_artifact_id", label=label)
+            integer_values = {
+                field: _require_integer(
+                    record,
+                    field,
+                    label=label,
+                    minimum=None if field == "seed" else 0,
+                )
+                for field in (
+                    "conformer_id", "seed", "n_generate", "n_generated",
+                    "top_n", "n_kept",
+                )
+            }
+            if integer_values["n_generated"] > integer_values["n_generate"]:
+                raise ValueError(
+                    f"{label} n_generated must not exceed n_generate."
+                )
+            if integer_values["n_kept"] > integer_values["n_generated"]:
+                raise ValueError(f"{label} n_kept must not exceed n_generated.")
+            rmsd_prune = _require_finite_number(
+                record, "rmsd_prune", label=label
+            )
+            if rmsd_prune < 0:
+                raise ValueError(f"{label} rmsd_prune must be nonnegative.")
+            _require_finite_number(
+                record, "relative_energy_kcalmol", label=label
+            )
+            parse_strict_bool(
+                record["converged"], field_name=f"{label} converged"
+            )
+            if not isinstance(record["converged"], bool):
+                raise ValueError(f"{label} converged must be a JSON boolean.")
+            conformer_config = configuration["conformer"]
+            for field in ("seed", "n_generate", "top_n"):
+                if integer_values[field] != conformer_config[field]:
+                    raise ValueError(
+                        f"{label} {field} disagrees with configuration.conformer."
+                    )
+            if not math.isclose(
+                rmsd_prune,
+                float(conformer_config["rmsd_prune"]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    f"{label} rmsd_prune disagrees with configuration.conformer."
+                )
+
+        conformer_ids = [record["conformer_id"] for record in molecule_conformers]
         if len(conformer_ids) != len(set(conformer_ids)):
             raise ValueError(
                 f"Duplicate conformer record for molecule {molecule['molecule_name']!r}."
@@ -549,6 +656,36 @@ def validate_manifest(manifest: dict) -> None:
             if parent_record.get("conformer_record_id") != conformer_record_id:
                 raise ValueError("Artifact parent and child disagree on conformer lineage.")
 
+    xyz_artifacts = [artifact for artifact in artifacts if artifact["kind"] == "xyz"]
+    xyz_by_id = {artifact["artifact_id"]: artifact for artifact in xyz_artifacts}
+    referenced_xyz_ids = []
+    for conformer in conformers:
+        xyz_artifact_id = conformer["xyz_artifact_id"]
+        xyz_artifact = xyz_by_id.get(xyz_artifact_id)
+        if xyz_artifact is None:
+            referenced = artifacts_by_id.get(xyz_artifact_id)
+            if referenced is not None:
+                raise ValueError(
+                    "Manifest conformer xyz_artifact_id must reference an XYZ artifact."
+                )
+            raise ValueError(
+                f"Manifest conformer XYZ artifact does not exist: {xyz_artifact_id!r}."
+            )
+        if xyz_artifact.get("conformer_record_id") != conformer["conformer_record_id"]:
+            raise ValueError("Manifest conformer and XYZ artifact lineage disagree.")
+        referenced_xyz_ids.append(xyz_artifact_id)
+
+    if len(referenced_xyz_ids) != len(set(referenced_xyz_ids)):
+        raise ValueError("Multiple conformers reference the same XYZ artifact.")
+    xyz_conformer_ids = [
+        artifact.get("conformer_record_id") for artifact in xyz_artifacts
+    ]
+    if len(xyz_conformer_ids) != len(set(xyz_conformer_ids)):
+        raise ValueError("One conformer is represented by multiple XYZ artifacts.")
+    orphan_xyz_ids = sorted(set(xyz_by_id) - set(referenced_xyz_ids))
+    if orphan_xyz_ids:
+        raise ValueError(f"Manifest contains orphan XYZ artifact(s): {orphan_xyz_ids}")
+
 
 def write_manifest(path: str, manifest: dict) -> None:
     """Validate and atomically write canonical, human-readable manifest JSON."""
@@ -606,7 +743,14 @@ def artifact_abspath(manifest_path: str, relative_path: str) -> str:
     # otherwise a stored path (relative to the resolved root) would round-trip
     # against an unresolved root under a symlinked package.
     package_root = os.path.realpath(os.path.dirname(os.path.abspath(manifest_path)))
-    return os.path.realpath(os.path.join(package_root, relative_path))
+    candidate = os.path.realpath(os.path.join(package_root, relative_path))
+    try:
+        common = os.path.commonpath((package_root, candidate))
+    except ValueError as exc:
+        raise ValueError("Artifact path is not within the run package.") from exc
+    if common != package_root:
+        raise ValueError("Artifact path must stay inside the run package.")
+    return candidate
 
 
 def find_artifact(manifest: dict, artifact_id: str) -> dict:
@@ -699,6 +843,9 @@ def record_conformer_xyz(
     artifact_id: str,
 ) -> tuple[str, str]:
     """Record one complete conformer row and its already-written XYZ artifact."""
+    converged_value = parse_strict_bool(
+        converged, field_name=f"Conformer {conformer_id!r} converged"
+    )
     manifest = load_manifest(manifest_path)
     molecule = _find_molecule(manifest, name, cid, smiles)
     config = manifest["configuration"]["conformer"]
@@ -730,7 +877,7 @@ def record_conformer_xyz(
         "n_kept": int(n_kept),
         "rmsd_prune": float(config["rmsd_prune"]),
         "relative_energy_kcalmol": float(relative_energy_kcalmol),
-        "converged": bool(converged),
+        "converged": converged_value,
         "xyz_artifact_id": artifact_id,
     }
     molecule["conformers"].append(record)
