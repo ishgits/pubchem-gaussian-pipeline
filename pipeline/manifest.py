@@ -887,18 +887,28 @@ def record_conformer_group(
     cid,
     smiles: str,
     conformers: list[dict],
+    conformer_log_path: str | None = None,
+    staged_conformer_log_path: str | None = None,
 ) -> list[tuple[str, str]]:
-    """Replace one molecule's complete conformer lineage in one transaction.
+    """Replace one molecule's complete conformer package in one transaction.
 
     Each item supplies the final ``xyz_path`` and may supply a distinct
     ``staged_xyz_path``.  The complete candidate manifest is built and validated
-    before staged files replace their final paths.  Ordinary file-placement or
-    manifest-write exceptions restore prior XYZ bytes and leave the prior
-    manifest unchanged.  This is not a journaled crash transaction across
-    multiple filesystem operations.
+    before staged files replace their final paths.  When both conformer-log
+    paths are supplied, the staged CSV must index exactly the candidate
+    manifest's XYZ artifact IDs and is published in the same rollback-capable
+    transaction.  Ordinary file-placement, CSV-replacement, or manifest-write
+    exceptions restore prior XYZ/log bytes and leave the prior manifest
+    unchanged.  This is not a journaled crash transaction across multiple
+    filesystem operations.
     """
     if not conformers:
         raise ValueError("A conformer group must contain at least one record.")
+    if (conformer_log_path is None) != (staged_conformer_log_path is None):
+        raise ValueError(
+            "conformer_log_path and staged_conformer_log_path must be supplied "
+            "together."
+        )
 
     manifest = load_manifest(manifest_path)
     molecule = _find_molecule(manifest, name, cid, smiles)
@@ -1098,6 +1108,81 @@ def record_conformer_group(
         cleanup_staging()
         raise
 
+    if conformer_log_path is not None:
+        try:
+            final_log_path = os.path.realpath(os.fspath(conformer_log_path))
+            staged_log_path = os.path.realpath(
+                os.fspath(staged_conformer_log_path)
+            )
+        except TypeError as exc:
+            cleanup_staging()
+            raise ValueError(
+                "Conformer log paths must be filesystem paths."
+            ) from exc
+        if not os.path.isfile(staged_log_path) or os.path.getsize(staged_log_path) == 0:
+            cleanup_staging()
+            raise ValueError(
+                "Staged conformer log is missing, irregular, or empty: "
+                f"{staged_log_path!r}."
+            )
+        try:
+            relative_artifact_path(final_log_path, manifest_path)
+            relative_artifact_path(staged_log_path, manifest_path)
+            staged_log = pd.read_csv(staged_log_path)
+        except Exception:
+            cleanup_staging()
+            raise
+        if "artifact_id" not in staged_log.columns:
+            cleanup_staging()
+            raise ValueError("Staged conformer log is missing artifact_id.")
+        observed_ids = [str(value) for value in staged_log["artifact_id"].tolist()]
+        if len(observed_ids) != len(set(observed_ids)):
+            cleanup_staging()
+            raise ValueError("Staged conformer log contains duplicate artifact IDs.")
+        expected_ids = {
+            artifact["artifact_id"]
+            for artifact in candidate["artifacts"]
+            if artifact["kind"] == "xyz"
+        }
+        if set(observed_ids) != expected_ids:
+            cleanup_staging()
+            raise ValueError(
+                "Staged conformer log artifact IDs do not exactly match the "
+                "candidate manifest XYZ artifact IDs."
+            )
+
+        staged_key = os.path.normcase(staged_log_path)
+        final_key = os.path.normcase(final_log_path)
+        manifest_key = os.path.normcase(os.path.realpath(manifest_path))
+        if staged_key == manifest_key or final_key == manifest_key:
+            cleanup_staging()
+            raise ValueError("Conformer log paths cannot replace the run manifest.")
+        if staged_key in seen_staged_paths:
+            cleanup_staging()
+            raise ValueError(
+                "Staged conformer log collides with a staged XYZ source."
+            )
+        if final_key in seen_staged_paths and final_key != staged_key:
+            cleanup_staging()
+            raise ValueError(
+                "Conformer log destination collides with a staged XYZ source."
+            )
+        if final_key in final_keys:
+            cleanup_staging()
+            raise ValueError(
+                "Conformer log destination collides with an XYZ destination."
+            )
+        if staged_key != final_key and staged_key in final_keys:
+            cleanup_staging()
+            raise ValueError(
+                "Staged conformer log collides with an XYZ destination."
+            )
+        staged_inputs.append((staged_log_path, final_log_path))
+        seen_staged_paths.add(staged_key)
+        final_keys.add(final_key)
+        if os.path.abspath(staged_log_path) != os.path.abspath(final_log_path):
+            placements.append((staged_log_path, final_log_path))
+
     backups = []
     placed = []
     try:
@@ -1137,7 +1222,7 @@ def record_conformer_group(
         cleanup_staging()
         if rollback_errors:
             raise RuntimeError(
-                "Conformer publication failed and XYZ rollback was incomplete."
+                "Conformer publication failed and package rollback was incomplete."
             ) from exc
         raise
     else:

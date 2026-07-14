@@ -1013,6 +1013,33 @@ class TestResumeConfigValidationBatch:
         )
         return kw
 
+    @staticmethod
+    def _package_snapshot(kw):
+        xyz_dir = kw["xyz_dir"]
+        return {
+            "manifest": open(kw["manifest_path"], "rb").read(),
+            "log": open(kw["log_csv"], "rb").read(),
+            "xyz": {
+                os.path.join(xyz_dir, name): open(
+                    os.path.join(xyz_dir, name), "rb"
+                ).read()
+                for name in os.listdir(xyz_dir)
+                if name.endswith(".xyz")
+            },
+        }
+
+    @staticmethod
+    def _assert_package_snapshot(kw, snapshot):
+        assert open(kw["manifest_path"], "rb").read() == snapshot["manifest"]
+        assert open(kw["log_csv"], "rb").read() == snapshot["log"]
+        assert {
+            os.path.join(kw["xyz_dir"], name): open(
+                os.path.join(kw["xyz_dir"], name), "rb"
+            ).read()
+            for name in os.listdir(kw["xyz_dir"])
+            if name.endswith(".xyz")
+        } == snapshot["xyz"]
+
     def test_matching_config_skips_regeneration(self, tmp_path, monkeypatch):
         calls = []
         C = self._patch(monkeypatch, calls)
@@ -1183,6 +1210,7 @@ class TestResumeConfigValidationBatch:
         first = C.search_conformers(self._table(), **kw)
         assert len(first) == 3
         manifest_before = open(kw["manifest_path"], "rb").read()
+        log_before = open(kw["log_csv"], "rb").read()
         xyz_before = {
             path: open(path, "rb").read() for path in first["xyz_path"]
         }
@@ -1203,14 +1231,192 @@ class TestResumeConfigValidationBatch:
         monkeypatch.setattr(C, "_write_xyz", fail_second)
         second = C.search_conformers(self._table(), **kw)
 
-        assert second.empty
+        assert len(second) == 3
         assert open(kw["manifest_path"], "rb").read() == manifest_before
+        assert open(kw["log_csv"], "rb").read() == log_before
         for path, expected in xyz_before.items():
             assert open(path, "rb").read() == expected
         assert not any(
             name.startswith(".staging-") for name in os.listdir(kw["xyz_dir"])
         )
         assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
+
+    def test_candidate_log_staging_failure_preserves_complete_package(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        kw = self._kw(tmp_path)
+        first = C.search_conformers(self._table(), **kw)
+        snapshot = self._package_snapshot(kw)
+
+        # Force a replacement attempt while leaving the committed package valid.
+        monkeypatch.setattr(C, "_row_config_matches", lambda *_args: False)
+        real_to_csv = pd.DataFrame.to_csv
+
+        def fail_candidate_stage(frame, path, *args, **kwargs):
+            if os.path.basename(os.fspath(path)).startswith(".conformer_log."):
+                raise OSError("simulated conformer-log staging failure")
+            return real_to_csv(frame, path, *args, **kwargs)
+
+        monkeypatch.setattr(pd.DataFrame, "to_csv", fail_candidate_stage)
+        second = C.search_conformers(self._table(), **kw)
+
+        self._assert_package_snapshot(kw, snapshot)
+        assert list(second["artifact_id"]) == list(first["artifact_id"])
+        assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
+        assert not any(
+            name.startswith(".conformer_log.")
+            for name in os.listdir(tmp_path)
+        )
+
+    def test_candidate_log_replacement_failure_rolls_back_xyz_and_log(
+        self, tmp_path, monkeypatch
+    ):
+        import pipeline.manifest as manifest_module
+
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        kw = self._kw(tmp_path)
+        first = C.search_conformers(self._table(), **kw)
+        snapshot = self._package_snapshot(kw)
+        monkeypatch.setattr(C, "_row_config_matches", lambda *_args: False)
+
+        real_replace = os.replace
+        failed = False
+
+        def fail_log_replace(source, destination):
+            nonlocal failed
+            source_text = os.fspath(source)
+            if (
+                not failed
+                and os.path.realpath(os.fspath(destination))
+                == os.path.realpath(kw["log_csv"])
+                and os.path.basename(source_text).startswith(".conformer_log.")
+                and ".backup-" not in source_text
+            ):
+                failed = True
+                raise OSError("simulated conformer-log replacement failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(manifest_module.os, "replace", fail_log_replace)
+        second = C.search_conformers(self._table(), **kw)
+
+        assert failed is True
+        self._assert_package_snapshot(kw, snapshot)
+        assert list(second["artifact_id"]) == list(first["artifact_id"])
+        assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
+        assert not any(".backup-" in name for name in os.listdir(tmp_path))
+
+    def test_manifest_write_failure_rolls_back_xyz_and_log(
+        self, tmp_path, monkeypatch
+    ):
+        import pipeline.manifest as manifest_module
+
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        kw = self._kw(tmp_path)
+        first = C.search_conformers(self._table(), **kw)
+        snapshot = self._package_snapshot(kw)
+        monkeypatch.setattr(C, "_row_config_matches", lambda *_args: False)
+        monkeypatch.setattr(
+            manifest_module,
+            "write_manifest",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("simulated manifest write failure")
+            ),
+        )
+
+        second = C.search_conformers(self._table(), **kw)
+
+        self._assert_package_snapshot(kw, snapshot)
+        assert list(second["artifact_id"]) == list(first["artifact_id"])
+        assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
+
+    def test_xyz_placement_failure_rolls_back_complete_package(
+        self, tmp_path, monkeypatch
+    ):
+        import pipeline.manifest as manifest_module
+
+        calls = []
+        C = self._patch(monkeypatch, calls)
+
+        def gen_three(smiles, **kw):
+            calls.append(smiles)
+            coords = [[("O", float(i), 0.0, 0.0)] for i in range(3)]
+            return coords, [0.0, 0.5, 1.0], "MMFF94", [True, True, True]
+
+        monkeypatch.setattr(C, "generate_conformers", gen_three)
+        kw = self._kw(tmp_path)
+        first = C.search_conformers(self._table(), **kw)
+        snapshot = self._package_snapshot(kw)
+        monkeypatch.setattr(C, "_row_config_matches", lambda *_args: False)
+
+        real_replace = os.replace
+        staged_moves = 0
+
+        def fail_second_xyz_placement(source, destination):
+            nonlocal staged_moves
+            source_text = os.fspath(source)
+            if os.path.basename(os.path.dirname(source_text)).startswith(
+                ".staging-"
+            ) and source_text.endswith(".xyz"):
+                staged_moves += 1
+                if staged_moves == 2:
+                    raise OSError("simulated XYZ placement failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(
+            manifest_module.os, "replace", fail_second_xyz_placement
+        )
+        second = C.search_conformers(self._table(), **kw)
+
+        self._assert_package_snapshot(kw, snapshot)
+        assert list(second["artifact_id"]) == list(first["artifact_id"])
+        assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
+
+    def test_successful_smaller_group_keeps_manifest_log_ids_exact(
+        self, tmp_path, monkeypatch
+    ):
+        from pipeline.manifest import load_manifest
+
+        calls = []
+        C = self._patch(monkeypatch, calls)
+
+        def gen_three(smiles, **kw):
+            calls.append(smiles)
+            coords = [[("O", float(i), 0.0, 0.0)] for i in range(3)]
+            return coords, [0.0, 0.5, 1.0], "MMFF94", [True, True, True]
+
+        monkeypatch.setattr(C, "generate_conformers", gen_three)
+        kw = self._kw(tmp_path)
+        first = C.search_conformers(self._table(), **kw)
+        old_paths = list(first["xyz_path"])
+
+        monkeypatch.setattr(C, "_row_config_matches", lambda *_args: False)
+        monkeypatch.setattr(
+            C,
+            "generate_conformers",
+            lambda smiles, **_kw: (
+                [[("O", 9.0, 0.0, 0.0)]],
+                [0.0],
+                "MMFF94",
+                [True],
+            ),
+        )
+        second = C.search_conformers(self._table(), **kw)
+
+        manifest = load_manifest(kw["manifest_path"])
+        manifest_ids = {
+            artifact["artifact_id"]
+            for artifact in manifest["artifacts"]
+            if artifact["kind"] == "xyz"
+        }
+        assert len(second) == 1
+        assert set(second["artifact_id"]) == manifest_ids
+        assert os.path.exists(old_paths[0])
+        assert not os.path.exists(old_paths[1])
+        assert not os.path.exists(old_paths[2])
 
 
 class TestPreserveUnrequestedBatch:

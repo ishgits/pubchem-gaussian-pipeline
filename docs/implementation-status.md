@@ -209,6 +209,24 @@ its resolved target, leaving the authoritative hash attached to old bytes. The
 publisher now moves staged bytes to the same resolved in-package target used by
 manifest path validation, preserving the internal symlink and verified lineage.
 
+**M-38 — Resolved.** The post-M-37 review found that molecule-group publication
+was atomic only across XYZ files and `run_manifest.json`; the stage rewrote
+`conformer_log.csv` separately after all group attempts. A caught staged-write
+or publication failure could therefore retain the prior complete ensemble in
+the manifest while publishing an empty/subset CSV, and a final CSV-write failure
+could leave newly committed manifest/XYZ state without its required subordinate
+index. `record_conformer_group()` now accepts a staged complete conformer log,
+requires its artifact-ID set to equal the complete candidate manifest XYZ set,
+and publishes the CSV through the same backup/placement/rollback path as the XYZ
+ensemble and manifest. `search_conformers()` reconstructs canonical log rows
+from manifest authority, repairs a stale/missing subordinate index atomically
+when the existing XYZ package verifies, stages the complete candidate log for
+each group, and returns only the committed on-disk log state. Ordinary staged
+CSV write, CSV replacement, XYZ placement, and manifest-write failures preserve
+the previous complete manifest/XYZ/log package. Successful smaller-group
+replacement removes obsolete XYZ files and leaves exact manifest/log XYZ
+artifact-ID equality.
+
 No known local frozen-contract Blocker or Major remains. This exact patched head
 has received a final local holistic re-review; remote CI and Ish's human merge
 decision remain required.
@@ -244,12 +262,16 @@ pytest 9.1.1
 Current local results:
 
 ```text
-pytest tests/ -q: 407 passed
+pytest tests/ -q: 412 passed
 python scripts/check_invariants.py: passed
 Python compilation: passed
 notebook JSON validation: passed
-clean `git archive`: 407 passed; invariant checks and compilation passed
+clean `git archive`: 412 passed; invariant checks and compilation passed
 ```
+
+The M-38 remediation and clean-archive verification were run on CPython 3.13.5
+with pandas 2.2.3, requests 2.32.5, RDKit 2025.09.4, and pytest 9.0.2. This was
+not an independent rerun of the pinned Python 3.12 release-target environment.
 
 The M-35 through M-37 verification used the pinned dependency versions listed above on
 CPython 3.12.10.

@@ -31,6 +31,7 @@ import tempfile
 import pandas as pd
 
 from .manifest import (
+    artifact_abspath,
     assert_stage_configuration,
     find_artifact,
     find_conformer_record,
@@ -38,7 +39,6 @@ from .manifest import (
     molecule_identity_hash,
     record_conformer_group,
     relative_artifact_path,
-    remove_conformer_lineage,
     sha256_file,
     stable_record_id,
 )
@@ -415,6 +415,136 @@ _LOG_COLUMNS = [
     "rmsd_prune",
     "converged",
 ]
+
+
+def _manifest_conformer_log_rows(
+    manifest_path: str,
+    manifest: dict | None = None,
+    *,
+    verify_xyz: bool = False,
+) -> list[dict]:
+    """Reconstruct the canonical conformer-log rows from manifest authority.
+
+    The CSV is a subordinate index, so every field that overlaps manifest
+    authority is derived from the manifest rather than copied from a possibly
+    stale prior CSV.  ``verify_xyz=True`` additionally requires every recorded
+    XYZ to exist as a nonempty regular file whose bytes match the manifest.
+    """
+    manifest = manifest or load_manifest(manifest_path)
+    artifacts = {
+        artifact["artifact_id"]: artifact
+        for artifact in manifest["artifacts"]
+        if artifact["kind"] == "xyz"
+    }
+    rows = []
+    for molecule in manifest["molecules"]:
+        for conformer in sorted(
+            molecule["conformers"], key=lambda record: record["conformer_id"]
+        ):
+            artifact_id = conformer["xyz_artifact_id"]
+            artifact = artifacts.get(artifact_id)
+            if artifact is None:
+                raise ValueError(
+                    f"Manifest conformer is missing XYZ artifact {artifact_id!r}."
+                )
+            xyz_path = artifact_abspath(manifest_path, artifact["relative_path"])
+            if verify_xyz:
+                if not os.path.isfile(xyz_path) or os.path.getsize(xyz_path) == 0:
+                    raise ValueError(
+                        f"Manifest XYZ is missing, irregular, or empty: {xyz_path!r}."
+                    )
+                if sha256_file(xyz_path) != artifact["sha256"]:
+                    raise ValueError(
+                        f"Manifest XYZ hash mismatch: {artifact_id!r}."
+                    )
+            rows.append({
+                "run_id": manifest["run_id"],
+                "artifact_id": artifact_id,
+                "config_hash": manifest["config_hash"],
+                "name": molecule["molecule_name"],
+                "cid": molecule["CID"],
+                "smiles": molecule["IsomericSMILES"],
+                "conformer_id": conformer["conformer_id"],
+                "rel_energy_kcalmol": conformer["relative_energy_kcalmol"],
+                "xyz_path": xyz_path,
+                "xyz_sha256": artifact["sha256"],
+                "rdkit_version": manifest["rdkit_version"],
+                "pipeline_version": manifest["pipeline_version"],
+                "pipeline_commit": manifest["pipeline_commit"],
+                "seed": conformer["seed"],
+                "n_generate": conformer["n_generate"],
+                "top_n": conformer["top_n"],
+                "method": conformer["method"],
+                "n_generated": conformer["n_generated"],
+                "n_kept": conformer["n_kept"],
+                "rmsd_prune": conformer["rmsd_prune"],
+                "converged": conformer["converged"],
+            })
+    return rows
+
+
+def _stage_conformer_log(rows: list[dict], log_csv: str) -> str:
+    """Write a complete candidate conformer log to a same-package temp file."""
+    parent = os.path.dirname(os.path.abspath(log_csv))
+    os.makedirs(parent, exist_ok=True)
+    fd, staged_path = tempfile.mkstemp(
+        prefix=".conformer_log.", suffix=".csv", dir=parent
+    )
+    os.close(fd)
+    try:
+        pd.DataFrame(rows, columns=_LOG_COLUMNS).to_csv(staged_path, index=False)
+        if not os.path.isfile(staged_path) or os.path.getsize(staged_path) == 0:
+            raise OSError("Staged conformer log was not written completely.")
+    except Exception:
+        try:
+            os.unlink(staged_path)
+        except OSError:
+            pass
+        raise
+    return staged_path
+
+
+def _write_conformer_log_atomically(rows: list[dict], log_csv: str) -> None:
+    """Atomically replace the subordinate conformer index without touching manifest."""
+    staged_path = _stage_conformer_log(rows, log_csv)
+    try:
+        os.replace(staged_path, log_csv)
+    except Exception:
+        try:
+            os.unlink(staged_path)
+        except OSError:
+            pass
+        raise
+
+
+def _conformer_log_matches_rows(log_csv: str, rows: list[dict]) -> bool:
+    """Return whether an existing CSV semantically matches canonical rows."""
+    if not os.path.isfile(log_csv):
+        return False
+    try:
+        actual = pd.read_csv(log_csv)
+        if list(actual.columns) != _LOG_COLUMNS:
+            return False
+        expected = pd.DataFrame(rows, columns=_LOG_COLUMNS)
+        actual["pipeline_commit"] = actual["pipeline_commit"].fillna("").astype(str)
+        expected["pipeline_commit"] = (
+            expected["pipeline_commit"].fillna("").astype(str)
+        )
+        sort_columns = ["artifact_id"] if len(expected) else []
+        if sort_columns:
+            actual = actual.sort_values(sort_columns).reset_index(drop=True)
+            expected = expected.sort_values(sort_columns).reset_index(drop=True)
+        pd.testing.assert_frame_equal(
+            actual,
+            expected,
+            check_dtype=False,
+            check_exact=False,
+            rtol=0.0,
+            atol=1e-12,
+        )
+    except (AssertionError, OSError, ValueError, TypeError):
+        return False
+    return True
 
 # Recorded fields that define a run's conformer-search configuration. A resumed
 # molecule may be skipped ONLY if its existing rows were produced with the same
@@ -1011,6 +1141,23 @@ def search_conformers(
     relative_artifact_path(xyz_dir, manifest_path)
     relative_artifact_path(log_csv, manifest_path)
 
+    # The manifest is authoritative and contains enough information to rebuild
+    # the complete subordinate conformer index.  Repair a missing/stale CSV
+    # atomically before generation when every currently published XYZ still
+    # verifies.  Resume decisions above intentionally remain based on the input
+    # CSV, so a damaged log still triggers the requested regeneration; the
+    # repaired canonical log is the rollback state if that regeneration fails.
+    try:
+        canonical_rows = _manifest_conformer_log_rows(
+            manifest_path, manifest, verify_xyz=True
+        )
+    except (OSError, ValueError):
+        canonical_rows = None
+    if canonical_rows is not None and not _conformer_log_matches_rows(
+        log_csv, canonical_rows
+    ):
+        _write_conformer_log_atomically(canonical_rows, log_csv)
+
     # All append validation above is intentionally complete before the first
     # output mutation (M-15). An invalid retained group must leave the prior log,
     # XYZ files, and failure log byte-for-byte unchanged.
@@ -1040,7 +1187,6 @@ def search_conformers(
         # than let RDKit auto-assign stereo or embed an empty/unparseable SMILES.
         skip_reason = check_conformer_eligibility(smiles)
         if skip_reason is not None:
-            remove_conformer_lineage(manifest_path, {str(name)})
             failed.append({
                 "name": name,
                 "cid": cid,
@@ -1057,7 +1203,6 @@ def search_conformers(
                 seed=seed,
             )
         except Exception as e:  # noqa: BLE001 — log and continue, never crash the batch
-            remove_conformer_lineage(manifest_path, {str(name)})
             failed.append({
                 "name": name,
                 "cid": cid,
@@ -1084,6 +1229,7 @@ def search_conformers(
         base = sanitize_basename(str(name))
 
         staging_dir = tempfile.mkdtemp(prefix=f".staging-{base}-", dir=xyz_dir)
+        staged_log_path = None
         group_payload = []
         group_log_rows = []
         try:
@@ -1146,12 +1292,46 @@ def search_conformers(
                     "converged": is_converged,
                 })
 
+            for expected, log_row in zip(group_payload, group_log_rows):
+                log_row["xyz_sha256"] = sha256_file(
+                    expected["staged_xyz_path"]
+                )
+
+            # Build the complete candidate subordinate index from current
+            # manifest authority, replacing only this molecule's rows.  This
+            # prevents a caught group failure from publishing a partial CSV and
+            # guarantees the staged log indexes the complete candidate manifest.
+            current_manifest = load_manifest(manifest_path)
+            candidate_log_rows = [
+                row
+                for row in _manifest_conformer_log_rows(
+                    manifest_path, current_manifest, verify_xyz=False
+                )
+                if row["name"] != str(name)
+            ]
+            candidate_log_rows.extend(group_log_rows)
+            molecule_order = {
+                molecule["molecule_name"]: index
+                for index, molecule in enumerate(current_manifest["molecules"])
+            }
+            candidate_log_rows.sort(
+                key=lambda item: (
+                    molecule_order.get(str(item["name"]), len(molecule_order)),
+                    int(item["conformer_id"]),
+                )
+            )
+            staged_log_path = _stage_conformer_log(
+                candidate_log_rows, log_csv
+            )
+
             recorded = record_conformer_group(
                 manifest_path,
                 name=str(name),
                 cid=cid,
                 smiles=str(smiles),
                 conformers=group_payload,
+                conformer_log_path=log_csv,
+                staged_conformer_log_path=staged_log_path,
             )
             for expected, result, log_row in zip(
                 group_payload, recorded, group_log_rows
@@ -1167,7 +1347,10 @@ def search_conformers(
                     raise ValueError(
                         "Manifest conformer ID changed during group recording."
                     )
-                log_row["xyz_sha256"] = xyz_digest
+                if log_row["xyz_sha256"] != xyz_digest:
+                    raise ValueError(
+                        "Manifest XYZ digest changed during group recording."
+                    )
             log_rows.extend(group_log_rows)
         except Exception as e:  # noqa: BLE001 — record publication failure and continue
             failed.append({
@@ -1177,10 +1360,25 @@ def search_conformers(
                 "error": repr(e),
             })
         finally:
+            if staged_log_path is not None:
+                try:
+                    os.unlink(staged_log_path)
+                except OSError:
+                    pass
             shutil.rmtree(staging_dir, ignore_errors=True)
 
-    out_df = pd.DataFrame(log_rows, columns=_LOG_COLUMNS)
-    out_df.to_csv(log_csv, index=False)
+    # Return the committed package state, never the in-memory rows from attempted
+    # publications.  Each successful group transaction has already replaced the
+    # complete log; each failed transaction left the prior complete log intact.
+    if os.path.isfile(log_csv):
+        out_df = pd.read_csv(log_csv)
+        if list(out_df.columns) != _LOG_COLUMNS:
+            raise ValueError("Committed conformer log has an unexpected schema.")
+        out_df["pipeline_commit"] = (
+            out_df["pipeline_commit"].fillna("").astype(str)
+        )
+    else:
+        out_df = pd.DataFrame(columns=_LOG_COLUMNS)
 
     if failed:
         pd.DataFrame(failed).to_csv(failed_csv, index=False)
