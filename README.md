@@ -213,7 +213,7 @@ See `requirements-lock.txt` for the pinned v2.0.0 release-target stack and its r
 
 If you use this workflow or any part of the dataset in your research, please cite:
 
-Ishaan Madan. (2026). ishgits/pubchem-gaussian-pipeline: v1.1 – Initial Release (v1.1). Zenodo. https://doi.org/10.5281/zenodo.18894724
+Ishaan Madan. (2026). ishgits/pubchem-gaussian-pipeline: v2.1.0 — Immutable Run Packages and Provenance Hardening (Version v2.1.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21365151
 
 ## License
 
