@@ -24,7 +24,7 @@ The v1.1 path (PubChem 3D SDF → Open Babel XYZ, via ``download_sdfs`` /
 # best-effort git commit so two runs from different revisions are
 # distinguishable; changing this string deliberately changes the
 # pipeline_version stamped into provenance logs going forward.
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 from .pubchem import (
     build_molecule_table,
