@@ -1,5 +1,6 @@
 """Tests for pipeline.gaussian"""
 
+import json
 import os
 import sys
 import tempfile
@@ -870,6 +871,64 @@ class TestConvergencePreflight:
         assert com_log.read_bytes() == log_before
         assert failure_log.read_bytes() == b"prior failure\n"
         for path, expected in com_bytes.items():
+            assert path.read_bytes() == expected
+
+
+class TestCompleteManifestGroupPreflight:
+    def test_truncated_manifest_group_fails_before_com_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        conformer_log, manifest_path = write_linked_conformer_log(
+            tmp_path,
+            [
+                {"name": "Seed", "conformer_id": conformer_id}
+                for conformer_id in range(3)
+            ],
+            SAMPLE_XYZ,
+        )
+        outdir = tmp_path / "gaussian_inputs"
+        com_log = tmp_path / "com_write_log.csv"
+        first = write_gaussian_coms_from_conformers(
+            conformer_log,
+            outdir=str(outdir),
+            log_csv=str(com_log),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            manifest_path=manifest_path,
+        )
+        failure_log = tmp_path / "com_write_failed.csv"
+        failure_log.write_bytes(b"prior failure\n")
+        com_before = {
+            Path(path): Path(path).read_bytes() for path in first["com_path"]
+        }
+        log_before = com_log.read_bytes()
+
+        manifest_file = Path(manifest_path)
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        manifest["molecules"][0]["conformers"] = manifest["molecules"][0][
+            "conformers"
+        ][:1]
+        manifest_file.write_text(
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        damaged_manifest = manifest_file.read_bytes()
+
+        with pytest.raises(ValueError, match="incomplete"):
+            write_gaussian_coms_from_conformers(
+                conformer_log,
+                outdir=str(outdir),
+                log_csv=str(com_log),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                manifest_path=manifest_path,
+            )
+
+        assert manifest_file.read_bytes() == damaged_manifest
+        assert com_log.read_bytes() == log_before
+        assert failure_log.read_bytes() == b"prior failure\n"
+        for path, expected in com_before.items():
             assert path.read_bytes() == expected
 
 

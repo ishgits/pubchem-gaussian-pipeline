@@ -1167,6 +1167,51 @@ class TestResumeConfigValidationBatch:
         assert list(second["conformer_id"]) == [0, 1, 2]
         assert set(second["n_kept"].astype(int)) == {3}
 
+    def test_second_staged_xyz_failure_publishes_no_partial_group(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+
+        def gen_three(smiles, **kw):
+            calls.append(smiles)
+            coords = [[("O", float(i), 0.0, 0.0)] for i in range(3)]
+            return coords, [0.0, 0.5, 1.0], "MMFF94", [True, True, True]
+
+        monkeypatch.setattr(C, "generate_conformers", gen_three)
+        kw = self._kw(tmp_path)
+        first = C.search_conformers(self._table(), **kw)
+        assert len(first) == 3
+        manifest_before = open(kw["manifest_path"], "rb").read()
+        xyz_before = {
+            path: open(path, "rb").read() for path in first["xyz_path"]
+        }
+
+        damaged = first.copy()
+        damaged.loc[0, "xyz_sha256"] = "0" * 64
+        damaged.to_csv(kw["log_csv"], index=False)
+        real_write_xyz = C._write_xyz
+        staged_writes = 0
+
+        def fail_second(path, coords, comment=""):
+            nonlocal staged_writes
+            staged_writes += 1
+            if staged_writes == 2:
+                raise OSError("simulated staged XYZ failure")
+            return real_write_xyz(path, coords, comment)
+
+        monkeypatch.setattr(C, "_write_xyz", fail_second)
+        second = C.search_conformers(self._table(), **kw)
+
+        assert second.empty
+        assert open(kw["manifest_path"], "rb").read() == manifest_before
+        for path, expected in xyz_before.items():
+            assert open(path, "rb").read() == expected
+        assert not any(
+            name.startswith(".staging-") for name in os.listdir(kw["xyz_dir"])
+        )
+        assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
+
 
 class TestPreserveUnrequestedBatch:
     """M-02 call 2a: the conformer log represents molecules requested this run."""

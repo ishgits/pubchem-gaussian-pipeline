@@ -11,7 +11,7 @@ from pipeline.manifest import create_run_manifest, slurm_template_identity
 from pipeline.manifest import (
     load_manifest,
     molecule_identity_hash,
-    record_conformer_xyz,
+    record_conformer_group,
     record_child_artifact,
     stable_record_id,
 )
@@ -150,62 +150,75 @@ def write_linked_conformer_log(
     source_text = open(sample_xyz, encoding="utf-8").read()
     output_rows = []
     grouped_counts = {}
-    for row in rows:
-        grouped_counts[row.get("name", "Ribose")] = grouped_counts.get(
-            row.get("name", "Ribose"), 0
-        ) + 1
+    grouped_rows = {}
     for row in rows:
         name = row.get("name", "Ribose")
-        cid = row.get("cid", 5779)
-        smiles = row.get("smiles", "C[C@H](O)C")
-        conformer_id = int(row.get("conformer_id", 0))
-        xyz_path = tmp_path / "xyz" / f"{name.lower()}_c{conformer_id:02d}.xyz"
-        xyz_path.parent.mkdir(parents=True, exist_ok=True)
-        xyz_path.write_text(source_text, encoding="utf-8")
-        conformer_record_id = stable_record_id(
-            manifest["run_id"],
-            "conformer",
-            f"{molecule_identity_hash(name, cid, smiles)}:{conformer_id}",
-        )
-        artifact_id = stable_record_id(
-            manifest["run_id"], "xyz", conformer_record_id
-        )
-        recorded_id, digest = record_conformer_xyz(
+        grouped_counts[name] = grouped_counts.get(name, 0) + 1
+        grouped_rows.setdefault(name, []).append(row)
+
+    for name, name_rows in grouped_rows.items():
+        payload = []
+        pending_outputs = []
+        for row in name_rows:
+            cid = row.get("cid", 5779)
+            smiles = row.get("smiles", "C[C@H](O)C")
+            conformer_id = int(row.get("conformer_id", 0))
+            xyz_path = tmp_path / "xyz" / f"{name.lower()}_c{conformer_id:02d}.xyz"
+            xyz_path.parent.mkdir(parents=True, exist_ok=True)
+            xyz_path.write_text(source_text, encoding="utf-8")
+            conformer_record_id = stable_record_id(
+                manifest["run_id"],
+                "conformer",
+                f"{molecule_identity_hash(name, cid, smiles)}:{conformer_id}",
+            )
+            artifact_id = stable_record_id(
+                manifest["run_id"], "xyz", conformer_record_id
+            )
+            payload.append({
+                "conformer_id": conformer_id,
+                "method": row.get("method", "MMFF94"),
+                "n_generated": row.get("n_generated", grouped_counts[name]),
+                "n_kept": row.get("n_kept", grouped_counts[name]),
+                "relative_energy_kcalmol": row.get("rel_energy_kcalmol", 0.0),
+                "converged": row.get("converged", True),
+                "xyz_path": str(xyz_path),
+                "artifact_id": artifact_id,
+            })
+            pending_outputs.append((row, xyz_path, artifact_id))
+
+        recorded = record_conformer_group(
             manifest_path,
             name=name,
-            cid=cid,
-            smiles=smiles,
-            conformer_id=conformer_id,
-            method=row.get("method", "MMFF94"),
-            n_generated=row.get("n_generated", grouped_counts[name]),
-            n_kept=row.get("n_kept", grouped_counts[name]),
-            relative_energy_kcalmol=row.get("rel_energy_kcalmol", 0.0),
-            converged=row.get("converged", True),
-            xyz_path=str(xyz_path),
-            artifact_id=artifact_id,
+            cid=name_rows[0].get("cid", 5779),
+            smiles=name_rows[0].get("smiles", "C[C@H](O)C"),
+            conformers=payload,
         )
-        output = dict(row)
-        output.update({
-            "run_id": manifest["run_id"],
-            "artifact_id": artifact_id,
-            "config_hash": manifest["config_hash"],
-            "name": name,
-            "cid": cid,
-            "smiles": smiles,
-            "conformer_id": conformer_id,
-            "rel_energy_kcalmol": row.get("rel_energy_kcalmol", 0.0),
-            "method": row.get("method", "MMFF94"),
-            "n_generated": row.get("n_generated", grouped_counts[name]),
-            "n_kept": row.get("n_kept", grouped_counts[name]),
-            "converged": row.get("converged", True),
-            "xyz_path": str(xyz_path),
-            "xyz_sha256": digest,
-            "pipeline_version": row.get("pipeline_version", pipeline_version),
-            "pipeline_commit": row.get("pipeline_commit", pipeline_commit),
-            "rdkit_version": row.get("rdkit_version", rdkit_version),
-            "conformer_record_id": recorded_id,
-        })
-        output_rows.append(output)
+        for (row, xyz_path, artifact_id), (recorded_id, digest) in zip(
+            pending_outputs, recorded
+        ):
+            conformer_id = int(row.get("conformer_id", 0))
+            output = dict(row)
+            output.update({
+                "run_id": manifest["run_id"],
+                "artifact_id": artifact_id,
+                "config_hash": manifest["config_hash"],
+                "name": name,
+                "cid": row.get("cid", 5779),
+                "smiles": row.get("smiles", "C[C@H](O)C"),
+                "conformer_id": conformer_id,
+                "rel_energy_kcalmol": row.get("rel_energy_kcalmol", 0.0),
+                "method": row.get("method", "MMFF94"),
+                "n_generated": row.get("n_generated", grouped_counts[name]),
+                "n_kept": row.get("n_kept", grouped_counts[name]),
+                "converged": row.get("converged", True),
+                "xyz_path": str(xyz_path),
+                "xyz_sha256": digest,
+                "pipeline_version": row.get("pipeline_version", pipeline_version),
+                "pipeline_commit": row.get("pipeline_commit", pipeline_commit),
+                "rdkit_version": row.get("rdkit_version", rdkit_version),
+                "conformer_record_id": recorded_id,
+            })
+            output_rows.append(output)
     log_path = tmp_path / "conformer_log.csv"
     pd.DataFrame(output_rows).to_csv(log_path, index=False)
     return str(log_path), manifest_path
@@ -286,14 +299,20 @@ def direct_com_context(
     """Return a linked XYZ path and required direct-v2 COM identity kwargs."""
     import pandas as pd
 
+    conformer_rows = [
+        {
+            "name": "Ribose",
+            "conformer_id": index,
+            "rel_energy_kcalmol": (
+                rel_energy_kcalmol if index == conformer_id else 0.0
+            ),
+            "converged": converged,
+        }
+        for index in range(conformer_id + 1)
+    ]
     log_path, manifest_path = write_linked_conformer_log(
         tmp_path,
-        [{
-            "name": "Ribose",
-            "conformer_id": conformer_id,
-            "rel_energy_kcalmol": rel_energy_kcalmol,
-            "converged": converged,
-        }],
+        conformer_rows,
         sample_xyz,
         route_opt=route_opt,
         route_freq=route_freq,
@@ -302,7 +321,8 @@ def direct_com_context(
         pipeline_commit=pipeline_commit,
         rdkit_version=rdkit_version,
     )
-    row = pd.read_csv(log_path, dtype=str, keep_default_na=False).iloc[0]
+    rows = pd.read_csv(log_path, dtype=str, keep_default_na=False)
+    row = rows[rows["conformer_id"].astype(int) == conformer_id].iloc[0]
     manifest = load_manifest(manifest_path)
     artifact_id = stable_record_id(
         manifest["run_id"], "com", row["artifact_id"]

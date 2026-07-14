@@ -187,9 +187,31 @@ with `configuration.conformer` without invalidating the manifest. Validation now
 rejects that internal provenance drift. Regression coverage exercises every item
 above on both normal and failure-atomic paths.
 
+**M-35 — Resolved.** Conformer ensembles are now staged and published atomically
+at molecule-group scope. A complete candidate manifest is validated before one
+canonical manifest write; ordinary file-placement or manifest-write exceptions
+restore prior XYZ bytes and manifest state. Every nonempty group must have exact
+cardinality, contiguous IDs, shared search metadata, the approved convergence
+shape, and exact XYZ lineage. This is deliberately not described as a journaled
+crash transaction across multiple filesystem operations.
+
+The final holistic audit also closed **M-36 — Resolved**, an additional
+frozen-contract publication finding discovered during implementation: crossed or
+duplicate staged source/destination mappings could otherwise mutate a protected
+final path, and replacing a group with fewer conformers could leave obsolete XYZ
+artifacts in the run package. The group publisher now rejects those mappings
+before mutation and transactionally retires obsolete prior XYZ files while
+preserving the current policy for unreferenced downstream COM/SH files.
+
+**M-37 — Resolved.** The final re-review found that publishing through an
+already-supported internal XYZ symlink could replace the link while recording
+its resolved target, leaving the authoritative hash attached to old bytes. The
+publisher now moves staged bytes to the same resolved in-package target used by
+manifest path validation, preserving the internal symlink and verified lineage.
+
 No known local frozen-contract Blocker or Major remains. This exact patched head
-still requires remote CI and one current-head review before the human merge
-decision; the status does not treat the prior review as approval of new code.
+has received a final local holistic re-review; remote CI and Ish's human merge
+decision remain required.
 
 ## 2. Prior finding disposition
 
@@ -222,12 +244,15 @@ pytest 9.1.1
 Current local results:
 
 ```text
-pytest tests/ -q: 378 passed
+pytest tests/ -q: 407 passed
 python scripts/check_invariants.py: passed
 Python compilation: passed
 notebook JSON validation: passed
-clean `git archive`: 378 passed; invariant checks and compilation passed
+clean `git archive`: 407 passed; invariant checks and compilation passed
 ```
+
+The M-35 through M-37 verification used the pinned dependency versions listed above on
+CPython 3.12.10.
 
 The M-30 re-verification above (284 passed, six new package-boundary cases)
 was run with the pinned dependency versions (pandas 3.0.3, requests 2.34.2,

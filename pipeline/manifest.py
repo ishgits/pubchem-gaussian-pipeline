@@ -587,6 +587,59 @@ def validate_manifest(manifest: dict) -> None:
                     f"{label} rmsd_prune disagrees with configuration.conformer."
                 )
 
+        if molecule_conformers:
+            first = molecule_conformers[0]
+            group_label = (
+                f"Manifest conformer group for {molecule['molecule_name']!r}"
+            )
+            for field in (
+                "method", "seed", "n_generate", "n_generated", "top_n",
+                "n_kept", "rmsd_prune",
+            ):
+                if any(record[field] != first[field] for record in molecule_conformers):
+                    raise ValueError(
+                        f"{group_label} has inconsistent {field} values."
+                    )
+
+            n_generate = first["n_generate"]
+            n_generated = first["n_generated"]
+            top_n = first["top_n"]
+            n_kept = first["n_kept"]
+            if n_generate < 1 or n_generated < 1 or top_n < 1 or n_kept < 1:
+                raise ValueError(
+                    f"{group_label} count fields must all be at least 1."
+                )
+            if n_generated > n_generate:
+                raise ValueError(f"{group_label} n_generated exceeds n_generate.")
+            if n_kept > n_generated:
+                raise ValueError(f"{group_label} n_kept exceeds n_generated.")
+            if n_kept > top_n:
+                raise ValueError(f"{group_label} n_kept exceeds top_n.")
+            if len(molecule_conformers) != n_kept:
+                raise ValueError(
+                    f"{group_label} is incomplete: expected {n_kept} records, "
+                    f"found {len(molecule_conformers)}."
+                )
+            actual_ids = sorted(
+                record["conformer_id"] for record in molecule_conformers
+            )
+            if actual_ids != list(range(n_kept)):
+                raise ValueError(
+                    f"{group_label} conformer IDs must be contiguous from 0 "
+                    f"through {n_kept - 1}."
+                )
+            convergence = [record["converged"] for record in molecule_conformers]
+            if not all(convergence) and not (
+                len(molecule_conformers) == 1
+                and first["conformer_id"] == 0
+                and n_kept == 1
+                and first["converged"] is False
+            ):
+                raise ValueError(
+                    f"{group_label} violates the retained-conformer convergence "
+                    "policy."
+                )
+
         conformer_ids = [record["conformer_id"] for record in molecule_conformers]
         if len(conformer_ids) != len(set(conformer_ids)):
             raise ValueError(
@@ -827,69 +880,274 @@ def assert_stage_configuration(manifest_path: str, section: str, config: dict) -
     return manifest
 
 
-def record_conformer_xyz(
+def record_conformer_group(
     manifest_path: str,
     *,
     name: str,
     cid,
     smiles: str,
-    conformer_id: int,
-    method: str,
-    n_generated: int,
-    n_kept: int,
-    relative_energy_kcalmol: float,
-    converged: bool,
-    xyz_path: str,
-    artifact_id: str,
-) -> tuple[str, str]:
-    """Record one complete conformer row and its already-written XYZ artifact."""
-    converged_value = parse_strict_bool(
-        converged, field_name=f"Conformer {conformer_id!r} converged"
-    )
+    conformers: list[dict],
+) -> list[tuple[str, str]]:
+    """Replace one molecule's complete conformer lineage in one transaction.
+
+    Each item supplies the final ``xyz_path`` and may supply a distinct
+    ``staged_xyz_path``.  The complete candidate manifest is built and validated
+    before staged files replace their final paths.  Ordinary file-placement or
+    manifest-write exceptions restore prior XYZ bytes and leave the prior
+    manifest unchanged.  This is not a journaled crash transaction across
+    multiple filesystem operations.
+    """
+    if not conformers:
+        raise ValueError("A conformer group must contain at least one record.")
+
     manifest = load_manifest(manifest_path)
     molecule = _find_molecule(manifest, name, cid, smiles)
     config = manifest["configuration"]["conformer"]
-    conformer_record_id = stable_record_id(
-        manifest["run_id"],
-        "conformer",
-        f"{molecule['molecule_identity_hash']}:{int(conformer_id)}",
-    )
-    if any(
-        record.get("conformer_record_id") == conformer_record_id
-        for record in molecule["conformers"]
-    ):
-        raise ValueError(f"Duplicate conformer record: {conformer_record_id!r}.")
-    expected_artifact_id = stable_record_id(
-        manifest["run_id"], "xyz", conformer_record_id
-    )
-    if artifact_id != expected_artifact_id:
-        raise ValueError("XYZ artifact ID does not match its stable lineage key.")
-    relative_path = relative_artifact_path(xyz_path, manifest_path)
-    digest = sha256_file(xyz_path)
-    record = {
-        "conformer_record_id": conformer_record_id,
-        "conformer_id": int(conformer_id),
-        "method": str(method),
-        "seed": int(config["seed"]),
-        "n_generate": int(config["n_generate"]),
-        "n_generated": int(n_generated),
-        "top_n": int(config["top_n"]),
-        "n_kept": int(n_kept),
-        "rmsd_prune": float(config["rmsd_prune"]),
-        "relative_energy_kcalmol": float(relative_energy_kcalmol),
-        "converged": converged_value,
-        "xyz_artifact_id": artifact_id,
+    prepared_records = []
+    prepared_artifacts = []
+    results = []
+    placements = []
+    staged_inputs = []
+    seen_final_paths = set()
+    seen_staged_paths = set()
+    path_mappings = []
+
+    def cleanup_staging() -> None:
+        staging_dirs = set()
+        protected_final_keys = {
+            os.path.normcase(os.path.realpath(final_path))
+            for _staged_path, final_path in staged_inputs
+        }
+        for staged_path, final_path in staged_inputs:
+            staging_dirs.add(os.path.dirname(staged_path))
+            staged_key = os.path.normcase(os.path.realpath(staged_path))
+            if (
+                os.path.abspath(staged_path) != os.path.abspath(final_path)
+                and staged_key not in protected_final_keys
+            ):
+                try:
+                    os.unlink(staged_path)
+                except OSError:
+                    pass
+        for directory in staging_dirs:
+            if os.path.basename(directory).startswith(".staging-"):
+                try:
+                    os.rmdir(directory)
+                except OSError:
+                    pass
+
+    for raw_item in conformers:
+        if not isinstance(raw_item, dict) or "xyz_path" not in raw_item:
+            continue
+        try:
+            raw_final = os.fspath(raw_item["xyz_path"])
+            raw_staged = os.fspath(
+                raw_item.get("staged_xyz_path", raw_final)
+            )
+        except TypeError:
+            continue
+        staged_inputs.append((str(raw_staged), str(raw_final)))
+
+    for item in conformers:
+        if not isinstance(item, dict):
+            cleanup_staging()
+            raise ValueError("Each conformer group item must be a dictionary.")
+        required_payload = {
+            "conformer_id", "method", "n_generated", "n_kept",
+            "relative_energy_kcalmol", "converged", "xyz_path", "artifact_id",
+        }
+        missing_payload = sorted(required_payload - set(item))
+        if missing_payload:
+            cleanup_staging()
+            raise ValueError(
+                "Conformer group payload is missing field(s): "
+                + ", ".join(missing_payload)
+            )
+        label = f"Conformer group item {item.get('conformer_id')!r}"
+        try:
+            conformer_id = _require_integer(
+                item, "conformer_id", label=label, minimum=0
+            )
+            converged = parse_strict_bool(
+                item.get("converged"),
+                field_name=f"Conformer {conformer_id!r} converged",
+            )
+            n_generated = _require_integer(
+                item, "n_generated", label=label, minimum=0
+            )
+            n_kept = _require_integer(item, "n_kept", label=label, minimum=0)
+            relative_energy = _require_finite_number(
+                item, "relative_energy_kcalmol", label=label
+            )
+            method = _require_nonblank_text(item, "method", label=label)
+            artifact_id = _require_nonblank_text(
+                item, "artifact_id", label=label
+            )
+        except Exception:
+            cleanup_staging()
+            raise
+        try:
+            final_path = os.fspath(item["xyz_path"])
+            staged_path = os.fspath(item.get("staged_xyz_path", final_path))
+        except TypeError as exc:
+            cleanup_staging()
+            raise ValueError("Conformer XYZ paths must be filesystem paths.") from exc
+        if not str(final_path).strip() or not str(staged_path).strip():
+            cleanup_staging()
+            raise ValueError("Conformer XYZ paths must be nonblank.")
+        final_path = str(final_path)
+        staged_path = str(staged_path)
+        if not os.path.isfile(staged_path) or os.path.getsize(staged_path) == 0:
+            cleanup_staging()
+            raise ValueError(
+                f"Staged conformer XYZ is missing, irregular, or empty: {staged_path!r}."
+            )
+        try:
+            relative_path = relative_artifact_path(final_path, manifest_path)
+            relative_artifact_path(staged_path, manifest_path)
+        except Exception:
+            cleanup_staging()
+            raise
+        # Artifact paths are stored against their resolved in-package targets.
+        # Publish to those same targets so a supported internal destination
+        # symlink cannot leave the manifest pointing at old bytes while the new
+        # file replaces the symlink itself.
+        final_path = os.path.realpath(final_path)
+        staged_path = os.path.realpath(staged_path)
+        if relative_path in seen_final_paths:
+            cleanup_staging()
+            raise ValueError(f"Duplicate conformer XYZ destination: {relative_path!r}.")
+        seen_final_paths.add(relative_path)
+        staged_key = os.path.normcase(os.path.realpath(staged_path))
+        final_key = os.path.normcase(os.path.realpath(final_path))
+        if staged_key in seen_staged_paths:
+            cleanup_staging()
+            raise ValueError(f"Duplicate staged conformer XYZ source: {staged_path!r}.")
+        seen_staged_paths.add(staged_key)
+        path_mappings.append((staged_key, final_key))
+
+        conformer_record_id = stable_record_id(
+            manifest["run_id"],
+            "conformer",
+            f"{molecule['molecule_identity_hash']}:{conformer_id}",
+        )
+        expected_artifact_id = stable_record_id(
+            manifest["run_id"], "xyz", conformer_record_id
+        )
+        if artifact_id != expected_artifact_id:
+            cleanup_staging()
+            raise ValueError("XYZ artifact ID does not match its stable lineage key.")
+        try:
+            digest = sha256_file(staged_path)
+        except Exception:
+            cleanup_staging()
+            raise
+        prepared_records.append({
+            "conformer_record_id": conformer_record_id,
+            "conformer_id": conformer_id,
+            "method": method,
+            "seed": int(config["seed"]),
+            "n_generate": int(config["n_generate"]),
+            "n_generated": n_generated,
+            "top_n": int(config["top_n"]),
+            "n_kept": n_kept,
+            "rmsd_prune": float(config["rmsd_prune"]),
+            "relative_energy_kcalmol": relative_energy,
+            "converged": converged,
+            "xyz_artifact_id": artifact_id,
+        })
+        prepared_artifacts.append({
+            "artifact_id": artifact_id,
+            "kind": "xyz",
+            "conformer_record_id": conformer_record_id,
+            "relative_path": relative_path,
+            "sha256": digest,
+        })
+        results.append((conformer_record_id, digest))
+        if os.path.abspath(staged_path) != os.path.abspath(final_path):
+            placements.append((staged_path, final_path))
+
+    final_keys = {final_key for _staged_key, final_key in path_mappings}
+    for staged_key, final_key in path_mappings:
+        if staged_key != final_key and staged_key in final_keys:
+            cleanup_staging()
+            raise ValueError(
+                "A staged conformer XYZ source collides with another final destination."
+            )
+
+    candidate = deepcopy(manifest)
+    candidate_molecule = _find_molecule(candidate, name, cid, smiles)
+    prior_record_ids = {
+        record["conformer_record_id"] for record in candidate_molecule["conformers"]
     }
-    molecule["conformers"].append(record)
-    manifest["artifacts"].append({
-        "artifact_id": artifact_id,
-        "kind": "xyz",
-        "conformer_record_id": conformer_record_id,
-        "relative_path": relative_path,
-        "sha256": digest,
-    })
-    write_manifest(manifest_path, manifest)
-    return conformer_record_id, digest
+    prior_xyz_paths = [
+        artifact_abspath(manifest_path, artifact["relative_path"])
+        for artifact in manifest["artifacts"]
+        if artifact.get("conformer_record_id") in prior_record_ids
+        and artifact.get("kind") == "xyz"
+    ]
+    candidate_molecule["conformers"] = prepared_records
+    candidate["artifacts"] = [
+        artifact for artifact in candidate["artifacts"]
+        if artifact.get("conformer_record_id") not in prior_record_ids
+    ]
+    candidate["artifacts"].extend(prepared_artifacts)
+    try:
+        validate_manifest(candidate)
+    except Exception:
+        cleanup_staging()
+        raise
+
+    backups = []
+    placed = []
+    try:
+        for prior_path in prior_xyz_paths:
+            prior_key = os.path.normcase(os.path.realpath(prior_path))
+            if prior_key in final_keys or not os.path.lexists(prior_path):
+                continue
+            backup_path = f"{prior_path}.backup-{uuid.uuid4().hex}"
+            os.replace(prior_path, backup_path)
+            backups.append((backup_path, prior_path))
+        for staged_path, final_path in placements:
+            backup_path = None
+            if os.path.lexists(final_path):
+                backup_path = (
+                    f"{staged_path}.backup-{uuid.uuid4().hex}"
+                )
+                os.replace(final_path, backup_path)
+                backups.append((backup_path, final_path))
+            os.replace(staged_path, final_path)
+            placed.append(final_path)
+        write_manifest(manifest_path, candidate)
+    except Exception as exc:
+        rollback_errors = []
+        for final_path in reversed(placed):
+            try:
+                os.unlink(final_path)
+            except FileNotFoundError:
+                pass
+            except OSError as rollback_exc:
+                rollback_errors.append(rollback_exc)
+        for backup_path, final_path in reversed(backups):
+            if os.path.lexists(backup_path):
+                try:
+                    os.replace(backup_path, final_path)
+                except OSError as rollback_exc:
+                    rollback_errors.append(rollback_exc)
+        cleanup_staging()
+        if rollback_errors:
+            raise RuntimeError(
+                "Conformer publication failed and XYZ rollback was incomplete."
+            ) from exc
+        raise
+    else:
+        for backup_path, _final_path in backups:
+            try:
+                os.unlink(backup_path)
+            except OSError:
+                pass
+        cleanup_staging()
+    return results
 
 
 def record_child_artifact(
@@ -969,6 +1227,8 @@ def remove_conformer_lineage(manifest_path: str, molecule_names: set[str]) -> No
                 record["conformer_record_id"] for record in molecule["conformers"]
             )
             molecule["conformers"] = []
+    if not conformer_record_ids:
+        return
     manifest["artifacts"] = [
         artifact for artifact in manifest["artifacts"]
         if artifact.get("conformer_record_id") not in conformer_record_ids

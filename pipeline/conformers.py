@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
+import tempfile
 
 import pandas as pd
 
@@ -34,7 +36,7 @@ from .manifest import (
     find_conformer_record,
     load_manifest,
     molecule_identity_hash,
-    record_conformer_xyz,
+    record_conformer_group,
     relative_artifact_path,
     remove_conformer_lineage,
     sha256_file,
@@ -1009,18 +1011,6 @@ def search_conformers(
     relative_artifact_path(xyz_dir, manifest_path)
     relative_artifact_path(log_csv, manifest_path)
 
-    # A molecule being regenerated replaces its complete prior lineage in this
-    # same immutable run.  This happens only after all append/resume validation.
-    names_to_replace = set(current_labels) - set(done_names)
-    if not append:
-        names_to_replace.update(
-            molecule["molecule_name"]
-            for molecule in manifest["molecules"]
-            if molecule["molecule_name"] not in done_names
-        )
-    remove_conformer_lineage(manifest_path, names_to_replace)
-    manifest = load_manifest(manifest_path)
-
     # All append validation above is intentionally complete before the first
     # output mutation (M-15). An invalid retained group must leave the prior log,
     # XYZ files, and failure log byte-for-byte unchanged.
@@ -1050,6 +1040,7 @@ def search_conformers(
         # than let RDKit auto-assign stereo or embed an empty/unparseable SMILES.
         skip_reason = check_conformer_eligibility(smiles)
         if skip_reason is not None:
+            remove_conformer_lineage(manifest_path, {str(name)})
             failed.append({
                 "name": name,
                 "cid": cid,
@@ -1066,6 +1057,7 @@ def search_conformers(
                 seed=seed,
             )
         except Exception as e:  # noqa: BLE001 — log and continue, never crash the batch
+            remove_conformer_lineage(manifest_path, {str(name)})
             failed.append({
                 "name": name,
                 "cid": cid,
@@ -1091,68 +1083,101 @@ def search_conformers(
         n_kept = len(keep)
         base = sanitize_basename(str(name))
 
-        for ii, conf_idx in enumerate(keep):
-            xyz_path = os.path.join(xyz_dir, f"{base}_c{ii:02d}.xyz")
-            rel_e = energies_kcal[conf_idx] - e_min
-            is_converged = bool(converged[conf_idx])
-            unconv_tag = "" if is_converged else f" {UNCONVERGED_FF_SEED}"
-            molecule_hash = molecule_identity_hash(name, cid, smiles)
-            conformer_record_id = stable_record_id(
-                manifest["run_id"], "conformer", f"{molecule_hash}:{ii}"
-            )
-            artifact_id = stable_record_id(
-                manifest["run_id"], "xyz", conformer_record_id
-            )
-            _write_xyz(
-                xyz_path,
-                coords_list[conf_idx],
-                comment=(
-                    f"run_id={manifest['run_id']} artifact_id={artifact_id} "
-                    f"config_hash={manifest['config_hash']} conformer_id={ii} "
-                    f"relative_energy_kcalmol={rel_e:.6f} method={method} "
-                    f"pipeline_version={pipeline_version} rdkit_version={rdkit_ver}"
-                    f"{unconv_tag}"
-                ),
-            )
-            recorded_conformer_id, xyz_digest = record_conformer_xyz(
+        staging_dir = tempfile.mkdtemp(prefix=f".staging-{base}-", dir=xyz_dir)
+        group_payload = []
+        group_log_rows = []
+        try:
+            for ii, conf_idx in enumerate(keep):
+                filename = f"{base}_c{ii:02d}.xyz"
+                xyz_path = os.path.join(xyz_dir, filename)
+                staged_xyz_path = os.path.join(staging_dir, filename)
+                rel_e = round(energies_kcal[conf_idx] - e_min, 6)
+                is_converged = bool(converged[conf_idx])
+                unconv_tag = "" if is_converged else f" {UNCONVERGED_FF_SEED}"
+                molecule_hash = molecule_identity_hash(name, cid, smiles)
+                conformer_record_id = stable_record_id(
+                    manifest["run_id"], "conformer", f"{molecule_hash}:{ii}"
+                )
+                artifact_id = stable_record_id(
+                    manifest["run_id"], "xyz", conformer_record_id
+                )
+                _write_xyz(
+                    staged_xyz_path,
+                    coords_list[conf_idx],
+                    comment=(
+                        f"run_id={manifest['run_id']} artifact_id={artifact_id} "
+                        f"config_hash={manifest['config_hash']} conformer_id={ii} "
+                        f"relative_energy_kcalmol={rel_e:.6f} method={method} "
+                        f"pipeline_version={pipeline_version} rdkit_version={rdkit_ver}"
+                        f"{unconv_tag}"
+                    ),
+                )
+                group_payload.append({
+                    "conformer_id": ii,
+                    "method": method,
+                    "n_generated": n_generated,
+                    "n_kept": n_kept,
+                    "relative_energy_kcalmol": rel_e,
+                    "converged": is_converged,
+                    "xyz_path": xyz_path,
+                    "staged_xyz_path": staged_xyz_path,
+                    "artifact_id": artifact_id,
+                })
+                group_log_rows.append({
+                    "run_id": manifest["run_id"],
+                    "artifact_id": artifact_id,
+                    "config_hash": manifest["config_hash"],
+                    "name": name,
+                    "cid": cid,
+                    "smiles": smiles,
+                    "conformer_id": ii,
+                    "rel_energy_kcalmol": rel_e,
+                    "xyz_path": xyz_path,
+                    "rdkit_version": rdkit_ver,
+                    "pipeline_version": pipeline_version,
+                    "pipeline_commit": pipeline_commit,
+                    "seed": seed,
+                    "n_generate": n_generate,
+                    "top_n": top_n,
+                    "method": method,
+                    "n_generated": n_generated,
+                    "n_kept": n_kept,
+                    "rmsd_prune": rmsd_prune,
+                    "converged": is_converged,
+                })
+
+            recorded = record_conformer_group(
                 manifest_path,
                 name=str(name),
                 cid=cid,
                 smiles=str(smiles),
-                conformer_id=ii,
-                method=method,
-                n_generated=n_generated,
-                n_kept=n_kept,
-                relative_energy_kcalmol=round(rel_e, 6),
-                converged=is_converged,
-                xyz_path=xyz_path,
-                artifact_id=artifact_id,
+                conformers=group_payload,
             )
-            if recorded_conformer_id != conformer_record_id:
-                raise ValueError("Manifest conformer ID changed during XYZ recording.")
-            log_rows.append({
-                "run_id": manifest["run_id"],
-                "artifact_id": artifact_id,
-                "config_hash": manifest["config_hash"],
+            for expected, result, log_row in zip(
+                group_payload, recorded, group_log_rows
+            ):
+                recorded_conformer_id, xyz_digest = result
+                expected_record_id = stable_record_id(
+                    manifest["run_id"],
+                    "conformer",
+                    f"{molecule_identity_hash(name, cid, smiles)}:"
+                    f"{expected['conformer_id']}",
+                )
+                if recorded_conformer_id != expected_record_id:
+                    raise ValueError(
+                        "Manifest conformer ID changed during group recording."
+                    )
+                log_row["xyz_sha256"] = xyz_digest
+            log_rows.extend(group_log_rows)
+        except Exception as e:  # noqa: BLE001 — record publication failure and continue
+            failed.append({
                 "name": name,
                 "cid": cid,
                 "smiles": smiles,
-                "conformer_id": ii,
-                "rel_energy_kcalmol": round(rel_e, 6),
-                "xyz_path": xyz_path,
-                "xyz_sha256": xyz_digest,
-                "rdkit_version": rdkit_ver,
-                "pipeline_version": pipeline_version,
-                "pipeline_commit": pipeline_commit,
-                "seed": seed,
-                "n_generate": n_generate,
-                "top_n": top_n,
-                "method": method,
-                "n_generated": n_generated,
-                "n_kept": n_kept,
-                "rmsd_prune": rmsd_prune,
-                "converged": is_converged,
+                "error": repr(e),
             })
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     out_df = pd.DataFrame(log_rows, columns=_LOG_COLUMNS)
     out_df.to_csv(log_csv, index=False)

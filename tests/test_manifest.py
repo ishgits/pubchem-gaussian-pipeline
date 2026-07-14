@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -22,7 +23,7 @@ from pipeline.manifest import (
     finalize_manifest,
     load_manifest,
     molecule_identity_hash,
-    record_conformer_xyz,
+    record_conformer_group,
     record_child_artifact,
     slurm_template_identity,
     stable_record_id,
@@ -85,7 +86,7 @@ def _create(tmp_path, table=None):
     return path
 
 
-def _create_with_xyz(tmp_path, *, conformer_id=0):
+def _create_with_xyz(tmp_path):
     tmp_path.mkdir(parents=True, exist_ok=True)
     path = _create(
         tmp_path,
@@ -101,30 +102,32 @@ def _create_with_xyz(tmp_path, *, conformer_id=0):
     conformer_record_id = stable_record_id(
         manifest["run_id"],
         "conformer",
-        f"{molecule['molecule_identity_hash']}:{conformer_id}",
+        f"{molecule['molecule_identity_hash']}:0",
     )
     artifact_id = stable_record_id(
         manifest["run_id"], "xyz", conformer_record_id
     )
-    xyz = tmp_path / "conformer_xyz" / f"water_c{conformer_id:02d}.xyz"
+    xyz = tmp_path / "conformer_xyz" / "water_c00.xyz"
     xyz.parent.mkdir(parents=True, exist_ok=True)
     xyz.write_text(
-        f"1\nlinked starting geometry\nO {float(conformer_id)} 0 0\n",
+        "1\nlinked starting geometry\nO 0 0 0\n",
         encoding="utf-8",
     )
-    record_conformer_xyz(
+    record_conformer_group(
         str(path),
         name="Water",
         cid=962,
         smiles="O",
-        conformer_id=conformer_id,
-        method="MMFF94",
-        n_generated=1,
-        n_kept=1,
-        relative_energy_kcalmol=float(conformer_id),
-        converged=True,
-        xyz_path=str(xyz),
-        artifact_id=artifact_id,
+        conformers=[{
+            "conformer_id": 0,
+            "method": "MMFF94",
+            "n_generated": 1,
+            "n_kept": 1,
+            "relative_energy_kcalmol": 0.0,
+            "converged": True,
+            "xyz_path": str(xyz),
+            "artifact_id": artifact_id,
+        }],
     )
     return path, xyz, artifact_id
 
@@ -353,20 +356,22 @@ class TestArtifactLineageAndHashes:
         xyz = tmp_path / "conformer_xyz" / "water_c00.xyz"
         xyz.parent.mkdir()
         xyz.write_text("1\nlinked starting geometry\nO 0 0 0\n")
-        recorded_id, digest = record_conformer_xyz(
+        recorded_id, digest = record_conformer_group(
             str(path),
             name=name,
             cid=cid,
             smiles=smiles,
-            conformer_id=0,
-            method="MMFF94",
-            n_generated=1,
-            n_kept=1,
-            relative_energy_kcalmol=0.0,
-            converged=True,
-            xyz_path=str(xyz),
-            artifact_id=artifact_id,
-        )
+            conformers=[{
+                "conformer_id": 0,
+                "method": "MMFF94",
+                "n_generated": 1,
+                "n_kept": 1,
+                "relative_energy_kcalmol": 0.0,
+                "converged": True,
+                "xyz_path": str(xyz),
+                "artifact_id": artifact_id,
+            }],
+        )[0]
         assert recorded_id == conformer_record_id
         artifact = verify_artifact(str(path), artifact_id)
         assert artifact["sha256"] == digest
@@ -415,19 +420,21 @@ class TestCompleteConformerSchema:
         before = path.read_bytes()
 
         with pytest.raises(ValueError, match="converged"):
-            record_conformer_xyz(
+            record_conformer_group(
                 str(path),
                 name="Water",
                 cid=962,
                 smiles="O",
-                conformer_id=0,
-                method="MMFF94",
-                n_generated=1,
-                n_kept=1,
-                relative_energy_kcalmol=0.0,
-                converged=float("nan"),
-                xyz_path=str(xyz),
-                artifact_id=artifact_id,
+                conformers=[{
+                    "conformer_id": 0,
+                    "method": "MMFF94",
+                    "n_generated": 1,
+                    "n_kept": 1,
+                    "relative_energy_kcalmol": 0.0,
+                    "converged": float("nan"),
+                    "xyz_path": str(xyz),
+                    "artifact_id": artifact_id,
+                }],
             )
         assert path.read_bytes() == before
 
@@ -543,19 +550,34 @@ class TestExactConformerXyzLineage:
         second_xyz_id = stable_record_id(manifest["run_id"], "xyz", second_record_id)
         second_xyz = tmp_path / "conformer_xyz" / "water_c01.xyz"
         second_xyz.write_text("1\nsecond\nO 1 0 0\n", encoding="utf-8")
-        record_conformer_xyz(
+        first_xyz = tmp_path / "conformer_xyz" / "water_c00.xyz"
+        record_conformer_group(
             str(path),
             name="Water",
             cid=962,
             smiles="O",
-            conformer_id=1,
-            method="MMFF94",
-            n_generated=2,
-            n_kept=2,
-            relative_energy_kcalmol=1.0,
-            converged=True,
-            xyz_path=str(second_xyz),
-            artifact_id=second_xyz_id,
+            conformers=[
+                {
+                    "conformer_id": 0,
+                    "method": "MMFF94",
+                    "n_generated": 2,
+                    "n_kept": 2,
+                    "relative_energy_kcalmol": 0.0,
+                    "converged": True,
+                    "xyz_path": str(first_xyz),
+                    "artifact_id": first_xyz_id,
+                },
+                {
+                    "conformer_id": 1,
+                    "method": "MMFF94",
+                    "n_generated": 2,
+                    "n_kept": 2,
+                    "relative_energy_kcalmol": 1.0,
+                    "converged": True,
+                    "xyz_path": str(second_xyz),
+                    "artifact_id": second_xyz_id,
+                },
+            ],
         )
         manifest = load_manifest(str(path))
         manifest["molecules"][0]["conformers"][1]["xyz_artifact_id"] = first_xyz_id
@@ -620,3 +642,352 @@ class TestResolvedArtifactContainment:
         xyz.symlink_to(internal)
         assert artifact_abspath(str(path), f"conformer_xyz/{xyz.name}") == str(internal)
         assert verify_artifact(str(path), artifact_id)["artifact_id"] == artifact_id
+
+
+class TestAtomicConformerGroupPublication:
+    @staticmethod
+    def _manifest(tmp_path):
+        return _create(
+            tmp_path,
+            table=pd.DataFrame([
+                {"name": "Water", "cid": 962, "IsomericSMILES": "O"}
+            ]),
+        )
+
+    @staticmethod
+    def _payload(path, tmp_path, *, count=3, prefix="new", staged=True):
+        manifest = load_manifest(str(path))
+        molecule = manifest["molecules"][0]
+        final_dir = tmp_path / "conformer_xyz"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        staging_dir = tmp_path / f".staging-{prefix}"
+        if staged:
+            staging_dir.mkdir(parents=True, exist_ok=True)
+        payload = []
+        for conformer_id in range(count):
+            final_path = final_dir / f"water_c{conformer_id:02d}.xyz"
+            source_path = (
+                staging_dir / final_path.name if staged else final_path
+            )
+            source_path.write_text(
+                f"1\n{prefix}-{conformer_id}\nO {conformer_id} 0 0\n",
+                encoding="utf-8",
+            )
+            conformer_record_id = stable_record_id(
+                manifest["run_id"],
+                "conformer",
+                f"{molecule['molecule_identity_hash']}:{conformer_id}",
+            )
+            artifact_id = stable_record_id(
+                manifest["run_id"], "xyz", conformer_record_id
+            )
+            item = {
+                "conformer_id": conformer_id,
+                "method": "MMFF94",
+                "n_generated": count,
+                "n_kept": count,
+                "relative_energy_kcalmol": float(conformer_id),
+                "converged": True,
+                "xyz_path": str(final_path),
+                "artifact_id": artifact_id,
+            }
+            if staged:
+                item["staged_xyz_path"] = str(source_path)
+            payload.append(item)
+        return payload
+
+    def _publish(self, path, payload):
+        return record_conformer_group(
+            str(path),
+            name="Water",
+            cid=962,
+            smiles="O",
+            conformers=payload,
+        )
+
+    def test_three_conformers_publish_with_one_manifest_write(
+        self, tmp_path, monkeypatch
+    ):
+        path = self._manifest(tmp_path)
+        payload = self._payload(path, tmp_path, count=3)
+        calls = []
+        real_write = manifest_module.write_manifest
+
+        def counted_write(manifest_path, manifest):
+            calls.append(deepcopy(manifest))
+            return real_write(manifest_path, manifest)
+
+        monkeypatch.setattr(manifest_module, "write_manifest", counted_write)
+        recorded = self._publish(path, payload)
+
+        assert len(calls) == 1
+        assert len(recorded) == 3
+        final = load_manifest(str(path))
+        assert len(final["molecules"][0]["conformers"]) == 3
+        assert len([a for a in final["artifacts"] if a["kind"] == "xyz"]) == 3
+        assert not list(tmp_path.glob(".staging-*"))
+
+    @pytest.mark.parametrize(
+        "ids",
+        [[0, 2], [1, 2], [0, 1, 3], [0, 0]],
+    )
+    def test_invalid_complete_id_sets_fail_before_mutation(self, tmp_path, ids):
+        path = self._manifest(tmp_path)
+        payload = self._payload(path, tmp_path, count=len(ids))
+        for item, conformer_id in zip(payload, ids):
+            item["conformer_id"] = conformer_id
+            manifest = load_manifest(str(path))
+            molecule = manifest["molecules"][0]
+            record_id = stable_record_id(
+                manifest["run_id"],
+                "conformer",
+                f"{molecule['molecule_identity_hash']}:{conformer_id}",
+            )
+            item["artifact_id"] = stable_record_id(
+                manifest["run_id"], "xyz", record_id
+            )
+        before = path.read_bytes()
+        with pytest.raises(ValueError, match="contiguous|Duplicate"):
+            self._publish(path, payload)
+        assert path.read_bytes() == before
+        assert not list(tmp_path.glob(".staging-*"))
+
+    def test_incomplete_payload_fails_before_manifest_mutation(self, tmp_path):
+        path = self._manifest(tmp_path)
+        payload = self._payload(path, tmp_path, count=1)
+        payload[0]["n_generated"] = 3
+        payload[0]["n_kept"] = 3
+        before = path.read_bytes()
+        with pytest.raises(ValueError, match="incomplete"):
+            self._publish(path, payload)
+        assert path.read_bytes() == before
+
+    def test_duplicate_staged_sources_fail_before_manifest_mutation(self, tmp_path):
+        path = self._manifest(tmp_path)
+        payload = self._payload(path, tmp_path, count=2)
+        Path(payload[1]["staged_xyz_path"]).unlink()
+        payload[1]["staged_xyz_path"] = payload[0]["staged_xyz_path"]
+        before = path.read_bytes()
+        with pytest.raises(ValueError, match="Duplicate staged"):
+            self._publish(path, payload)
+        assert path.read_bytes() == before
+        assert not list(tmp_path.glob(".staging-*"))
+
+    def test_staged_source_cannot_collide_with_another_final_path(self, tmp_path):
+        path = self._manifest(tmp_path)
+        payload = self._payload(path, tmp_path, count=2)
+        colliding_path = Path(payload[1]["xyz_path"])
+        colliding_path.write_text("1\nprotected\nO 0 0 0\n", encoding="utf-8")
+        payload[0]["staged_xyz_path"] = str(colliding_path)
+        before = path.read_bytes()
+        protected = colliding_path.read_bytes()
+        with pytest.raises(ValueError, match="collides"):
+            self._publish(path, payload)
+        assert path.read_bytes() == before
+        assert colliding_path.read_bytes() == protected
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("method", "UFF"),
+            ("seed", 7),
+            ("n_generate", 19),
+            ("n_generated", 2),
+            ("top_n", 2),
+            ("n_kept", 2),
+            ("rmsd_prune", 0.4),
+        ],
+    )
+    def test_inconsistent_group_metadata_is_rejected(
+        self, tmp_path, field, value
+    ):
+        path = self._manifest(tmp_path)
+        payload = self._payload(path, tmp_path, count=3, staged=False)
+        self._publish(path, payload)
+        manifest = load_manifest(str(path))
+        manifest["molecules"][0]["conformers"][1][field] = value
+        with pytest.raises(
+            ValueError, match="inconsistent|configuration|n_kept|n_generated"
+        ):
+            validate_manifest(manifest)
+
+    @pytest.mark.parametrize(
+        "ids,flags,n_kept,accepted",
+        [
+            ([0, 1, 2], [True, True, True], 3, True),
+            ([0], [False], 1, True),
+            ([0, 1], [True, False], 2, False),
+            ([0, 1], [False, False], 2, False),
+            ([0], [False], 2, False),
+            ([1], [False], 1, False),
+        ],
+    )
+    def test_complete_group_convergence_policy(
+        self, tmp_path, ids, flags, n_kept, accepted
+    ):
+        path = self._manifest(tmp_path)
+        payload = self._payload(path, tmp_path, count=len(ids), staged=False)
+        manifest = load_manifest(str(path))
+        molecule = manifest["molecules"][0]
+        for item, conformer_id, converged in zip(payload, ids, flags):
+            item["conformer_id"] = conformer_id
+            item["n_kept"] = n_kept
+            item["n_generated"] = max(n_kept, len(ids))
+            item["converged"] = converged
+            record_id = stable_record_id(
+                manifest["run_id"],
+                "conformer",
+                f"{molecule['molecule_identity_hash']}:{conformer_id}",
+            )
+            item["artifact_id"] = stable_record_id(
+                manifest["run_id"], "xyz", record_id
+            )
+        if accepted:
+            self._publish(path, payload)
+            assert len(load_manifest(str(path))["molecules"][0]["conformers"]) == n_kept
+        else:
+            with pytest.raises(ValueError, match="convergence|incomplete|contiguous"):
+                self._publish(path, payload)
+
+    def test_move_failure_restores_old_group_and_files(self, tmp_path, monkeypatch):
+        path = self._manifest(tmp_path)
+        old_payload = self._payload(
+            path, tmp_path, count=2, prefix="old", staged=False
+        )
+        self._publish(path, old_payload)
+        manifest_before = path.read_bytes()
+        old_bytes = {
+            item["xyz_path"]: Path(item["xyz_path"]).read_bytes()
+            for item in old_payload
+        }
+        new_payload = self._payload(path, tmp_path, count=2, prefix="new")
+        staged_sources = {item["staged_xyz_path"] for item in new_payload}
+        real_replace = os.replace
+        moves = 0
+
+        def fail_second_staged_move(source, destination):
+            nonlocal moves
+            if str(source) in staged_sources:
+                moves += 1
+                if moves == 2:
+                    raise OSError("simulated placement failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(manifest_module.os, "replace", fail_second_staged_move)
+        with pytest.raises(OSError, match="placement failure"):
+            self._publish(path, new_payload)
+        assert path.read_bytes() == manifest_before
+        for final_path, expected in old_bytes.items():
+            assert Path(final_path).read_bytes() == expected
+        assert not list(tmp_path.glob(".staging-*"))
+
+    def test_manifest_write_failure_restores_old_files(self, tmp_path, monkeypatch):
+        path = self._manifest(tmp_path)
+        old_payload = self._payload(
+            path, tmp_path, count=2, prefix="old", staged=False
+        )
+        self._publish(path, old_payload)
+        manifest_before = path.read_bytes()
+        old_bytes = {
+            item["xyz_path"]: Path(item["xyz_path"]).read_bytes()
+            for item in old_payload
+        }
+        new_payload = self._payload(path, tmp_path, count=2, prefix="new")
+        monkeypatch.setattr(
+            manifest_module,
+            "write_manifest",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("simulated manifest failure")
+            ),
+        )
+        with pytest.raises(OSError, match="manifest failure"):
+            self._publish(path, new_payload)
+        assert path.read_bytes() == manifest_before
+        for final_path, expected in old_bytes.items():
+            assert Path(final_path).read_bytes() == expected
+        assert not list(tmp_path.glob(".staging-*"))
+
+    def test_successful_replacement_removes_old_descendant_lineage(self, tmp_path):
+        path = self._manifest(tmp_path)
+        old_payload = self._payload(
+            path, tmp_path, count=2, prefix="old", staged=False
+        )
+        recorded = self._publish(path, old_payload)
+        manifest = load_manifest(str(path))
+        for item, (conformer_record_id, _digest) in zip(old_payload, recorded):
+            com_path = tmp_path / "gaussian_inputs" / f"{item['conformer_id']}.com"
+            com_path.parent.mkdir(exist_ok=True)
+            com_path.write_text("old com\n", encoding="utf-8")
+            com_id = stable_record_id(
+                manifest["run_id"], "com", item["artifact_id"]
+            )
+            record_child_artifact(
+                str(path),
+                kind="com",
+                artifact_id=com_id,
+                parent_artifact_id=item["artifact_id"],
+                conformer_record_id=conformer_record_id,
+                path=str(com_path),
+            )
+            sh_path = tmp_path / "slurm_scripts" / f"{item['conformer_id']}.sh"
+            sh_path.parent.mkdir(exist_ok=True)
+            sh_path.write_text("#!/bin/bash\n", encoding="utf-8")
+            sh_id = stable_record_id(manifest["run_id"], "sh", com_id)
+            record_child_artifact(
+                str(path),
+                kind="sh",
+                artifact_id=sh_id,
+                parent_artifact_id=com_id,
+                conformer_record_id=conformer_record_id,
+                path=str(sh_path),
+            )
+
+        new_payload = self._payload(path, tmp_path, count=3, prefix="new")
+        self._publish(path, new_payload)
+        final = load_manifest(str(path))
+        assert len(final["molecules"][0]["conformers"]) == 3
+        assert {artifact["kind"] for artifact in final["artifacts"]} == {"xyz"}
+        assert len(final["artifacts"]) == 3
+        for item in new_payload:
+            assert "new" in Path(item["xyz_path"]).read_text(encoding="utf-8")
+
+    def test_successful_smaller_group_removes_obsolete_xyz_files(self, tmp_path):
+        path = self._manifest(tmp_path)
+        old_payload = self._payload(
+            path, tmp_path, count=3, prefix="old", staged=False
+        )
+        self._publish(path, old_payload)
+        new_payload = self._payload(path, tmp_path, count=1, prefix="new")
+        self._publish(path, new_payload)
+
+        assert Path(old_payload[0]["xyz_path"]).exists()
+        assert not Path(old_payload[1]["xyz_path"]).exists()
+        assert not Path(old_payload[2]["xyz_path"]).exists()
+        final = load_manifest(str(path))
+        assert len(final["molecules"][0]["conformers"]) == 1
+        assert len(final["artifacts"]) == 1
+
+    def test_internal_destination_symlink_updates_resolved_artifact(
+        self, tmp_path
+    ):
+        path = self._manifest(tmp_path)
+        payload = self._payload(path, tmp_path, count=1, prefix="old", staged=False)
+        final_path = Path(payload[0]["xyz_path"])
+        target = tmp_path / "stored" / final_path.name
+        target.parent.mkdir()
+        final_path.replace(target)
+        final_path.symlink_to(target)
+        self._publish(path, payload)
+
+        replacement = self._payload(path, tmp_path, count=1, prefix="new")
+        self._publish(path, replacement)
+
+        assert final_path.is_symlink()
+        assert "new-0" in target.read_text(encoding="utf-8")
+        manifest = load_manifest(str(path))
+        artifact_id = manifest["molecules"][0]["conformers"][0][
+            "xyz_artifact_id"
+        ]
+        assert verify_artifact(str(path), artifact_id)["relative_path"] == (
+            "stored/water_c00.xyz"
+        )

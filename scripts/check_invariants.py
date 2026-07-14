@@ -598,7 +598,7 @@ def _frozen_matrix_problems(
         "sanitize_basename(",
         "output_basenames",
         "def validate_manifest(",
-        "def record_conformer_xyz(",
+        "def record_conformer_group(",
         "def record_child_artifact(",
         '"Geom=AllChk"',
         '"Guess=Read"',

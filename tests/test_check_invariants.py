@@ -248,6 +248,18 @@ class TestFrozenManifestMatrixGuard:
     def test_current_sources_pass(self):
         assert check_invariants._frozen_matrix_problems(*self._sources()) == []
 
+    def test_detects_missing_atomic_conformer_group_writer(self):
+        manifest, conformers, gaussian, slurm = self._sources()
+        manifest = manifest.replace(
+            "def record_conformer_group(",
+            "def removed_record_conformer_group(",
+            1,
+        )
+        problems = check_invariants._frozen_matrix_problems(
+            manifest, conformers, gaussian, slurm
+        )
+        assert any("record_conformer_group" in problem for problem in problems)
+
     def test_detects_missing_xyz_linkage_field(self):
         manifest, conformers, gaussian, slurm = self._sources()
         conformers = conformers.replace(
