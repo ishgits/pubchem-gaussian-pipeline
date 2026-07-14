@@ -524,6 +524,36 @@ def validate_manifest(manifest: dict) -> None:
         )
         if molecule["molecule_identity_hash"] != expected_identity:
             raise ValueError("Manifest molecule identity hash mismatch.")
+
+        # v2.1 (contract §9): provisional undefined-stereo provenance fields.
+        molecule_status = molecule.get("provenance_status", "normal")
+        if molecule_status not in ("normal", "provisional_undefined_stereo"):
+            raise ValueError(
+                f"Manifest molecule {molecule['molecule_name']!r} has unsupported "
+                f"provenance_status {molecule_status!r}."
+            )
+        provisional_only = ("undefined_centers", "pubchem_smiles", "arbitrated_smiles")
+        if molecule_status == "provisional_undefined_stereo":
+            for key in provisional_only:
+                if not str(molecule.get(key, "")).strip():
+                    raise ValueError(
+                        f"Provisional molecule {molecule['molecule_name']!r} is "
+                        f"missing nonblank {key!r}."
+                    )
+            if str(molecule["arbitrated_smiles"]).strip() == str(
+                molecule["pubchem_smiles"]
+            ).strip():
+                raise ValueError(
+                    f"Provisional molecule {molecule['molecule_name']!r} "
+                    "arbitrated_smiles must differ from pubchem_smiles."
+                )
+        else:
+            present = [key for key in provisional_only if key in molecule]
+            if present:
+                raise ValueError(
+                    f"Normal molecule {molecule['molecule_name']!r} must not carry "
+                    f"provisional-only field(s): {present}."
+                )
         molecule_conformers = molecule["conformers"]
         if not isinstance(molecule_conformers, list):
             raise ValueError("Manifest molecule conformers must be a list.")
@@ -889,8 +919,19 @@ def record_conformer_group(
     conformers: list[dict],
     conformer_log_path: str | None = None,
     staged_conformer_log_path: str | None = None,
+    provenance_status: str = "normal",
+    undefined_centers: str | None = None,
+    pubchem_smiles: str | None = None,
+    arbitrated_smiles: str | None = None,
 ) -> list[tuple[str, str]]:
     """Replace one molecule's complete conformer package in one transaction.
+
+    v2.1 (contract §9): for a provisional undefined-stereo molecule
+    (``provenance_status = "provisional_undefined_stereo"``) the molecule record
+    additionally carries ``undefined_centers``, ``pubchem_smiles``, and
+    ``arbitrated_smiles``. The arbitrated structure must differ from the
+    underspecified PubChem SMILES — it is one arbitrary configuration, never the
+    defined stereoisomer.
 
     Each item supplies the final ``xyz_path`` and may supply a distinct
     ``staged_xyz_path``.  The complete candidate manifest is built and validated
@@ -909,6 +950,37 @@ def record_conformer_group(
             "conformer_log_path and staged_conformer_log_path must be supplied "
             "together."
         )
+    if provenance_status not in ("normal", "provisional_undefined_stereo"):
+        raise ValueError(
+            f"Unsupported provenance_status: {provenance_status!r}."
+        )
+    if provenance_status == "provisional_undefined_stereo":
+        if not (undefined_centers and str(undefined_centers).strip()):
+            raise ValueError(
+                "A provisional undefined-stereo molecule must record its "
+                "undefined_centers."
+            )
+        if not (pubchem_smiles and str(pubchem_smiles).strip()):
+            raise ValueError(
+                "A provisional undefined-stereo molecule must record its "
+                "pubchem_smiles."
+            )
+        if not (arbitrated_smiles and str(arbitrated_smiles).strip()):
+            raise ValueError(
+                "A provisional undefined-stereo molecule must record its "
+                "arbitrated_smiles."
+            )
+        if str(arbitrated_smiles).strip() == str(pubchem_smiles).strip():
+            raise ValueError(
+                "The arbitrated SMILES must differ from the underspecified "
+                "PubChem SMILES; it is one arbitrary configuration, never the "
+                "defined stereoisomer."
+            )
+        if len(conformers) != 1:
+            raise ValueError(
+                "A provisional undefined-stereo molecule carries exactly one "
+                "arbitrated structure."
+            )
 
     manifest = load_manifest(manifest_path)
     molecule = _find_molecule(manifest, name, cid, smiles)
@@ -1097,6 +1169,17 @@ def record_conformer_group(
         and artifact.get("kind") == "xyz"
     ]
     candidate_molecule["conformers"] = prepared_records
+    # v2.1 (contract §9): stamp the provisional undefined-stereo provenance onto
+    # the molecule record. Normal molecules carry provenance_status="normal" and
+    # drop any provisional-only fields.
+    candidate_molecule["provenance_status"] = provenance_status
+    if provenance_status == "provisional_undefined_stereo":
+        candidate_molecule["undefined_centers"] = str(undefined_centers)
+        candidate_molecule["pubchem_smiles"] = str(pubchem_smiles)
+        candidate_molecule["arbitrated_smiles"] = str(arbitrated_smiles)
+    else:
+        for key in ("undefined_centers", "pubchem_smiles", "arbitrated_smiles"):
+            candidate_molecule.pop(key, None)
     candidate["artifacts"] = [
         artifact for artifact in candidate["artifacts"]
         if artifact.get("conformer_record_id") not in prior_record_ids

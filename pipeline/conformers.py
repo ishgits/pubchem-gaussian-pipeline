@@ -370,6 +370,105 @@ def generate_conformers(
 
 
 # ---------------------------------------------------------------------------
+# Provisional undefined-stereo structure (v2.1 judgment #5)
+# ---------------------------------------------------------------------------
+
+# Status recorded in conformer_log.csv / the manifest molecule record and used
+# downstream to mark provisional artifacts (dE=NA, PROVISIONAL marker).
+PROVENANCE_NORMAL = "normal"
+PROVENANCE_PROVISIONAL = "provisional_undefined_stereo"
+
+
+def undefined_stereo_labels(mol) -> list[str]:
+    """Return human labels for each *unspecified* stereo element of *mol*.
+
+    Atom stereocentres are labeled ``atom <idx>`` and double-bond stereo elements
+    ``bond <a>-<b>``. The count of returned labels is ``k`` — the number of
+    undefined centres — so ``2**k`` is the number of possible stereoisomers.
+    """
+    from rdkit import Chem
+
+    labels: list[str] = []
+    for element in Chem.FindPotentialStereo(mol):
+        if element.specified != Chem.StereoSpecified.Unspecified:
+            continue
+        if "Bond" in str(element.type):
+            bond = mol.GetBondWithIdx(int(element.centeredOn))
+            labels.append(
+                f"bond {bond.GetBeginAtomIdx()}-{bond.GetEndAtomIdx()}"
+            )
+        else:
+            labels.append(f"atom {int(element.centeredOn)}")
+    return labels
+
+
+def generate_provisional_conformer(smiles: str, seed: int = SEED):
+    """Embed ONE provisional structure for an undefined-stereo molecule (§9).
+
+    This is explicitly **not** an ensemble conformer search. RDKit fixes the
+    undefined centre(s) to an arbitrary configuration at embed time; the
+    post-embed isomeric SMILES is read back as the *arbitrated* structure.
+
+    Returns ``(coords, method, converged, arbitrated_smiles, undefined_labels)``:
+
+    - ``coords`` — ``[(symbol, x, y, z), ...]`` in Ångström for the one structure;
+    - ``method`` — ``"MMFF94"`` or ``"UFF"`` (the FF used for the light cleanup);
+    - ``converged`` — whether the light FF cleanup converged;
+    - ``arbitrated_smiles`` — isomeric SMILES read back from the embedded 3D
+      geometry (the arbitrary configuration RDKit chose), distinct from the
+      underspecified PubChem SMILES;
+    - ``undefined_labels`` — labels of the undefined stereo centre(s).
+
+    Raises ``ValueError`` if *smiles* cannot be parsed and ``RuntimeError`` if the
+    single embed fails.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"RDKit could not parse SMILES: {smiles!r}")
+    undefined_labels = undefined_stereo_labels(mol)
+
+    molh = Chem.AddHs(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = seed
+    # A single ETKDG embed (fixed seed) — one structure, not an ensemble.
+    conf_id = AllChem.EmbedMolecule(molh, params)
+    if conf_id < 0:
+        raise RuntimeError(
+            f"RDKit embedding produced no provisional structure for SMILES "
+            f"{smiles!r} (seed={seed})"
+        )
+
+    # Light FF cleanup. MMFF94 preferred; UFF recorded fallback (never silent).
+    if AllChem.MMFFHasAllMoleculeParams(molh):
+        method = "MMFF94"
+        not_converged = AllChem.MMFFOptimizeMolecule(
+            molh, mmffVariant="MMFF94", maxIters=FF_MAXITERS, confId=conf_id
+        )
+    else:
+        method = "UFF"
+        print(
+            f"WARNING: MMFF94 parameters unavailable for provisional SMILES "
+            f"{smiles!r}; using UFF for the light cleanup (logged, not silent)."
+        )
+        not_converged = AllChem.UFFOptimizeMolecule(
+            molh, confId=conf_id, maxIters=FF_MAXITERS
+        )
+    converged = not_converged == 0
+
+    coords = _conf_coords(molh, conf_id)
+
+    # Read back the arbitrated configuration from the embedded 3D geometry.
+    heavy = Chem.RemoveHs(molh)
+    Chem.AssignStereochemistryFrom3D(heavy)
+    arbitrated_smiles = Chem.MolToSmiles(heavy)
+
+    return coords, method, converged, arbitrated_smiles, undefined_labels
+
+
+# ---------------------------------------------------------------------------
 # XYZ writer
 # ---------------------------------------------------------------------------
 
@@ -414,6 +513,10 @@ _LOG_COLUMNS = [
     "n_kept",
     "rmsd_prune",
     "converged",
+    "provenance_status",
+    "undefined_centers",
+    "pubchem_smiles",
+    "arbitrated_smiles",
 ]
 
 
@@ -438,6 +541,10 @@ def _manifest_conformer_log_rows(
     }
     rows = []
     for molecule in manifest["molecules"]:
+        provenance_status = molecule.get("provenance_status", "normal")
+        undefined_centers = molecule.get("undefined_centers", "") or ""
+        pubchem_smiles = molecule.get("pubchem_smiles", "") or ""
+        arbitrated_smiles = molecule.get("arbitrated_smiles", "") or ""
         for conformer in sorted(
             molecule["conformers"], key=lambda record: record["conformer_id"]
         ):
@@ -479,6 +586,10 @@ def _manifest_conformer_log_rows(
                 "n_kept": conformer["n_kept"],
                 "rmsd_prune": conformer["rmsd_prune"],
                 "converged": conformer["converged"],
+                "provenance_status": provenance_status,
+                "undefined_centers": undefined_centers,
+                "pubchem_smiles": pubchem_smiles,
+                "arbitrated_smiles": arbitrated_smiles,
             })
     return rows
 
@@ -504,161 +615,6 @@ def _stage_conformer_log(rows: list[dict], log_csv: str) -> str:
     return staged_path
 
 
-def _write_conformer_log_atomically(rows: list[dict], log_csv: str) -> None:
-    """Atomically replace the subordinate conformer index without touching manifest."""
-    staged_path = _stage_conformer_log(rows, log_csv)
-    try:
-        os.replace(staged_path, log_csv)
-    except Exception:
-        try:
-            os.unlink(staged_path)
-        except OSError:
-            pass
-        raise
-
-
-def _conformer_log_matches_rows(log_csv: str, rows: list[dict]) -> bool:
-    """Return whether an existing CSV semantically matches canonical rows."""
-    if not os.path.isfile(log_csv):
-        return False
-    try:
-        actual = pd.read_csv(log_csv)
-        if list(actual.columns) != _LOG_COLUMNS:
-            return False
-        expected = pd.DataFrame(rows, columns=_LOG_COLUMNS)
-        actual["pipeline_commit"] = actual["pipeline_commit"].fillna("").astype(str)
-        expected["pipeline_commit"] = (
-            expected["pipeline_commit"].fillna("").astype(str)
-        )
-        sort_columns = ["artifact_id"] if len(expected) else []
-        if sort_columns:
-            actual = actual.sort_values(sort_columns).reset_index(drop=True)
-            expected = expected.sort_values(sort_columns).reset_index(drop=True)
-        pd.testing.assert_frame_equal(
-            actual,
-            expected,
-            check_dtype=False,
-            check_exact=False,
-            rtol=0.0,
-            atol=1e-12,
-        )
-    except (AssertionError, OSError, ValueError, TypeError):
-        return False
-    return True
-
-# Recorded fields that define a run's conformer-search configuration. A resumed
-# molecule may be skipped ONLY if its existing rows were produced with the same
-# values for all of these; otherwise its rows are stale and it is regenerated
-# (M-09). `seed`, `n_generate`, `top_n`, `rmsd_prune` are the requested search
-# knobs; `pipeline_version`, `pipeline_commit`, and `rdkit_version` are run-level
-# guards — a code change to the generation logic or a different RDKit
-# (ETKDGv3+MMFF geometry is RDKit-version-dependent, B-02 call 1b) invalidates a
-# cached geometry. Clean nonblank commits must match; dirty commits are never
-# reusable because one ``sha.dirty`` marker cannot identify working-tree content
-# (M-20). `cid`/`smiles` are per-molecule identity and are checked separately in
-# `_resume_partition`, not here.
-_RESUME_CONFIG_FIELDS = (
-    "seed", "n_generate", "top_n", "rmsd_prune", "pipeline_version",
-    "pipeline_commit", "rdkit_version",
-)
-
-
-def _commit_key(value) -> str:
-    """Normalize best-effort commit provenance; missing/NaN becomes blank."""
-    if value is None or pd.isna(value):
-        return ""
-    return str(value).strip()
-
-
-def _row_config_matches(row: dict, config: dict) -> bool:
-    """
-    True iff a recorded conformer_log *row* was produced with *config*.
-
-    Missing columns (a pre-provenance / older-schema log) or unparseable values
-    count as a mismatch, so such rows are conservatively regenerated rather than
-    trusted. `rmsd_prune` is compared with a small float tolerance; the ints
-    (seed/n_generate/top_n) and strings (`pipeline_version`, `rdkit_version`) are
-    compared exactly. When both source commits are available they must also match;
-    a dirty commit on either side always invalidates reuse because the marker does
-    not identify the uncommitted content (M-20). Either unavailable commit also
-    disables reuse; there is no version-only fallback. Per-molecule identity
-    (`cid`/`smiles`) is validated by the caller, not here.
-    """
-    try:
-        for field in ("pipeline_version", "rdkit_version"):
-            if str(row[field]) != str(config[field]):
-                return False
-        for field in ("seed", "n_generate", "top_n"):
-            if int(row[field]) != int(config[field]):
-                return False
-        if not math.isclose(
-            float(row["rmsd_prune"]), float(config["rmsd_prune"]), rel_tol=0.0, abs_tol=1e-9
-        ):
-            return False
-    except (KeyError, TypeError, ValueError):
-        return False
-
-    row_commit = _commit_key(row.get("pipeline_commit"))
-    config_commit = _commit_key(config.get("pipeline_commit"))
-    if not row_commit or not config_commit:
-        return False
-    if row_commit.endswith(".dirty") or config_commit.endswith(".dirty"):
-        return False
-    if row_commit != config_commit:
-        return False
-    return True
-
-
-def _row_manifest_matches(row: dict, manifest_path: str, manifest: dict) -> bool:
-    """Validate one retained XYZ row against exact manifest identity and bytes."""
-    try:
-        if str(row["run_id"]) != manifest["run_id"]:
-            return False
-        if str(row["config_hash"]) != manifest["config_hash"]:
-            return False
-        artifact_id = str(row["artifact_id"])
-        artifact = find_artifact(manifest, artifact_id)
-        if artifact["kind"] != "xyz":
-            return False
-        molecule, conformer = find_conformer_record(
-            manifest, artifact["conformer_record_id"]
-        )
-        if str(row.get("name")) != molecule["molecule_name"]:
-            return False
-        if not _row_identity_matches(
-            row, molecule["CID"], molecule["IsomericSMILES"]
-        ):
-            return False
-        if _integer_key(row.get("conformer_id")) != conformer["conformer_id"]:
-            return False
-        if str(row.get("method")) != conformer["method"]:
-            return False
-        if _integer_key(row.get("n_generated")) != conformer["n_generated"]:
-            return False
-        if _integer_key(row.get("n_kept")) != conformer["n_kept"]:
-            return False
-        if not math.isclose(
-            float(row.get("rel_energy_kcalmol")),
-            float(conformer["relative_energy_kcalmol"]),
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        ):
-            return False
-        converged_value = parse_strict_bool(
-            row.get("converged"),
-            field_name=f"Conformer row {row.get('conformer_id')!r} converged",
-        )
-        if converged_value is not conformer["converged"]:
-            return False
-        if str(row["xyz_sha256"]) != artifact["sha256"]:
-            return False
-        if relative_artifact_path(str(row["xyz_path"]), manifest_path) != artifact["relative_path"]:
-            return False
-        return sha256_file(str(row["xyz_path"])) == artifact["sha256"]
-    except (KeyError, OSError, TypeError, ValueError):
-        return False
-
-
 def _cid_key(x):
     """Normalize a CID for identity comparison (int or None); never raises."""
     try:
@@ -672,120 +628,6 @@ def _smiles_key(x) -> str:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return ""
     return str(x).strip()
-
-
-def _row_identity_matches(row: dict, cid, smiles) -> bool:
-    """
-    True iff a recorded *row* was produced for the same molecule identity
-    (``cid`` and ``smiles``) requested this run (B-02). A corrected structure —
-    same molecule `name` but a different CID/SMILES — is therefore treated as
-    stale and regenerated, never silently reused.
-    """
-    return (
-        _cid_key(row.get("cid")) == _cid_key(cid)
-        and _smiles_key(row.get("smiles")) == _smiles_key(smiles)
-    )
-
-
-def _row_xyz_present(row: dict) -> bool:
-    """True iff a recorded row's ``xyz_path`` exists on disk and is non-empty (B-02)."""
-    path = row.get("xyz_path")
-    if path is None or (isinstance(path, float) and pd.isna(path)) or str(path).strip() == "":
-        return False
-    return os.path.exists(str(path)) and os.path.getsize(str(path)) > 0
-
-
-def _integer_key(value):
-    """Normalize an integer-like CSV value; return ``None`` when invalid."""
-    if isinstance(value, bool):
-        return None
-    try:
-        if value is None or pd.isna(value):
-            return None
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(number) or not number.is_integer():
-        return None
-    return int(number)
-
-
-def _resume_group_is_complete(
-    rows: list[dict], manifest_path: str | None = None, manifest: dict | None = None
-) -> bool:
-    """
-    Validate that one molecule's resume rows form a complete conformer set.
-
-    A resumable group must contain the number of rows declared by ``n_kept``;
-    every row must agree on that positive count; conformer IDs must be the unique
-    contiguous set ``0..n_kept-1``; and XYZ paths must be unique, present, and
-    non-empty (M-12). This rejects truncated, duplicated, or manually damaged
-    logs even when each surviving row is individually valid.
-    """
-    if not rows:
-        return False
-
-    n_kept_values = [_integer_key(row.get("n_kept")) for row in rows]
-    if any(value is None or value < 1 for value in n_kept_values):
-        return False
-    if len(set(n_kept_values)) != 1:
-        return False
-    n_kept = n_kept_values[0]
-    if len(rows) != n_kept:
-        return False
-
-    conformer_ids = [_integer_key(row.get("conformer_id")) for row in rows]
-    if any(value is None or value < 0 for value in conformer_ids):
-        return False
-    if sorted(conformer_ids) != list(range(n_kept)):
-        return False
-
-    xyz_paths = []
-    for row in rows:
-        if not _row_xyz_present(row):
-            return False
-        xyz_paths.append(os.path.normcase(os.path.abspath(str(row["xyz_path"]))))
-    if len(set(xyz_paths)) != len(xyz_paths):
-        return False
-    if manifest_path is not None:
-        manifest = manifest or load_manifest(manifest_path)
-        if not all(_row_manifest_matches(row, manifest_path, manifest) for row in rows):
-            return False
-    return True
-
-
-def _group_identity_is_consistent(rows: list[dict]) -> bool:
-    """True iff retained rows agree on one non-empty molecule identity (M-15)."""
-    if not rows:
-        return False
-
-    names = {str(row.get("name")) for row in rows}
-    cid_values = {_cid_key(row.get("cid")) for row in rows}
-    smiles_values = {_smiles_key(row.get("smiles")) for row in rows}
-    return (
-        len(names) == 1
-        and len(cid_values) == 1
-        and None not in cid_values
-        and len(smiles_values) == 1
-        and "" not in smiles_values
-    )
-
-
-def _carry_forward_group_is_valid(
-    rows: list[dict],
-    config: dict,
-    manifest_path: str | None = None,
-    manifest: dict | None = None,
-) -> bool:
-    """Validate an unrequested group before append-mode carry-forward (M-15)."""
-    return (
-        _resume_group_is_complete(rows, manifest_path, manifest)
-        and _group_identity_is_consistent(rows)
-        and all(_row_config_matches(row, config) for row in rows)
-        # The commit is best-effort and may be blank, but the field itself must
-        # exist so an old schema cannot be mistaken for current provenance.
-        and all("pipeline_commit" in row for row in rows)
-    )
 
 
 def validate_unique_output_basenames(labels: list[str]) -> None:
@@ -819,76 +661,6 @@ def validate_unique_output_basenames(labels: list[str]) -> None:
         seen_basenames[basename] = label
 
 
-def _resume_partition(
-    existing,
-    config: dict,
-    requested: dict,
-    preserve_unrequested: bool = False,
-    manifest_path: str | None = None,
-    manifest: dict | None = None,
-):
-    """
-    Split an existing conformer_log into resumable, carry-forward, and stale sets.
-
-    *requested* maps each molecule name requested this run to its identity dict
-    ``{"cid": ..., "smiles": ...}`` (B-02): identity is per-molecule, so it is
-    matched against the requested molecule, not a run-level config.
-
-    Groups rows by molecule name and, for each molecule **requested this run**,
-    keeps it only if (a) its rows form the complete, self-consistent conformer
-    group declared by ``n_kept`` (M-12), (b) every row matches the run-level
-    *config* (search knobs, pipeline + RDKit version — M-09 / B-02), and (c)
-    every row matches the requested molecule's ``cid``/``smiles`` identity.
-
-    Molecules **not requested this run** are dropped from the new log by default
-    (M-02 call 2a): the conformer log represents the molecules requested this run,
-    so a changed molecule list yields a clean current run. When
-    *preserve_unrequested* is True (the ``append=True`` opt-in), each retained
-    group must pass complete-group, XYZ, current-config/version, internal-identity,
-    and provenance checks (M-15). Invalid unrequested groups cannot be regenerated
-    from the current molecule table, so they are reported to the caller instead
-    of being silently kept or dropped.
-
-    Returns ``(done_names, kept_rows, stale_names, invalid_retained)`` where
-    ``done_names`` are skipped as complete, ``kept_rows`` are preserved in the
-    new log, ``stale_names`` are requested groups that must regenerate, and
-    ``invalid_retained`` maps invalid unrequested group names to failure reasons.
-    """
-    groups: dict[str, list] = {}
-    for rec in existing.to_dict("records"):
-        groups.setdefault(str(rec.get("name")), []).append(rec)
-
-    done_names: set = set()
-    kept_rows: list = []
-    stale_names: set = set()
-    invalid_retained: dict[str, str] = {}
-    for name, rows in groups.items():
-        if name not in requested:
-            if preserve_unrequested:
-                if _carry_forward_group_is_valid(
-                    rows, config, manifest_path, manifest
-                ):
-                    kept_rows.extend(rows)
-                else:
-                    invalid_retained[name] = (
-                        "incomplete group, missing XYZ, config/version mismatch, "
-                        "missing provenance, or inconsistent identity"
-                    )
-            continue
-        cid = requested[name].get("cid")
-        smiles = requested[name].get("smiles")
-        if _resume_group_is_complete(rows, manifest_path, manifest) and all(
-            _row_config_matches(r, config)
-            and _row_identity_matches(r, cid, smiles)
-            for r in rows
-        ):
-            done_names.add(name)
-            kept_rows.extend(rows)
-        else:
-            stale_names.add(name)  # config/version/identity drift — regenerate
-    return done_names, kept_rows, stale_names, invalid_retained
-
-
 def search_conformers(
     molecule_table,
     xyz_dir: str = "conformer_xyz",
@@ -898,7 +670,6 @@ def search_conformers(
     top_n: int = TOP_N,
     rmsd_prune: float = RMSD_PRUNE,
     seed: int = SEED,
-    append: bool = False,
     manifest_path: str = "run_manifest.json",
 ) -> pd.DataFrame:
     """
@@ -924,27 +695,17 @@ def search_conformers(
     XYZ comment carries the ``UNCONVERGED_FF_SEED`` marker and its FF energy is
     unreliable.
 
-    Resume-safe (M-09 / B-02): a molecule already in *log_csv* is skipped **only**
-    when its recorded run-level config (``seed``, ``n_generate``, ``top_n``,
-    ``rmsd_prune``, ``pipeline_version``, ``rdkit_version``) *and* per-molecule
-    identity (``cid``, ``smiles``) match this call; its rows form the complete set
-    declared by ``n_kept`` with unique contiguous IDs and unique XYZ paths; and
-    every recorded ``xyz_path`` still exists and is non-empty. If any condition
-    fails — or the log predates those provenance columns — its rows are treated as
-    stale, dropped, and the molecule is regenerated (with a warning), so
-    downstream Gaussian inputs are never built from conformers produced under a
-    different configuration, for a different structure, or from a damaged log.
+    Undefined stereo (v2.1 judgment #5): a molecule whose ``IsomericSMILES``
+    leaves stereochemistry unspecified is no longer skipped. It takes the
+    provisional path — one arbitrated structure embedded from the PubChem SMILES
+    (:func:`generate_provisional_conformer`), ``dE=NA``,
+    ``provenance_status=provisional_undefined_stereo``, ``undefined_centers`` /
+    ``arbitrated_smiles`` recorded, a PROVISIONAL marker in the XYZ, and a loud
+    console warning. It is never presented as the defined stereoisomer.
 
-    Manifest coverage (B-10): with ``append=False``, *molecule_table* must match
-    the immutable manifest molecule set exactly. With ``append=True``, a subset is
-    allowed only when valid retained rows account for every other manifest
-    molecule; no configured molecule may disappear silently. Before any output
-    mutation, append mode validates
-    sanitized output basenames across the current labels and all retained labels
-    (B-07), then validates every retained group for completeness, XYZ existence,
-    current config/version, internal identity, and provenance (M-15). A collision
-    or invalid retained group raises rather than overwriting, dropping, or
-    silently preserving questionable chemistry.
+    No resume/append (v2.1, contract §7): every run is fresh and immutable.
+    Pointing this at a run folder whose manifest is already populated with
+    conformers raises rather than reusing or appending — start a new run instead.
 
     Returns the full conformer log as a DataFrame.
     """
@@ -974,45 +735,21 @@ def search_conformers(
         seen_labels.add(label)
         current_labels.append(label)
 
-    # B-07: append mode retains unrequested rows from the existing log, so output
-    # identity must be validated over the UNION of current and retained labels.
-    # Load that log before any directory creation, failure-log deletion, or file
-    # write, and reuse the DataFrame later for resume partitioning. This also
-    # rejects an already-corrupt append log containing colliding labels.
-    existing = None
-    labels_to_validate = list(current_labels)
-    if append and os.path.exists(log_csv):
-        existing = pd.read_csv(log_csv)
-        current_label_set = set(current_labels)
-        labels_to_validate.extend(
-            str(name)
-            for name in existing.get("name", pd.Series(dtype=object)).tolist()
-            if str(name) not in current_label_set
-        )
-    validate_unique_output_basenames(labels_to_validate)
+    # §6 collision safety, now within the single run folder: distinct labels must
+    # remain distinct after sanitization before any output mutation.
+    validate_unique_output_basenames(current_labels)
 
     # Provenance captured once per run (M-06): pipeline version + best-effort git
     # commit, so conformer_log rows and XYZ files tie back to the code revision.
     pipeline_version, pipeline_commit = pipeline_provenance()
-    # RDKit version is captured up front (B-02): ETKDGv3+MMFF geometry is
-    # RDKit-version-dependent, so the resume check must compare each recorded
-    # rdkit_version against this run's before reusing a cached geometry.
     rdkit_ver = _rdkit_version()
 
-    # This run's conformer-search configuration; resumed rows must match it.
-    run_config = {
+    manifest_config = {
         "method_policy": METHOD_POLICY,
         "seed": seed,
         "n_generate": n_generate,
         "top_n": top_n,
         "rmsd_prune": rmsd_prune,
-        "pipeline_version": pipeline_version,
-        "pipeline_commit": pipeline_commit,
-        "rdkit_version": rdkit_ver,
-    }
-    manifest_config = {
-        key: run_config[key]
-        for key in ("method_policy", "seed", "n_generate", "top_n", "rmsd_prune")
     }
     manifest = assert_stage_configuration(
         manifest_path, "conformer", manifest_config
@@ -1026,10 +763,20 @@ def search_conformers(
             raise ValueError(
                 f"Runtime {field} disagrees with run manifest; create a new manifest."
             )
-    # Per-molecule identity requested this run (B-02): name → {cid, smiles}. Resume
-    # matches recorded rows against the requested molecule's identity, so a
-    # corrected CID/SMILES under an unchanged name regenerates instead of reusing
-    # a stale geometry.
+
+    # v2.1 (contract §7): resume/append is removed. An already-populated run
+    # folder must not be reused, appended to, or repaired — it raises so the user
+    # starts a fresh run. A fresh manifest has no conformer records and no
+    # artifacts, so this never fires in normal single-run use.
+    if any(molecule["conformers"] for molecule in manifest["molecules"]) or manifest["artifacts"]:
+        raise ValueError(
+            "This run folder is already populated with conformer records; v2.1 "
+            "has no resume/append path. Start a new run with a fresh run_id "
+            "instead of reusing an existing run package."
+        )
+
+    # Per-molecule identity requested this run: name → {cid, smiles}. Must match
+    # the immutable manifest molecule set exactly (no subset without append).
     requested = {
         str(row.get("name")): {
             "cid": row.get("cid"),
@@ -1060,107 +807,26 @@ def search_conformers(
         raise ValueError(
             "Runtime molecule identities disagree with run manifest; create a new manifest."
         )
-    if not append and requested_identities != configured_identities:
+    if requested_identities != configured_identities:
         missing = sorted(
             record["molecule_name"]
             for record in configured_records
             if record["molecule_identity_hash"] not in requested_identities
         )
         raise ValueError(
-            "append=False requires the runtime molecule table to match the run "
-            "manifest exactly; missing manifest molecule(s): " + ", ".join(missing)
+            "The runtime molecule table must match the run manifest exactly; "
+            "missing manifest molecule(s): " + ", ".join(missing)
         )
 
-    # Resume-safe (M-09 / B-02 / M-15): only skip a requested molecule whose
-    # existing rows were
-    # produced with THIS run's config AND identity, and whose XYZ files still
-    # exist. Rows from a different seed/n_generate/top_n/rmsd_prune, pipeline or
-    # RDKit version, a different cid/smiles, or with a missing XYZ (or a
-    # pre-provenance log) are stale — drop them and regenerate so downstream never
-    # builds on outdated conformers.
-    if os.path.exists(log_csv):
-        if existing is None:
-            existing = pd.read_csv(log_csv)
-        done_names, log_rows, stale_names, invalid_retained = _resume_partition(
-            existing,
-            run_config,
-            requested,
-            preserve_unrequested=append,
-            manifest_path=manifest_path,
-            manifest=manifest,
-        )
-        if invalid_retained:
-            details = "; ".join(
-                f"{name!r}: {reason}"
-                for name, reason in sorted(invalid_retained.items())
-            )
-            raise ValueError(
-                "append=True cannot carry forward invalid existing conformer "
-                "group(s): "
-                + details
-                + ". Rerun with those molecules included so they can be "
-                "regenerated, repair the existing log/XYZ files, or use "
-                "append=False."
-            )
-        for name in sorted(stale_names):
-            print(
-                f"WARNING: {name!r} in {log_csv} has stale config/identity, "
-                f"missing geometry, or an incomplete conformer group; "
-                f"regenerating (stale rows dropped) so downstream inputs are "
-                f"not built on invalid conformers."
-            )
-    else:
-        done_names = set()
-        log_rows = []
-
-    if append:
-        accounted_names = set(requested)
-        accounted_names.update(str(row.get("name")) for row in log_rows)
-        configured_names = {
-            str(record["molecule_name"]) for record in configured_records
-        }
-        if accounted_names != configured_names:
-            missing = sorted(configured_names - accounted_names)
-            extra = sorted(accounted_names - configured_names)
-            details = []
-            if missing:
-                details.append("missing manifest molecule(s): " + ", ".join(missing))
-            if extra:
-                details.append("unexpected molecule(s): " + ", ".join(extra))
-            raise ValueError(
-                "append=True requires current rows plus valid retained rows to "
-                "account for the complete run manifest; " + "; ".join(details)
-            )
+    log_rows: list[dict] = []
 
     # M-30: every v2 output destination must stay inside the manifest package,
     # validated BEFORE the first mutation. An xyz_dir or authoritative conformer
-    # log outside the package must raise before any conformer-lineage removal,
-    # directory creation, failure-log deletion, XYZ write, or log rewrite. Every
-    # per-conformer XYZ path is built only as os.path.join(xyz_dir, base + ...),
-    # and the basename is already validated, so directory-level checks suffice.
+    # log outside the package must raise before any directory creation,
+    # failure-log deletion, XYZ write, or log rewrite.
     relative_artifact_path(xyz_dir, manifest_path)
     relative_artifact_path(log_csv, manifest_path)
 
-    # The manifest is authoritative and contains enough information to rebuild
-    # the complete subordinate conformer index.  Repair a missing/stale CSV
-    # atomically before generation when every currently published XYZ still
-    # verifies.  Resume decisions above intentionally remain based on the input
-    # CSV, so a damaged log still triggers the requested regeneration; the
-    # repaired canonical log is the rollback state if that regeneration fails.
-    try:
-        canonical_rows = _manifest_conformer_log_rows(
-            manifest_path, manifest, verify_xyz=True
-        )
-    except (OSError, ValueError):
-        canonical_rows = None
-    if canonical_rows is not None and not _conformer_log_matches_rows(
-        log_csv, canonical_rows
-    ):
-        _write_conformer_log_atomically(canonical_rows, log_csv)
-
-    # All append validation above is intentionally complete before the first
-    # output mutation (M-15). An invalid retained group must leave the prior log,
-    # XYZ files, and failure log byte-for-byte unchanged.
     ensure_dir(xyz_dir)
 
     # Clear any stale failure log from a prior run (MIN-02) so a later clean run
@@ -1173,7 +839,7 @@ def search_conformers(
 
     for _, row in molecule_table.iterrows():
         name = row.get("name")
-        if name is None or str(name) in done_names:
+        if name is None:
             continue
 
         # NB: this reads the molecule TABLE's own "IsomericSMILES" column
@@ -1183,50 +849,94 @@ def search_conformers(
         smiles = row.get("IsomericSMILES")
         cid = row.get("cid")
 
-        # Stereo/validity gate (remediation B-01, decision 2a): skip + log rather
-        # than let RDKit auto-assign stereo or embed an empty/unparseable SMILES.
         skip_reason = check_conformer_eligibility(smiles)
-        if skip_reason is not None:
-            failed.append({
-                "name": name,
-                "cid": cid,
-                "smiles": smiles,
-                "error": skip_reason,
-            })
-            continue
 
-        try:
-            coords_list, energies_kcal, method, converged = generate_conformers(
-                str(smiles),
-                n_generate=n_generate,
-                rmsd_prune=rmsd_prune,
-                seed=seed,
+        # Per-molecule normalized publication inputs. The provisional path (§9)
+        # and the normal ensemble path both feed the SAME publication block below
+        # — the only difference rides on `provisional` and the marker fields.
+        provisional = False
+        undefined_centers_label = ""
+        arbitrated_smiles = ""
+        pubchem_smiles = ""
+
+        if skip_reason is None:
+            try:
+                coords_list, energies_kcal, method, converged = generate_conformers(
+                    str(smiles),
+                    n_generate=n_generate,
+                    rmsd_prune=rmsd_prune,
+                    seed=seed,
+                )
+            except Exception as e:  # noqa: BLE001 — log and continue, never crash the batch
+                failed.append({
+                    "name": name, "cid": cid, "smiles": smiles, "error": repr(e),
+                })
+                continue
+
+            n_generated = len(energies_kcal)
+            # Rank/select only converged conformers (M-04 1a); if none converged,
+            # carry exactly one flagged best-effort seed (2b).
+            keep, all_failed = select_converged_top_n(energies_kcal, converged, top_n)
+            if all_failed:
+                print(
+                    f"WARNING: no conformer converged for {name!r} after retry; "
+                    f"carrying 1 best-effort {UNCONVERGED_FF_SEED} geometry — its FF "
+                    f"energy is unreliable and it is an unminimized DFT start."
+                )
+            # ΔE reference is the lowest energy among the CARRIED conformers, so
+            # the kept minimum is 0.0 kcal/mol.
+            e_min = min(energies_kcal[i] for i in keep) if keep else 0.0
+        elif skip_reason == "undefined stereochemistry":
+            # v2.1 judgment #5: embed ONE provisional, loudly-flagged structure
+            # rather than skipping. Never a silent stereo guess.
+            try:
+                (
+                    prov_coords, method, prov_converged, arbitrated_smiles,
+                    undefined_labels,
+                ) = generate_provisional_conformer(str(smiles), seed=seed)
+            except Exception as e:  # noqa: BLE001 — log and continue
+                failed.append({
+                    "name": name, "cid": cid, "smiles": smiles, "error": repr(e),
+                })
+                continue
+            provisional = True
+            pubchem_smiles = str(smiles)
+            coords_list = [prov_coords]
+            energies_kcal = [0.0]
+            converged = [prov_converged]
+            keep = [0]
+            n_generated = 1
+            e_min = 0.0
+            undefined_centers_label = (
+                ", ".join(undefined_labels)
+                if undefined_labels
+                else "unspecified center(s)"
             )
-        except Exception as e:  # noqa: BLE001 — log and continue, never crash the batch
-            failed.append({
-                "name": name,
-                "cid": cid,
-                "smiles": smiles,
-                "error": repr(e),
-            })
-            continue
-
-        n_generated = len(energies_kcal)
-        # Rank/select only converged conformers (M-04 1a); if none converged,
-        # carry exactly one flagged best-effort seed (2b).
-        keep, all_failed = select_converged_top_n(energies_kcal, converged, top_n)
-        if all_failed:
+            k = len(undefined_labels)
+            isomer_note = (
+                f" ({k} undefined centres → {2 ** k} isomers possible, one arbitrated)"
+                if k > 1
+                else ""
+            )
             print(
-                f"WARNING: no conformer converged for {name!r} after retry; "
-                f"carrying 1 best-effort {UNCONVERGED_FF_SEED} geometry — its FF "
-                f"energy is unreliable and it is an unminimized DFT start."
+                f"WARNING: {name!r} has undefined stereochemistry at "
+                f"{undefined_centers_label}{isomer_note}; conformer search skipped. "
+                f"Embedded ONE provisional structure from the PubChem SMILES with an "
+                f"ARBITRARY choice at the undefined centre(s) — an unvalidated DFT "
+                f"start, NOT the compound's real configuration. dE=NA."
             )
-        # ΔE reference is the lowest energy among the CARRIED conformers, so the
-        # kept minimum is 0.0 kcal/mol. (In the all-failed branch the single
-        # carried seed is trivially its own reference.)
-        e_min = min(energies_kcal[i] for i in keep) if keep else 0.0
+        else:
+            # no IsomericSMILES / unparseable SMILES — skip + log (never guess).
+            failed.append({
+                "name": name, "cid": cid, "smiles": smiles, "error": skip_reason,
+            })
+            continue
+
         n_kept = len(keep)
         base = sanitize_basename(str(name))
+        provenance_status = (
+            PROVENANCE_PROVISIONAL if provisional else PROVENANCE_NORMAL
+        )
 
         staging_dir = tempfile.mkdtemp(prefix=f".staging-{base}-", dir=xyz_dir)
         staged_log_path = None
@@ -1237,7 +947,9 @@ def search_conformers(
                 filename = f"{base}_c{ii:02d}.xyz"
                 xyz_path = os.path.join(xyz_dir, filename)
                 staged_xyz_path = os.path.join(staging_dir, filename)
-                rel_e = round(energies_kcal[conf_idx] - e_min, 6)
+                # Provisional: dE=NA in artifacts (no ensemble reference), 0.0 in
+                # the manifest/log (its own reference within a group of one).
+                rel_e = 0.0 if provisional else round(energies_kcal[conf_idx] - e_min, 6)
                 is_converged = bool(converged[conf_idx])
                 unconv_tag = "" if is_converged else f" {UNCONVERGED_FF_SEED}"
                 molecule_hash = molecule_identity_hash(name, cid, smiles)
@@ -1247,15 +959,20 @@ def search_conformers(
                 artifact_id = stable_record_id(
                     manifest["run_id"], "xyz", conformer_record_id
                 )
+                # v2.1 per-artifact metadata (contract §5): XYZ line 2 carries
+                # only inline science (dE, method) + the one artifact_id.
+                if provisional:
+                    de_field = "dE=NA"
+                    marker = f" PROVISIONAL: stereo arbitrated at {undefined_centers_label}"
+                else:
+                    de_field = f"dE={rel_e:.6f} kcal/mol"
+                    marker = ""
                 _write_xyz(
                     staged_xyz_path,
                     coords_list[conf_idx],
                     comment=(
-                        f"run_id={manifest['run_id']} artifact_id={artifact_id} "
-                        f"config_hash={manifest['config_hash']} conformer_id={ii} "
-                        f"relative_energy_kcalmol={rel_e:.6f} method={method} "
-                        f"pipeline_version={pipeline_version} rdkit_version={rdkit_ver}"
-                        f"{unconv_tag}"
+                        f"{de_field} method={method} artifact_id={artifact_id}"
+                        f"{unconv_tag}{marker}"
                     ),
                 )
                 group_payload.append({
@@ -1290,6 +1007,10 @@ def search_conformers(
                     "n_kept": n_kept,
                     "rmsd_prune": rmsd_prune,
                     "converged": is_converged,
+                    "provenance_status": provenance_status,
+                    "undefined_centers": undefined_centers_label,
+                    "pubchem_smiles": pubchem_smiles,
+                    "arbitrated_smiles": arbitrated_smiles,
                 })
 
             for expected, log_row in zip(group_payload, group_log_rows):
@@ -1305,7 +1026,7 @@ def search_conformers(
             candidate_log_rows = [
                 row
                 for row in _manifest_conformer_log_rows(
-                    manifest_path, current_manifest, verify_xyz=False
+                    manifest_path, current_manifest
                 )
                 if row["name"] != str(name)
             ]
@@ -1332,6 +1053,10 @@ def search_conformers(
                 conformers=group_payload,
                 conformer_log_path=log_csv,
                 staged_conformer_log_path=staged_log_path,
+                provenance_status=provenance_status,
+                undefined_centers=undefined_centers_label if provisional else None,
+                pubchem_smiles=pubchem_smiles if provisional else None,
+                arbitrated_smiles=arbitrated_smiles if provisional else None,
             )
             for expected, result, log_row in zip(
                 group_payload, recorded, group_log_rows
@@ -1378,7 +1103,11 @@ def search_conformers(
             out_df["pipeline_commit"].fillna("").astype(str)
         )
     else:
+        # Zero-job run (M-11): no molecule produced a conformer group, so no
+        # group transaction wrote the log. Write a header-only log so the
+        # downstream Gaussian stage can consume a valid, empty index.
         out_df = pd.DataFrame(columns=_LOG_COLUMNS)
+        out_df.to_csv(log_csv, index=False)
 
     if failed:
         pd.DataFrame(failed).to_csv(failed_csv, index=False)

@@ -195,10 +195,10 @@ def _gaussian_provenance_problems(text: str) -> list[str]:
         if field not in writer_args:
             problems.append(f"write_gaussian_com missing parameter {field}")
 
-    literals = _function_runtime_literals(writer)
-    for token in ("provenance ", "pipeline=", "commit=", "rdkit="):
-        if token not in literals:
-            problems.append(f"write_gaussian_com title missing token {token!r}")
+    # v2.1 (contract §5): the COM title no longer carries a `provenance …` line
+    # or the linkage/version tokens — they are manifest-only now. The writer still
+    # accepts and validates those fields (checked above via parameters) so the COM
+    # write log and manifest stay authoritative; it just does not print them.
 
     # M-17: a direct call with `conformer_id` is still a v2 scientific output and
     # must not bypass the protected batch boundary. The helper must condition on
@@ -402,13 +402,27 @@ def check_gaussian_provenance() -> list[str]:
     ]
 
 
-# 5) Conformer reuse/output provenance (M-15/M-19/M-20). Unrequested groups
-# cannot be regenerated from the current molecule table, so append mode must
-# validate and reject them before any output mutation rather than copying them
-# untouched. Generated XYZ comments must identify RDKit, and cached clean commit
-# provenance must match while dirty worktrees are never reusable.
-def _append_integrity_problems(text: str) -> list[str]:
-    """Return missing M-15 append-boundary semantics in conformer source text."""
+# 5) v2.1 resume/append removal (contract §7, architecture Change 4). Every run
+# is fresh and immutable; the entire reuse subsystem is deleted, which removes
+# B-04 by construction. This guard proves the resume path is GONE — not merely
+# refactored — so a future change cannot quietly reintroduce it: search_conformers
+# must expose no `append` parameter and no resume helpers, and it must raise on an
+# already-populated run folder rather than reusing it. It also holds the reduced
+# XYZ provenance tokens (dE / method / artifact_id).
+_REMOVED_RESUME_FUNCTIONS = (
+    "_resume_partition",
+    "_row_config_matches",
+    "_carry_forward_group_is_valid",
+    "_commit_key",
+    "_row_manifest_matches",
+    "_resume_group_is_complete",
+    "_conformer_log_matches_rows",
+    "_write_conformer_log_atomically",
+)
+
+
+def _no_resume_problems(text: str) -> list[str]:
+    """Return violations of the v2.1 no-resume / immutable-run contract."""
     try:
         tree = ast.parse(text)
     except SyntaxError as exc:
@@ -417,141 +431,57 @@ def _append_integrity_problems(text: str) -> list[str]:
     functions = {
         node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
     }
-    carry = functions.get("_carry_forward_group_is_valid")
-    config_match = functions.get("_row_config_matches")
-    partition = functions.get("_resume_partition")
-    search = functions.get("search_conformers")
     problems = []
-    for name, function in (
-        ("_carry_forward_group_is_valid", carry),
-        ("_row_config_matches", config_match),
-        ("_resume_partition", partition),
-        ("search_conformers", search),
-    ):
-        if function is None:
-            problems.append(f"{name} is missing")
-    if carry is None or config_match is None or partition is None or search is None:
+    for removed in _REMOVED_RESUME_FUNCTIONS:
+        if removed in functions:
+            problems.append(f"resume helper {removed} was not removed")
+
+    search = functions.get("search_conformers")
+    if search is None:
+        problems.append("search_conformers is missing")
         return problems
 
-    config_literals = _function_runtime_literals(config_match)
-    commit_getters = {
-        node.func.value.id
-        for node in ast.walk(config_match)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "get"
-        and isinstance(node.func.value, ast.Name)
-        and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and node.args[0].value == "pipeline_commit"
-    }
-    if not {"row", "config"}.issubset(commit_getters):
-        problems.append("resume config matching omits pipeline_commit")
-    blank_commit_guards = {
-        node.operand.id
-        for node in ast.walk(config_match)
-        if isinstance(node, ast.UnaryOp)
-        and isinstance(node.op, ast.Not)
-        and isinstance(node.operand, ast.Name)
-        and node.operand.id in {"row_commit", "config_commit"}
-    }
-    if blank_commit_guards != {"row_commit", "config_commit"}:
-        problems.append("resume config matching permits a missing commit")
-    if ".dirty" not in config_literals:
-        problems.append("resume config matching omits dirty-commit rejection")
-
-    carry_calls = {
-        node.func.id
-        for node in ast.walk(carry)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    for required in (
-        "_resume_group_is_complete",
-        "_group_identity_is_consistent",
-        "_row_config_matches",
-    ):
-        if required not in carry_calls:
-            problems.append(f"carry-forward validation omits {required}")
-    if "pipeline_commit" not in _function_runtime_literals(carry):
-        problems.append("carry-forward validation omits pipeline_commit field presence")
-
-    search_literals = _function_runtime_literals(search)
-    if "rdkit_version=" not in search_literals:
-        problems.append("generated XYZ provenance omits rdkit_version= token")
-
-    run_config_keys = set()
-    for node in ast.walk(search):
-        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
-            continue
-        if not any(
-            isinstance(target, ast.Name) and target.id == "run_config"
-            for target in node.targets
-        ):
-            continue
-        run_config_keys.update(
-            key.value
-            for key in node.value.keys
-            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    search_args = {
+        arg.arg
+        for arg in (
+            search.args.posonlyargs + search.args.args + search.args.kwonlyargs
         )
-    if "pipeline_commit" not in run_config_keys:
-        problems.append("search_conformers run_config omits pipeline_commit")
-
-    partition_calls = {
-        node.func.id
-        for node in ast.walk(partition)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
-    partition_names = {
-        node.id for node in ast.walk(partition) if isinstance(node, ast.Name)
-    }
-    if "_carry_forward_group_is_valid" not in partition_calls:
-        problems.append("_resume_partition does not validate carry-forward groups")
-    if "preserve_unrequested" not in partition_names:
-        problems.append("_resume_partition lacks append carry-forward gating")
-    if "invalid_retained" not in partition_names:
-        problems.append("_resume_partition does not report invalid retained groups")
+    if "append" in search_args:
+        problems.append("search_conformers still exposes an append parameter")
 
-    partition_lines = []
-    mutation_lines = []
-    for node in ast.walk(search):
-        if not isinstance(node, ast.Call):
-            continue
-        if isinstance(node.func, ast.Name) and node.func.id == "_resume_partition":
-            partition_lines.append(node.lineno)
-        if isinstance(node.func, ast.Name) and node.func.id == "ensure_dir":
-            mutation_lines.append(node.lineno)
-        if isinstance(node.func, ast.Attribute) and node.func.attr in {"remove", "to_csv"}:
-            mutation_lines.append(node.lineno)
-
-    guard_lines = []
+    # The already-populated run folder must raise (no reuse/append). Look for a
+    # test on manifest conformers/artifacts that raises before generation.
+    search_literals = _function_runtime_literals(search)
+    if "already populated" not in search_literals:
+        problems.append("search_conformers does not reject an already-populated run folder")
+    populated_guard = False
     for node in ast.walk(search):
         if not isinstance(node, ast.If):
             continue
-        test_names = {
-            child.id for child in ast.walk(node.test) if isinstance(child, ast.Name)
-        }
-        if "invalid_retained" in test_names and any(
+        source = ast.dump(node.test)
+        if ("conformers" in source and "artifacts" in source) and any(
             isinstance(child, ast.Raise) for child in ast.walk(node)
         ):
-            guard_lines.append(node.lineno)
-    if not partition_lines:
-        problems.append("search_conformers does not partition the existing log")
-    if not guard_lines:
-        problems.append("search_conformers does not raise for invalid retained groups")
-    elif mutation_lines and min(guard_lines) >= min(mutation_lines):
-        problems.append("invalid retained groups are checked after output mutation")
-    elif partition_lines and min(partition_lines) >= min(guard_lines):
-        problems.append("invalid retained groups are checked before partitioning")
+            populated_guard = True
+    if not populated_guard:
+        problems.append("search_conformers has no populated-run guard that raises")
+
+    # Reduced XYZ provenance tokens (contract §5).
+    for token in ("dE=", "method=", "artifact_id="):
+        if token not in search_literals:
+            problems.append(f"generated XYZ provenance omits {token!r} token")
+
     return problems
 
 
 def check_append_integrity() -> list[str]:
     if not CONFORMERS.exists():
-        return ["[append-integrity] pipeline/conformers.py is missing"]
+        return ["[no-resume] pipeline/conformers.py is missing"]
     text = CONFORMERS.read_text(encoding="utf-8", errors="replace")
     return [
-        f"[append-integrity] {problem}"
-        for problem in _append_integrity_problems(text)
+        f"[no-resume] {problem}"
+        for problem in _no_resume_problems(text)
     ]
 
 
@@ -612,22 +542,28 @@ def _frozen_matrix_problems(
         if token not in manifest_text:
             problems.append(f"manifest contract omits {token!r}")
 
-    xyz_fields = (
-        "run_id=", "artifact_id=", "config_hash=", "conformer_id=",
-        "relative_energy_kcalmol=", "method=", "pipeline_version=",
-        "rdkit_version=",
-    )
+    # v2.1 reduced per-artifact matrix (contract §5). XYZ line 2 carries only
+    # inline science + the one artifact_id back-pointer; the removed fields are
+    # manifest-only and MUST NOT be reintroduced here.
+    xyz_fields = ("dE=", "method=", "artifact_id=")
     for token in xyz_fields:
         if token not in xyz_runtime:
             problems.append(f"XYZ linkage omits {token!r}")
+    for removed in ("run_id=", "config_hash=", "pipeline_version=", "rdkit_version="):
+        if removed in xyz_runtime:
+            problems.append(f"XYZ comment must not carry manifest-only {removed!r}")
 
-    com_fields = (
-        "run_id=", "artifact_id=", "config_hash=", "conformer_id=",
-        "relative_energy_kcalmol=", "pipeline_version=", "rdkit_version=",
-    )
+    # COM title is a single line: name + level-of-theory suffix + dE + artifact_id.
+    com_fields = ("dE=", "artifact_id=")
     for token in com_fields:
         if token not in com_runtime:
             problems.append(f"COM linkage omits {token!r}")
+    for removed in (
+        "run_id=", "config_hash=", "conformer_id=",
+        "pipeline_version=", "rdkit_version=", "provenance ",
+    ):
+        if removed in com_runtime:
+            problems.append(f"COM title must not carry manifest-only {removed!r}")
     for token in ("manifest_path", "record_child_artifact", "sha256_file"):
         if token not in gaussian_text:
             problems.append(f"Gaussian manifest boundary omits {token!r}")
@@ -641,18 +577,20 @@ def _frozen_matrix_problems(
             problems.append(f"Gaussian convergence preflight omits {token!r}")
     for token in (
         "requested_identities != configured_identities",
-        "account for the complete run manifest",
+        "already populated",
     ):
         if token not in conformer_text:
             problems.append(f"Conformer manifest coverage omits {token!r}")
 
-    sh_fields = (
-        "# run_id=", "# artifact_id=", "# source_com_relative_path=",
-        "# source_com_sha256=",
-    )
+    # v2.1 reduced SH header (contract §5): artifact_id + co-located source COM
+    # basename + sha256. run_id and the source-COM relative path are manifest-only.
+    sh_fields = ("# artifact_id=", "# source_com=", "sha256=")
     for token in sh_fields:
         if token not in sh_runtime:
             problems.append(f"SLURM linkage omits {token!r}")
+    for removed in ("# run_id=", "source_com_relative_path"):
+        if removed in sh_runtime:
+            problems.append(f"SH header must not carry manifest-only {removed!r}")
     for token in (
         "zero-byte com_path", "duplicate normalized com_path",
         "collapse to script basename", "record_child_artifact",

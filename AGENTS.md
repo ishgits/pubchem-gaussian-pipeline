@@ -1,9 +1,10 @@
 # AGENTS.md — pubchem-gaussian-pipeline
 
 Universal operating instructions for any coding or reviewing agent working in
-this repository. This file is the source of truth. The exact frozen v2.0 release
-boundary is defined in `docs/release-contract-v2.0.md` and is normative by
-reference.
+this repository. This file is the source of truth. The current release boundary
+is defined in `docs/release-contract-v2.1.md` and is normative by reference;
+`docs/release-contract-v2.0.md` remains the frozen prior boundary that v2.1
+deliberately revises.
 
 ## 1. Project objective
 
@@ -43,26 +44,35 @@ These are load-bearing. A silent change is prohibited.
 - The conformer stage does not infer electronic multiplicity. Gaussian charge
   and multiplicity remain explicit inputs.
 
-## 3. Frozen v2.0 provenance and artifact contract
+## 3. v2.1 provenance and artifact contract
 
-Follow `docs/release-contract-v2.0.md` exactly.
+Follow `docs/release-contract-v2.1.md` exactly. It is a deliberate, Ish-approved
+revision of the frozen `docs/release-contract-v2.0.md`.
 
 - `run_manifest.json` is the authoritative complete provenance record.
-- XYZ and COM are scientific artifacts. They carry `run_id`, `artifact_id`,
-  `config_hash`, and the exact per-artifact fields in the release contract.
-- SLURM scripts are operational artifacts and identify their exact source COM.
-- The supported transfer/archive unit is the complete run package, including the
-  manifest, stage logs, XYZ, COM, and SH directories.
-- Full conformer-search configuration belongs in the manifest. Do not require or
-  add duplicate copies of every knob to each XYZ or COM unless the frozen
-  contract is deliberately revised by Ish.
-- Flat directories remain for v2.0. The `runs/<study>/<run_id>/` redesign is
-  deferred to v2.1.
+- XYZ and COM are scientific artifacts. Under v2.1 their bodies carry only inline
+  science plus a single `artifact_id` back-pointer (XYZ: `dE`, `method`,
+  `artifact_id`; COM title: name, level-of-theory suffix, `dE`, `artifact_id`).
+  Everything else is a manifest lookup and its absence from the artifact body is
+  not a finding.
+- SLURM scripts are operational artifacts. Their header carries `artifact_id` and
+  the source COM basename + SHA-256; COM and SH are co-located so the script runs
+  `g16 <base>_F.com` from its own directory (no path-resolution machinery).
+- The supported transfer/archive unit is the complete run package, which in v2.1
+  is one immutable `runs/<study>/<run_id>/` directory (manifest, stage logs,
+  `conformer_xyz/`, and `gaussian_jobs/` with COM+SH co-located).
+- Full conformer-search configuration belongs in the manifest. Do not add
+  duplicate copies of any knob to each XYZ or COM.
 - All source and destination path collisions, duplicate artifact IDs, missing or
   zero-byte required files, and manifest/hash disagreements fail before output
-  mutation.
-- Resume and append reuse require the same clean, nonblank source commit. Dirty
-  or unavailable git provenance disables reuse and forces regeneration.
+  mutation, now evaluated within the run folder.
+- Resume/append reuse is removed. Every run is fresh and immutable; to add
+  molecules, start a new run. An existing populated run folder raises rather than
+  being reused.
+- Undefined-stereo molecules are no longer skipped: they take the provisional
+  path (one loudly-flagged arbitrated structure, `dE=NA`,
+  `provenance_status=provisional_undefined_stereo`), never silently guessed and
+  never presented as the defined stereoisomer.
 - The legacy Open Babel v1.1 path is explicitly exempt from the strict v2
   manifest contract.
 

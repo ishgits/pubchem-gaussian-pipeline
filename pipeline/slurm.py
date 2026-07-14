@@ -35,6 +35,11 @@ _SLURM_LOG_COLUMNS = [
 # ---------------------------------------------------------------------------
 # Default template — EDIT THIS for your cluster
 # ---------------------------------------------------------------------------
+# v2.1 (contract §5, architecture Change 2): COM and SH are co-located in the
+# per-run gaussian_jobs/ directory, so the script drops all path-resolution
+# machinery (the old SCRIPT_DIR/COM_PATH/cd block) and simply runs g16 on the
+# .com in the current working directory. Operational contract: submit the .sh
+# from the directory that holds its .com (documented in the notebook next-steps).
 DEFAULT_TEMPLATE = """\
 #!/bin/bash
 #SBATCH --account={account}
@@ -48,16 +53,7 @@ DEFAULT_TEMPLATE = """\
 #SBATCH --time={time}
 
 module load gaussian16
-
-# Resolve the Gaussian input relative to THIS script's own location, so the job
-# runs correctly no matter which directory `sbatch` is invoked from (B-03). The
-# .com path is stored relative to the script (e.g. ../gaussian_inputs/x.com); we
-# cd into the input's directory and run g16 on the basename so Gaussian's output
-# files land beside the input.
-SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
-COM_PATH="$SCRIPT_DIR/{com_relpath}"
-cd "$(dirname "$COM_PATH")"
-g16 "$(basename "$COM_PATH")"
+g16 {jobname}.com
 """
 
 
@@ -151,9 +147,8 @@ def write_slurm_script(
     cpus: int = 16,
     mem: str = "32G",
     time: str = "24:00:00",
-    run_id: str | None = None,
     artifact_id: str | None = None,
-    source_com_relative_path: str | None = None,
+    source_com: str | None = None,
     source_com_sha256: str | None = None,
 ) -> str:
     """
@@ -166,15 +161,15 @@ def write_slurm_script(
     outdir : str
         Directory to write the .sh file.
     com_path : str, optional
-        Path to the ``.com`` input this job runs. The script references it
-        **relative to its own location** (``os.path.relpath(com_path, outdir)``),
-        preserving custom directory names, so submitting from any working
-        directory still finds the input (B-03). Defaults to
-        ``{outdir}/{jobname}.com`` (sibling to the script) for backward
-        compatibility.
+        Path to the ``.com`` input this job runs. In v2.1 the COM and SH are
+        co-located in the same ``gaussian_jobs/`` directory, so the script runs
+        ``g16 {jobname}.com`` from its own working directory with no path
+        resolution. Defaults to ``{outdir}/{jobname}.com`` (sibling to the
+        script). Retained only to derive the ``source_com`` basename recorded in
+        the header; not referenced by the script body.
     template : str
         SLURM template with ``{jobname}``, ``{account}``, ``{cpus}``, ``{mem}``,
-        ``{time}``, and ``{com_relpath}`` placeholders.
+        and ``{time}`` placeholders.
     account : str
         SLURM account/allocation name.
     cpus, mem, time : resource parameters.
@@ -187,30 +182,28 @@ def write_slurm_script(
     ensure_dir(outdir)
     sh_path = os.path.join(outdir, f"{jobname}.sh")
 
-    if com_path is None:
-        com_path = os.path.join(outdir, f"{jobname}.com")
-    com_relpath = os.path.relpath(com_path, outdir)
-
     text = template.format(
         jobname=jobname,
         account=account,
         cpus=cpus,
         mem=mem,
         time=time,
-        com_relpath=com_relpath,
     )
-    linkage = (run_id, artifact_id, source_com_relative_path, source_com_sha256)
+    # v2.1 per-artifact metadata (contract §5): the SH header carries only the
+    # single artifact_id back-pointer and the co-located source COM basename +
+    # SHA-256 (the one operationally load-bearing header — it lets the job
+    # confirm it is running the intended COM). run_id and the source-COM
+    # relative path are manifest-only now.
+    linkage = (artifact_id, source_com, source_com_sha256)
     if any(value is not None for value in linkage):
         if any(value is None or not str(value).strip() for value in linkage):
             raise ValueError(
-                "Linked SLURM scripts require run_id, artifact_id, source COM "
-                "relative path, and source COM SHA-256."
+                "Linked SLURM scripts require artifact_id, source COM basename, "
+                "and source COM SHA-256."
             )
         header = (
-            f"# run_id={run_id}\n"
             f"# artifact_id={artifact_id}\n"
-            f"# source_com_relative_path={source_com_relative_path}\n"
-            f"# source_com_sha256={source_com_sha256}\n"
+            f"# source_com={source_com} sha256={source_com_sha256}\n"
         )
         if text.startswith("#!") and "\n" in text:
             shebang, remainder = text.split("\n", 1)
@@ -349,9 +342,8 @@ def write_slurm_scripts(
                 manifest["run_id"], "sh", com_artifact["artifact_id"]
             )
             linked_kwargs = {
-                "run_id": manifest["run_id"],
                 "artifact_id": sh_artifact_id,
-                "source_com_relative_path": com_artifact["relative_path"],
+                "source_com": os.path.basename(com_path),
                 "source_com_sha256": com_artifact["sha256"],
             }
         write_slurm_script(

@@ -33,26 +33,32 @@ names → PubChem              → RDKit conformer search           → Gaussian
 
 **Step 5 — Run manifest.** `run_manifest.json` is the authoritative provenance record. It contains the complete conformer, Gaussian, and SLURM configuration plus molecule identity, artifact lineage, relative paths, and file hashes. XYZ, COM, and SH files carry stable identifiers that link back to the manifest.
 
-The supported archive and transfer unit is the complete run package. An isolated artifact remains identifiable through its IDs, but it is not promised to be independently reproducible without the matching manifest. Resume and append reuse require the same clean source commit; dirty or unavailable git metadata forces regeneration.
+The supported archive and transfer unit is the complete run package — in v2.1 the whole immutable `runs/<study>/<run_id>/` folder. An isolated artifact remains identifiable through its IDs, but it is not promised to be independently reproducible without the matching manifest. **There is no resume/append: every run is fresh and immutable; to add molecules, start a new run.**
 
 
 ## Provenance and reproducibility contract
 
-v2.0 uses a manifest-centric model defined in
-[`docs/release-contract-v2.0.md`](docs/release-contract-v2.0.md):
+v2.1 uses a manifest-centric model defined in
+[`docs/release-contract-v2.1.md`](docs/release-contract-v2.1.md) (a deliberate
+revision of the frozen [`docs/release-contract-v2.0.md`](docs/release-contract-v2.0.md)):
 
 - `run_manifest.json` stores the complete configuration and artifact hashes;
-- XYZ and COM files carry stable `run_id`, `artifact_id`, and `config_hash`
-  linkage plus their required per-artifact metadata;
-- SLURM scripts identify the exact source COM and hash;
+- each run writes one immutable `runs/<study>/<run_id>/` folder, with COM+SH
+  co-located in `gaussian_jobs/`;
+- XYZ and COM bodies carry only inline science plus a single `artifact_id`
+  back-pointer (everything else is a manifest lookup);
+- SLURM scripts identify the exact source COM basename and hash and run
+  `g16 <base>_F.com` from their own directory;
 - every accepted source record maps to one unique destination path;
 - collisions, missing or zero-byte sources, and manifest/hash disagreement fail
   before mutation;
-- resume is disabled when the current or recorded source commit is dirty or
-  unavailable.
+- **resume/append is removed** — re-running against a populated run folder raises
+  rather than reusing; start a new run instead;
+- undefined-stereo molecules take the **provisional** path (one loudly-flagged
+  arbitrated structure, `dE=NA`), never silently guessed.
 
-The complete run package, not an isolated COM or XYZ, is the supported archival
-unit.
+The complete run package (the `runs/<study>/<run_id>/` folder), not an isolated
+COM or XYZ, is the supported archival unit.
 
 ## Quick Start
 
@@ -72,32 +78,33 @@ Open `notebooks/run_pipeline.ipynb` and:
 
 1. **Configuration cell** — set your Gaussian method/basis set, conformer knobs (`N_GENERATE`, `TOP_N`, `RMSD_PRUNE`, `SEED`), SLURM account, nproc, memory, and walltime.
 2. **Molecule cell** — replace the demo molecules with your own list.
-3. Run all cells top to bottom in a fresh output directory. The notebook creates
-   the immutable `run_manifest.json` after PubChem resolution and before XYZ,
-   COM, or SH artifacts, then verifies all recorded hashes at the end.
+3. Set the `STUDY` label and run all cells top to bottom. Each run creates a
+   fresh, immutable `runs/<study>/<run_id>/` folder; the notebook writes
+   `run_manifest.json` after PubChem resolution and before XYZ, COM, or SH
+   artifacts, then verifies all recorded hashes at the end.
 
 ### 3. Submit to your cluster
 
 ```bash
-# Transfer/archive the complete run package: run_manifest.json,
-# conformer_log.csv, com_write_log.csv, slurm_write_log.csv,
-# conformer_xyz/, gaussian_inputs/, and slurm_scripts/. Then:
-for f in slurm_scripts/*.sh; do sbatch "$f"; done
+# Transfer/archive the complete run package — the whole runs/<study>/<run_id>/
+# folder (run_manifest.json, the stage-log CSVs, conformer_xyz/, and
+# gaussian_jobs/ with COM+SH co-located). Submit each .sh FROM the directory
+# that holds its .com (they ship together; the script does not hunt for input):
+cd runs/<study>/<run_id>/gaussian_jobs
+for f in *.sh; do sbatch "$f"; done
 ```
 
 `run_manifest.json` is authoritative. The current CSV logs are operational
-indexes and must agree with it. Reduced reruns may leave prior XYZ/COM files on
-disk, but only manifest-referenced artifacts may enter the supported submission
-path. The per-study `runs/` directory redesign is deferred to v2.1, so use fresh
-output directories when studies must be physically separated. Keep the package
-together: isolated artifacts contain lookup identifiers, but they require the
-matching manifest for the complete configuration and supported reproducibility.
+indexes and must agree with it. Keep the package together: isolated artifacts
+contain lookup identifiers, but they require the matching manifest for the
+complete configuration and supported reproducibility.
 
-Conformer reuse is intentionally strict. The retained and current records must
-name the same clean, nonblank pipeline commit and pass every identity,
-configuration, complete-group, file, and hash check. A dirty tree, source ZIP,
-installed copy without `.git`, or any missing commit regenerates conformers; it
-never falls back to matching only the package version.
+There is **no resume/append** (v2.1). Every run is fresh and immutable; to add
+molecules, start a new run in a new `runs/<study>/<run_id>/` folder. Pointing the
+pipeline at an already-populated run folder raises rather than reusing or
+appending — two clean single-purpose runs are better provenance than a resume
+path. This deletes the v2.0 stale-conformer-resurrection finding (B-04) by
+construction.
 
 ## Repository Structure
 
@@ -107,7 +114,7 @@ pubchem-gaussian-pipeline/
 │   ├── pubchem.py              #   Name resolution, scoring, SMILES/SDF retrieval
 │   ├── conformers.py           #   RDKit ETKDGv3 embed + MMFF94/UFF rank (v2 core)
 │   ├── gaussian.py             #   XYZ → .com (Link1 opt+freq)
-│   ├── slurm.py                #   .com → .sh (run-scoped, submission-independent)
+│   ├── slurm.py                #   .com → .sh (co-located; submit from the .com's dir)
 │   ├── manifest.py             #   Canonical config hash, IDs, lineage, file hashes
 │   ├── geometry.py             #   Legacy v1.1 SDF → XYZ (Open Babel)
 │   └── utils.py                #   Shared helpers, provenance
@@ -131,7 +138,9 @@ The notebook's molecule cell accepts any name PubChem can resolve. For ambiguous
 
 ### Conformer search
 
-Tune `N_GENERATE` (ensemble size), `TOP_N` (conformers carried to DFT), `RMSD_PRUNE` (Å, duplicate threshold), and `SEED` (fixed → reproducible ensemble) in the configuration cell. Molecules whose `IsomericSMILES` has **undefined stereochemistry** are **skipped and logged** to `conformer_search_failed.csv` (reason `"undefined stereochemistry"`) rather than letting RDKit guess a stereoisomer.
+Tune `N_GENERATE` (ensemble size), `TOP_N` (conformers carried to DFT), `RMSD_PRUNE` (Å, duplicate threshold), and `SEED` (fixed → reproducible ensemble) in the configuration cell.
+
+**Undefined stereochemistry (v2.1 provisional path).** Molecules whose `IsomericSMILES` leaves stereochemistry unspecified are **no longer skipped**. RDKit embeds **one** provisional structure from the PubChem SMILES with an **arbitrary** choice at the undefined centre(s), applies a light MMFF/UFF cleanup, and records it loudly: `provenance_status=provisional_undefined_stereo`, `undefined_centers`, `pubchem_smiles`, and the post-embed `arbitrated_smiles` in the manifest and `conformer_log.csv`; `dE=NA` and a `PROVISIONAL: stereo arbitrated at …` marker in the XYZ/COM; and a loud console warning. This arbitrated structure is an **unvalidated DFT starting geometry, not the compound's real configuration** — one arbitrary pick among 2^k for k undefined centres. It must never be treated as the defined stereoisomer; stereoisomer enumeration is out of scope for v2.1.
 
 ### Level of theory
 

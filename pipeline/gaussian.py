@@ -241,6 +241,8 @@ def write_gaussian_com(
     manifest_path: str | None = None,
     parent_artifact_id: str | None = None,
     conformer_record_id: str | None = None,
+    provenance_status: str = "normal",
+    undefined_centers: str | None = None,
 ) -> str:
     """
     Write a Gaussian .com input file from an XYZ file.
@@ -398,42 +400,31 @@ def write_gaussian_com(
     ensure_dir(outdir)
 
     coords = xyz_to_gaussian_coords(xyz_path)
+
+    # v2.1 per-artifact metadata (contract §5, architecture Change 1): the COM
+    # title is a SINGLE line carrying only inline science plus the one
+    # artifact_id back-pointer. run_id/config_hash/conformer_id/versions and the
+    # former second `provenance …` line are manifest-only now. This must never
+    # alter route lines, checkpoint directives, charge/multiplicity, coordinates,
+    # or the Link1 frequency section.
+    is_provisional = provenance_status == "provisional_undefined_stereo"
     title = f"{base} {title_suffix}".strip()
-    if rel_energy_kcalmol is not None:
+    if is_provisional:
+        # A single arbitrated structure has no ensemble reference; never fabricate
+        # dE=0.000 (contract §9 honesty guardrail).
+        title = f"{title} dE=NA".strip()
+    elif rel_energy_kcalmol is not None:
         # Units labeled explicitly; FF energy, never a DFT Hartree value.
         title = f"{title} dE={rel_energy_kcalmol:.4f} kcal/mol".strip()
+    if artifact_id:
+        title = f"{title} artifact_id={artifact_id}".strip()
     if unconverged_value:
         # Make the unconverged FF start explicit on the input itself (M-04 2b).
         title = f"{title} {UNCONVERGED_FF_SEED}".strip()
-
-    # M-14: keep software provenance self-contained in the Gaussian title
-    # section. It must never alter route lines, checkpoint directives,
-    # charge/multiplicity, coordinates, or the Link1 frequency section.
-    provenance_parts = []
-    if pipeline_version:
-        provenance_parts.append(f"pipeline={pipeline_version}")
-    if pipeline_commit:
-        provenance_parts.append(f"commit={pipeline_commit}")
-    elif pipeline_version or rdkit_version:
-        provenance_parts.append("commit=unavailable")
-    if rdkit_version:
-        provenance_parts.append(f"rdkit={rdkit_version}")
-    title_lines = [title]
-    if conformer_id is not None:
-        relative_energy_text = (
-            "unavailable"
-            if rel_energy_kcalmol is None
-            else f"{rel_energy_kcalmol:.6f}"
-        )
-        title_lines.append(
-            f"run_id={run_id} artifact_id={artifact_id} config_hash={config_hash} "
-            f"conformer_id={conformer_id} "
-            f"relative_energy_kcalmol={relative_energy_text} "
-            f"pipeline_version={pipeline_version} rdkit_version={rdkit_version}"
-        )
-    if provenance_parts:
-        title_lines.append("provenance " + " ".join(provenance_parts))
-    title_block = "\n".join(title_lines)
+    if is_provisional:
+        centers = undefined_centers if undefined_centers else "unspecified center(s)"
+        title = f"{title} PROVISIONAL: stereo arbitrated at {centers}".strip()
+    title_block = title
 
     text = (
         f"%nprocshared={nproc}\n"
@@ -666,6 +657,10 @@ def write_gaussian_coms_from_conformers(
         rdkit_version = _optional_text(row.get("rdkit_version"))
         run_id = str(row["run_id"])
         config_hash = str(row["config_hash"])
+        # v2.1: the provisional undefined-stereo marker rides through on the
+        # conformer-log row's provenance_status column — no special-case branch.
+        provenance_status = _optional_text(row.get("provenance_status")) or "normal"
+        undefined_centers = _optional_text(row.get("undefined_centers"))
         try:
             com_path = write_gaussian_com(
                 name,
@@ -683,6 +678,8 @@ def write_gaussian_coms_from_conformers(
                 manifest_path=manifest_path,
                 parent_artifact_id=xyz_artifact["artifact_id"],
                 conformer_record_id=xyz_artifact["conformer_record_id"],
+                provenance_status=provenance_status,
+                undefined_centers=undefined_centers,
                 **kwargs,
             )
             if os.path.normcase(os.path.abspath(com_path)) != os.path.normcase(os.path.abspath(expected_com_path)):

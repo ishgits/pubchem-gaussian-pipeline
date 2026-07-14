@@ -49,15 +49,16 @@ class TestWriteSlurmScript:
             assert "--time=48:00:00" in text
 
     def test_g16_runs_the_com_basename(self):
-        # B-03: the script cd's to the input's directory and runs g16 on the
-        # basename (resolved relative to the script's own location), not a bare
-        # `g16 {jobname}.com` that only works from one directory.
+        # v2.1 (contract §5, architecture Change 2): COM+SH are co-located, so the
+        # script drops all path-resolution machinery and simply runs g16 on the
+        # .com in its own directory.
         with tempfile.TemporaryDirectory() as tmpdir:
             sh_path = write_slurm_script("cytosine_F", tmpdir)
             with open(sh_path) as f:
                 text = f.read()
-            assert 'g16 "$(basename "$COM_PATH")"' in text
-            assert 'COM_PATH="$SCRIPT_DIR/cytosine_F.com"' in text
+            assert "g16 cytosine_F.com" in text
+            for gone in ("SCRIPT_DIR", "COM_PATH", "cd ", "../", "basename"):
+                assert gone not in text
 
     def test_custom_template(self):
         custom = "#!/bin/bash\n#SBATCH --job-name={jobname}\necho {jobname}\n"
@@ -68,46 +69,37 @@ class TestWriteSlurmScript:
             assert "echo test_mol" in text
 
 
-class TestSlurmScriptResolvesInput:
-    """B-03: a script in slurm_scripts/ must resolve its .com in a sibling
-    gaussian_inputs/ directory, regardless of the submission directory."""
+class TestSlurmScriptCoLocated:
+    """v2.1: COM+SH ship together in gaussian_jobs/, so the script runs
+    `g16 {jobname}.com` from its own directory — no path-resolution machinery."""
 
-    def test_sibling_dirs_relpath(self):
+    def test_runs_bare_com_basename_regardless_of_com_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            com_dir = os.path.join(tmpdir, "gaussian_inputs")
-            slurm_dir = os.path.join(tmpdir, "slurm_scripts")
-            os.makedirs(com_dir)
-            os.makedirs(slurm_dir)
-            com_path = os.path.join(com_dir, "adenine_F.com")
+            jobs_dir = os.path.join(tmpdir, "gaussian_jobs")
+            os.makedirs(jobs_dir)
+            com_path = os.path.join(jobs_dir, "adenine_F.com")
             with open(com_path, "w") as f:
                 f.write("%chk=adenine_F.chk\n")
 
-            sh_path = write_slurm_script("adenine_F", slurm_dir, com_path=com_path)
+            sh_path = write_slurm_script("adenine_F", jobs_dir, com_path=com_path)
             with open(sh_path) as f:
                 text = f.read()
 
-            # The stored path is relative and preserves the real directory name.
-            assert 'COM_PATH="$SCRIPT_DIR/../gaussian_inputs/adenine_F.com"' in text
+            assert "g16 adenine_F.com" in text
+            for gone in ("SCRIPT_DIR", "COM_PATH", "../", "basename", "cd "):
+                assert gone not in text
 
-            # And it actually resolves back to the real input file on disk.
-            rel = os.path.join("..", "gaussian_inputs", "adenine_F.com")
-            resolved = os.path.normpath(os.path.join(slurm_dir, rel))
-            assert resolved == os.path.normpath(com_path)
-            assert os.path.exists(resolved)
-
-    def test_custom_com_dir_name_preserved(self):
-        # relpath preserves a non-default directory name (not hardcoded).
+    def test_no_path_machinery_even_for_nondefault_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            com_dir = os.path.join(tmpdir, "my_inputs")
-            slurm_dir = os.path.join(tmpdir, "jobs")
-            os.makedirs(com_dir)
-            os.makedirs(slurm_dir)
-            com_path = os.path.join(com_dir, "water_F.com")
+            jobs_dir = os.path.join(tmpdir, "jobs")
+            os.makedirs(jobs_dir)
+            com_path = os.path.join(jobs_dir, "water_F.com")
             open(com_path, "w").close()
-            sh_path = write_slurm_script("water_F", slurm_dir, com_path=com_path)
+            sh_path = write_slurm_script("water_F", jobs_dir, com_path=com_path)
             with open(sh_path) as f:
                 text = f.read()
-            assert "../my_inputs/water_F.com" in text
+            assert "g16 water_F.com" in text
+            assert "jobs/water_F.com" not in text  # no directory path in the body
 
 
 class TestWriteSlurmScriptsLogDriven:
@@ -333,9 +325,11 @@ class TestStrictOneToOneManifestMapping:
         assert out["sh_path"].is_unique
         for _, row in out.iterrows():
             text = open(row["sh_path"], encoding="utf-8").read()
-            assert f"# run_id={row['run_id']}" in text
+            # v2.1 reduced header: artifact_id + co-located source COM basename + sha256.
             assert f"# artifact_id={row['artifact_id']}" in text
-            assert f"# source_com_sha256={row['com_sha256']}" in text
+            assert f"# source_com={os.path.basename(row['com_path'])} sha256={row['com_sha256']}" in text
+            assert "# run_id=" not in text
+            assert "source_com_relative_path" not in text
 
 
 class TestWriteSlurmScriptsOverwrite:
