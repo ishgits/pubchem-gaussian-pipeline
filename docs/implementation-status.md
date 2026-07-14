@@ -43,7 +43,7 @@ references v2.1 and drops the resume/dirty-git reuse bullet.
 ### Task 3 — SH simplification: complete
 
 `DEFAULT_TEMPLATE` drops the SCRIPT_DIR/COM_PATH/cd path-resolution block and
-ends with `module load gaussian16` then `g16 JOBNAME.com`. The script assumes
+ends with `ml gaussian16` then `g16 JOBNAME.com`. The script assumes
 the COM is in the current working directory. `write_slurm_script` no longer
 threads a COM relative path.
 
@@ -126,6 +126,11 @@ caveat.
   mutation; provisional COMs therefore retain `dE=NA` and the visible marker.
 - Manifest validation requires an undefined-stereo provisional molecule to carry
   exactly one conformer, including for hand-edited or damaged manifests.
+- Manifest-driven SLURM generation rejects COM/SH directory separation before
+  mutation; direct v2 COM writes derive provisional metadata from the manifest;
+  and all three conformer-stage logs/directories are package-contained.
+- The bundled default SLURM template intentionally uses Purdue RCAC/Lmod syntax,
+  `ml gaussian16`; other clusters may provide a site-specific custom template.
 
 ## 2. Scientific invariants (unchanged)
 

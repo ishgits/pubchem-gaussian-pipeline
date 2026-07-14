@@ -229,7 +229,11 @@ The script header MUST carry exactly:
 - The SH body drops all path-resolution machinery (no `SCRIPT_DIR`, `cd`, or
   `../`). Because COM and SH are co-located in `gaussian_jobs/` (§2), the script
   assumes the `.com` is in the current working directory and ends with
-  `module load gaussian16` then `g16 <base>_F.com`.
+  `ml gaussian16` then `g16 <base>_F.com`.
+
+  The bundled default uses Purdue RCAC/Lmod syntax; a custom template MAY use
+  the module-loading command required by another site, provided Gaussian 16 is
+  loaded before `g16 <base>_F.com`.
 
 **Operational contract (MUST be documented in the notebook next-steps cell):**
 on the HPC, submit the `.sh` from the directory that contains its `.com`. The

@@ -37,7 +37,7 @@ opt→freq contract.
 
 3. **Simplify the SH script.**
    - Remove the `SCRIPT_DIR`/`COM_PATH` resolution block and its comment; the
-     script ends with `module load gaussian16` then `g16 <base>_F.com`, assuming
+     script ends with `ml gaussian16` then `g16 <base>_F.com`, assuming
      the COM is in the cwd.
    - Verify-by: generated SH contains no `SCRIPT_DIR`/`cd`/`../`; a test asserts
      the two-line tail and that `source_com`/`sha256` header is intact.

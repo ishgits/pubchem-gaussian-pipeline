@@ -826,6 +826,7 @@ def search_conformers(
     # failure-log deletion, XYZ write, or log rewrite.
     relative_artifact_path(xyz_dir, manifest_path)
     relative_artifact_path(log_csv, manifest_path)
+    relative_artifact_path(failed_csv, manifest_path)
 
     # A fresh/recreated manifest must not publish into stale conformer-stage
     # state.  Keep this scoped to the destinations owned by this stage; later

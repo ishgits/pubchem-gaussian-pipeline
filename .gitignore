@@ -25,3 +25,5 @@ run_manifest.json
 
 # local agent settings
 .claude/settings.local.json
+# Local pipeline run packages generated from the notebook
+notebooks/runs/

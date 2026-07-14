@@ -417,6 +417,57 @@ class TestWriteGaussianComConformer:
                 text = f.read()
             assert "provenance " not in text
 
+    def test_direct_v2_com_derives_provisional_metadata_from_manifest(self, tmp_path):
+        from pipeline.manifest import load_manifest, write_manifest
+
+        xyz_path, linkage = direct_com_context(tmp_path, SAMPLE_XYZ)
+        manifest = load_manifest(linkage["manifest_path"])
+        manifest["molecules"][0].update({
+            "provenance_status": "provisional_undefined_stereo",
+            "undefined_centers": "C1",
+            "pubchem_smiles": "C[C@H](O)C",
+            "arbitrated_smiles": "C[C@@H](O)C",
+        })
+        write_manifest(linkage["manifest_path"], manifest)
+
+        com_path = write_gaussian_com(
+            name="Ribose", xyz_path=xyz_path, outdir=str(tmp_path / "gaussian_jobs"),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            conformer_id=0, rel_energy_kcalmol=0.0,
+            pipeline_version="2.0.0", pipeline_commit="abc1234",
+            rdkit_version="2025.09.3", **linkage,
+        )
+        text = Path(com_path).read_text(encoding="utf-8")
+        assert "dE=NA" in text
+        assert "PROVISIONAL: stereo arbitrated at C1" in text
+        assert "dE=0.0000 kcal/mol" not in text
+
+    def test_direct_v2_provisional_metadata_mismatch_fails_before_mutation(self, tmp_path):
+        from pipeline.manifest import load_manifest, write_manifest
+
+        xyz_path, linkage = direct_com_context(tmp_path, SAMPLE_XYZ)
+        manifest = load_manifest(linkage["manifest_path"])
+        manifest["molecules"][0].update({
+            "provenance_status": "provisional_undefined_stereo",
+            "undefined_centers": "C1",
+            "pubchem_smiles": "C[C@H](O)C",
+            "arbitrated_smiles": "C[C@@H](O)C",
+        })
+        write_manifest(linkage["manifest_path"], manifest)
+        outdir = tmp_path / "gaussian_jobs"
+
+        with pytest.raises(ValueError, match="provenance_status disagrees"):
+            write_gaussian_com(
+                name="Ribose", xyz_path=xyz_path, outdir=str(outdir),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                conformer_id=0, rel_energy_kcalmol=0.0,
+                pipeline_version="2.0.0", pipeline_commit="abc1234",
+                rdkit_version="2025.09.3", provenance_status="normal", **linkage,
+            )
+        assert not outdir.exists()
+
 
 class TestWriteGaussianComsFromConformers:
     def test_manifest_driven_default_is_gaussian_jobs(self):
@@ -833,8 +884,8 @@ class TestEmptyComLogSchemas:
             route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
             manifest_path=manifest_path,
         )
-        slurm_dir = tmp_path / "slurm_scripts"
-        slurm_dir.mkdir()
+        slurm_dir = tmp_path / "gaussian_jobs"
+        slurm_dir.mkdir(exist_ok=True)
         (slurm_dir / "stale_F.sh").write_text("#!/bin/bash\n")
         slurm_log = tmp_path / "slurm_write_log.csv"
         scripts = write_slurm_scripts(
@@ -993,7 +1044,7 @@ class TestPackageBoundaryPreflight:
             route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
             manifest_path=manifest_path,
         )
-        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_dir = outdir
         slurm_log = tmp_path / "slurm_write_log.csv"
         write_slurm_scripts(
             com_log_csv=str(com_log),

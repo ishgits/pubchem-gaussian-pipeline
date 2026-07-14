@@ -279,7 +279,7 @@ def write_gaussian_com(
     manifest_path: str | None = None,
     parent_artifact_id: str | None = None,
     conformer_record_id: str | None = None,
-    provenance_status: str = "normal",
+    provenance_status: str | None = None,
     undefined_centers: str | None = None,
 ) -> str:
     """
@@ -409,6 +409,20 @@ def write_gaussian_com(
         molecule_record, conformer_record = find_conformer_record(
             manifest, conformer_record_id
         )
+        manifest_status = molecule_record.get("provenance_status", "normal")
+        manifest_centers = molecule_record.get("undefined_centers")
+        if (
+            provenance_status is not None
+            and provenance_status != manifest_status
+        ):
+            raise ValueError("Direct COM provenance_status disagrees with the run manifest.")
+        if (
+            undefined_centers is not None
+            and undefined_centers != manifest_centers
+        ):
+            raise ValueError("Direct COM undefined_centers disagrees with the run manifest.")
+        provenance_status = manifest_status
+        undefined_centers = manifest_centers
         if str(name) != molecule_record["molecule_name"]:
             raise ValueError("Direct COM molecule name disagrees with run manifest.")
         if int(conformer_id) != conformer_record["conformer_id"]:
@@ -420,6 +434,9 @@ def write_gaussian_com(
             raise ValueError("Direct COM relative energy disagrees with run manifest.")
         if unconverged_value == conformer_record["converged"]:
             raise ValueError("Direct COM convergence marker disagrees with run manifest.")
+
+    if provenance_status is None:
+        provenance_status = "normal"
 
     base = sanitize_basename(name)
     if conformer_id is not None:

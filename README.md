@@ -158,9 +158,9 @@ architecture deviation and must be documented before use.
 
 ### SLURM template
 
-The default template in `pipeline/slurm.py` assumes `module load gaussian16` and
-`g16`. Edit the template string or pass a custom one for a different module
-system or Gaussian version. The exact template hash and resources are part of
+The default template in `pipeline/slurm.py` uses Purdue RCAC/Lmod syntax, `ml gaussian16`, and
+`g16`. On another cluster, edit `DEFAULT_TEMPLATE` or pass a custom template
+with the site-specific Gaussian 16 module command. The exact template hash and resources are part of
 the immutable run configuration, so changing them requires a new manifest/run.
 
 ### Charge & multiplicity

@@ -79,9 +79,12 @@ assumes the `.com` is in the current working directory:
 #SBATCH --account=…
 #SBATCH --job-name=<base>_F
 # … resources …
-module load gaussian16
+ml gaussian16
 g16 <base>_F.com
 ```
+
+The bundled default uses Purdue RCAC/Lmod syntax (`ml gaussian16`). A different
+cluster may provide a custom template with its site-specific module command.
 
 **Operational contract (must be documented in the notebook next-steps cell):** on
 the HPC, submit the `.sh` from the directory that contains its `.com`. The COM+SH

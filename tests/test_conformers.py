@@ -1118,7 +1118,7 @@ class TestPackageBoundaryPreflight:
         )
         return C, table, manifest_path
 
-    @pytest.mark.parametrize("target", ["xyz_dir", "log_csv"])
+    @pytest.mark.parametrize("target", ["xyz_dir", "log_csv", "failed_csv"])
     def test_outside_package_destination_fails_atomically(
         self, tmp_path, monkeypatch, target
     ):
@@ -1144,11 +1144,14 @@ class TestPackageBoundaryPreflight:
         outside = tmp_path.parent / f"m30_conformer_outside_{tmp_path.name}"
         if target == "xyz_dir":
             call = dict(xyz_dir=str(outside), log_csv=str(log_csv))
-        else:
+        elif target == "log_csv":
             call = dict(
                 xyz_dir=str(xyz_dir),
                 log_csv=str(outside / "conformer_log.csv"),
             )
+        else:
+            call = dict(xyz_dir=str(xyz_dir), log_csv=str(log_csv))
+            failed_csv = outside / "conformer_search_failed.csv"
 
         with pytest.raises(ValueError, match="inside the run package"):
             C.search_conformers(
@@ -1159,7 +1162,10 @@ class TestPackageBoundaryPreflight:
             )
 
         assert Path(manifest_path).read_bytes() == manifest_before
-        assert failed_csv.read_bytes() == failed_before
+        if target == "failed_csv":
+            assert not failed_csv.exists()
+        else:
+            assert failed_csv.read_bytes() == failed_before
         assert not xyz_dir.exists()
         assert not log_csv.exists()
         assert not outside.exists()

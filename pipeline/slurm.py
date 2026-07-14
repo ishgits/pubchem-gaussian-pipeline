@@ -52,7 +52,7 @@ DEFAULT_TEMPLATE = """\
 #SBATCH --mem={mem}
 #SBATCH --time={time}
 
-module load gaussian16
+ml gaussian16
 g16 {jobname}.com
 """
 
@@ -307,6 +307,19 @@ def write_slurm_scripts(
             time=kwargs.get("time", "24:00:00"),
             com_relpath=os.path.relpath(com_path, slurm_dir),
         )
+
+    if manifest is not None:
+        slurm_root = os.path.normcase(os.path.realpath(slurm_dir))
+        for item in prepared:
+            com_path = item["com_path"]
+            com_root = os.path.normcase(os.path.realpath(os.path.dirname(com_path)))
+            if com_root != slurm_root:
+                raise ValueError(
+                    "Manifest-driven SLURM generation requires each .sh file to "
+                    "be co-located with its source .com. "
+                    f"COM directory: {os.path.dirname(com_path)!r}; "
+                    f"SLURM directory: {slurm_dir!r}."
+                )
 
     # M-18 validation above intentionally completes before this first mutation.
     # A stale/damaged COM log must not prune good scripts, create a directory, or
