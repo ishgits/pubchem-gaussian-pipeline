@@ -57,6 +57,33 @@ g16 {jobname}.com
 """
 
 
+def _template_values(
+    *,
+    jobname: str,
+    account: str,
+    cpus: int,
+    mem: str,
+    time: str,
+) -> dict:
+    return {
+        "jobname": jobname,
+        "account": account,
+        "cpus": cpus,
+        "mem": mem,
+        "time": time,
+    }
+
+
+def _render_template(template: str, values: dict) -> str:
+    try:
+        return template.format(**values)
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported SLURM template placeholder: {exc.args[0]!r}. "
+            "Supported placeholders are: jobname, account, cpus, mem, time."
+        ) from exc
+
+
 def _validated_logged_com_paths(
     com_log: pd.DataFrame, manifest_path: str, manifest: dict
 ) -> list[dict]:
@@ -179,16 +206,17 @@ def write_slurm_script(
     str
         Path to the written .sh file.
     """
-    ensure_dir(outdir)
-    sh_path = os.path.join(outdir, f"{jobname}.sh")
-
-    text = template.format(
+    values = _template_values(
         jobname=jobname,
         account=account,
         cpus=cpus,
         mem=mem,
         time=time,
     )
+    text = _render_template(template, values)
+
+    ensure_dir(outdir)
+    sh_path = os.path.join(outdir, f"{jobname}.sh")
     # v2.1 per-artifact metadata (contract §5): the SH header carries only the
     # single artifact_id back-pointer and the co-located source COM basename +
     # SHA-256 (the one operationally load-bearing header — it lets the job
@@ -248,6 +276,14 @@ def write_slurm_scripts(
     """
     if com_dir is not None:
         # Legacy explicit mode: every .com on disk becomes a job.
+        com_root = os.path.normcase(os.path.realpath(com_dir))
+        slurm_root = os.path.normcase(os.path.realpath(slurm_dir))
+        if com_root != slurm_root:
+            raise ValueError(
+                "Legacy com_dir mode requires slurm_dir to be the same directory "
+                "as com_dir because generated scripts run g16 on the co-located "
+                "COM basename."
+            )
         com_paths = sorted(glob.glob(os.path.join(com_dir, "*.com")))
         prepared = [{"com_path": path, "artifact": None} for path in com_paths]
         manifest = None
@@ -298,15 +334,14 @@ def write_slurm_scripts(
             )
         basenames[jobname] = com_path
         destinations[destination] = com_path
-        template = kwargs.get("template", DEFAULT_TEMPLATE)
-        template.format(
+        values = _template_values(
             jobname=jobname,
             account=kwargs.get("account", "myaccount"),
             cpus=kwargs.get("cpus", 16),
             mem=kwargs.get("mem", "32G"),
             time=kwargs.get("time", "24:00:00"),
-            com_relpath=os.path.relpath(com_path, slurm_dir),
         )
+        _render_template(kwargs.get("template", DEFAULT_TEMPLATE), values)
 
     if manifest is not None:
         slurm_root = os.path.normcase(os.path.realpath(slurm_dir))

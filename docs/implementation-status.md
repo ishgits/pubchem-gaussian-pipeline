@@ -132,6 +132,14 @@ caveat.
 - The bundled default SLURM template intentionally uses Purdue RCAC/Lmod syntax,
   `ml gaussian16`; other clusters may provide a site-specific custom template.
 
+### Final SLURM cleanup
+
+- Legacy `com_dir` mode now requires `slurm_dir` to be the same real directory,
+  matching the simplified co-located `g16 JOBNAME.com` execution model.
+- SLURM custom-template preflight and rendering now use the same supported
+  placeholder set; obsolete or unknown placeholders fail before any filesystem
+  or manifest mutation.
+
 ## 2. Scientific invariants (unchanged)
 
 Level of theory, route lines, charge/multiplicity, coordinate/energy units, and

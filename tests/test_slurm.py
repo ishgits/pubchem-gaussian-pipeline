@@ -69,6 +69,19 @@ class TestWriteSlurmScript:
                 text = f.read()
             assert "echo test_mol" in text
 
+    @pytest.mark.parametrize("placeholder", ["com_relpath", "unknown_field"])
+    def test_unsupported_template_placeholder_fails_before_directory_creation(
+        self, tmp_path, placeholder
+    ):
+        outdir = tmp_path / "gaussian_jobs"
+        with pytest.raises(ValueError, match=placeholder):
+            write_slurm_script(
+                "test_mol",
+                str(outdir),
+                template=f"#!/bin/bash\necho {{{placeholder}}}\n",
+            )
+        assert not outdir.exists()
+
 
 class TestSlurmScriptCoLocated:
     """v2.1: COM+SH ship together in gaussian_jobs/, so the script runs
@@ -180,7 +193,7 @@ class TestWriteSlurmScriptsLogDriven:
     def test_legacy_com_dir_glob_still_reachable(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             com_dir = os.path.join(tmpdir, "gaussian_inputs")
-            slurm_dir = os.path.join(tmpdir, "slurm_scripts")
+            slurm_dir = com_dir
             os.makedirs(com_dir)
             for name in ("a_F", "b_F"):
                 open(os.path.join(com_dir, f"{name}.com"), "w").close()
@@ -190,6 +203,29 @@ class TestWriteSlurmScriptsLogDriven:
                 log_csv=os.path.join(tmpdir, "slurm_write_log.csv"),
             )
             assert sorted(df["jobname"]) == ["a_F", "b_F"]
+
+    def test_legacy_separate_directories_fail_before_mutation(self, tmp_path):
+        com_dir = tmp_path / "gaussian_inputs"
+        slurm_dir = tmp_path / "slurm_scripts"
+        com_dir.mkdir()
+        (com_dir / "job_F.com").write_text("%chk=job_F.chk\n")
+        slurm_dir.mkdir()
+        prior_script = slurm_dir / "prior.sh"
+        prior_script.write_bytes(b"prior script\n")
+        slurm_log = tmp_path / "slurm_write_log.csv"
+        slurm_log.write_bytes(b"prior log\n")
+        com_before = (com_dir / "job_F.com").read_bytes()
+
+        with pytest.raises(ValueError, match="same directory|co-located"):
+            write_slurm_scripts(
+                com_dir=str(com_dir),
+                slurm_dir=str(slurm_dir),
+                log_csv=str(slurm_log),
+            )
+
+        assert prior_script.read_bytes() == b"prior script\n"
+        assert slurm_log.read_bytes() == b"prior log\n"
+        assert (com_dir / "job_F.com").read_bytes() == com_before
 
     @pytest.mark.parametrize(
         "bad_path",
@@ -368,7 +404,7 @@ class TestWriteSlurmScriptsOverwrite:
     def test_rewrite_updates_account_and_reports_overwrite(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             com_dir = os.path.join(tmpdir, "gaussian_inputs")
-            slurm_dir = os.path.join(tmpdir, "slurm_scripts")
+            slurm_dir = com_dir
             os.makedirs(com_dir)
             com_path = os.path.join(com_dir, "adenine_F.com")
             with open(com_path, "w") as handle:
