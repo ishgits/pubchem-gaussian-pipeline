@@ -4,6 +4,7 @@ import os
 import inspect
 import sys
 import tempfile
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -114,6 +115,39 @@ class TestSlurmScriptCoLocated:
                 text = f.read()
             assert "g16 water_F.com" in text
             assert "jobs/water_F.com" not in text  # no directory path in the body
+
+
+    def test_separate_direct_com_and_sh_dirs_fail_before_mutation(self, tmp_path):
+        com_dir = tmp_path / "gaussian_inputs"
+        com_dir.mkdir()
+        com_path = com_dir / "water_F.com"
+        com_path.write_bytes(b"%chk=water_F.chk\n")
+        outdir = tmp_path / "slurm_scripts"
+
+        with pytest.raises(ValueError, match="same directory"):
+            write_slurm_script(
+                "water_F",
+                str(outdir),
+                com_path=str(com_path),
+            )
+
+        assert not outdir.exists()
+        assert com_path.read_bytes() == b"%chk=water_F.chk\n"
+
+    def test_direct_sibling_com_and_sh_still_succeeds(self, tmp_path):
+        jobs_dir = tmp_path / "gaussian_jobs"
+        jobs_dir.mkdir()
+        com_path = jobs_dir / "water_F.com"
+        com_path.write_text("%chk=water_F.chk\n")
+
+        sh_path = write_slurm_script(
+            "water_F",
+            str(jobs_dir),
+            com_path=str(com_path),
+        )
+
+        assert Path(sh_path).parent == jobs_dir
+        assert "g16 water_F.com" in Path(sh_path).read_text()
 
 
 class TestWriteSlurmScriptsLogDriven:

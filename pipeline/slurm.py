@@ -206,6 +206,18 @@ def write_slurm_script(
     str
         Path to the written .sh file.
     """
+    if com_path is not None:
+        com_root = os.path.normcase(
+            os.path.realpath(os.path.dirname(com_path))
+        )
+        out_root = os.path.normcase(os.path.realpath(outdir))
+        if com_root != out_root:
+            raise ValueError(
+                "write_slurm_script requires outdir to be the same directory "
+                "as com_path because the generated script runs g16 on the "
+                "co-located COM basename."
+            )
+
     values = _template_values(
         jobname=jobname,
         account=account,
