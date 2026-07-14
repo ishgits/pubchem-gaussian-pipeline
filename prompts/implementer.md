@@ -1,16 +1,24 @@
-# Implementer brief (Claude Code / Codex)
+# Implementer brief
 
-Implement `docs/implementation-plan.md` against `docs/architecture.md`.
+Implement `docs/implementation-plan.md` against `docs/architecture.md` and the
+frozen `docs/release-contract-v2.0.md`.
 
-- Read `AGENTS.md` first and obey its scientific invariants (§2) and development
-  rules (§3).
-- Work on a new branch named `round-<NN>/<short-slug>`.
-- Implement the plan's tasks in order.
-- Run the required checks (`pytest tests/ -q` and
-  `python scripts/check_invariants.py`) and make them green before opening the PR.
-- Create/maintain `docs/implementation-status.md` recording: what was and wasn't
-  implemented, deviations from architecture, tests added, known limitations, and
-  questions requiring scientific judgment.
-- Do NOT alter scientific assumptions without recording the deviation in the
-  status doc.
-- Open a pull request. Do not merge. Stop.
+- Read `AGENTS.md` first.
+- Work on a branch, never directly on `main`.
+- Implement tasks in plan order.
+- Do not broaden the frozen contract without Ish's explicit approval.
+- Validate all complete inputs before mutating outputs or logs.
+- Preserve one-to-one source-record to destination-path mapping.
+- Add tests for normal, missing, blank, zero-byte, duplicate, colliding, damaged,
+  dirty-git, and no-git cases where the task touches those boundaries.
+- Maintain `docs/implementation-status.md` honestly.
+- Run:
+  ```bash
+  pytest tests/ -q
+  python scripts/check_invariants.py
+  git diff --check
+  test -z "$(git ls-files -ci --exclude-standard)"
+  ```
+- Repeat the relevant checks from a clean `git archive` before requesting final
+  review.
+- Open or update the PR. Do not merge; Ish is the human gate.

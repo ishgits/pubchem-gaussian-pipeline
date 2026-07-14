@@ -1,4 +1,0 @@
-name,sdf_path,xyz_path,status
-Water,pubchem_sdf/water.sdf,pubchem_xyz/water.xyz,OK
-Glycine,pubchem_sdf/glycine.sdf,pubchem_xyz/glycine.xyz,OK
-Adenine,pubchem_sdf/adenine.sdf,pubchem_xyz/adenine.xyz,OK

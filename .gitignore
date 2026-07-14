@@ -13,7 +13,15 @@ __pycache__/
 
 # pipeline outputs (generated, not source)
 .pubchem_cache/
+conformer_xyz/
 gaussian_inputs/
 slurm_scripts/
+pubchem_sdf/
+pubchem_xyz/
+molecules_pubchem_*.csv
 *_log.csv
-com_write_failed.csv
+*_failed.csv
+run_manifest.json
+
+# local agent settings
+.claude/settings.local.json

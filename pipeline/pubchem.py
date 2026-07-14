@@ -9,8 +9,10 @@ to handle flaky connections and respect PubChem rate limits.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import tempfile
 import time
 from urllib.parse import quote
 
@@ -24,7 +26,7 @@ from .utils import ensure_dir, normalize_cid, sanitize_basename
 # ---------------------------------------------------------------------------
 PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 _DEFAULT_HEADERS = {
-    "User-Agent": "gaussian-input-pipeline/1.0 (research use)"
+    "User-Agent": "gaussian-input-pipeline/2.0 (research use)"
 }
 
 
@@ -32,9 +34,51 @@ _DEFAULT_HEADERS = {
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _cache_path(cache_dir: str, key: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", key)[:180]
-    return os.path.join(cache_dir, safe + ".json")
+_CACHE_SCHEMA = 2
+
+
+def _cache_request(url: str) -> dict:
+    """Return the complete canonical identity of one cacheable request."""
+    return {"cache_schema": _CACHE_SCHEMA, "method": "GET", "url": url}
+
+
+def _cache_request_identity(url: str) -> str:
+    payload = json.dumps(
+        _cache_request(url), sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cache_path(cache_dir: str, key: str, url: str) -> str:
+    """Return a readable, collision-resistant path bound to the full request."""
+    readable = re.sub(r"[^a-zA-Z0-9_.-]+", "_", key)[:120].strip("._-")
+    readable = readable or "request"
+    return os.path.join(
+        cache_dir, f"{readable}__{_cache_request_identity(url)}.json"
+    )
+
+
+def _write_cache(path: str, request: dict, response: dict) -> None:
+    """Atomically write a request-bound cache envelope."""
+    fd, temporary = tempfile.mkstemp(prefix=".pubchem_cache.", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "cache_schema": _CACHE_SCHEMA,
+                    "request": request,
+                    "response": response,
+                },
+                handle,
+                sort_keys=True,
+            )
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _get_json(
@@ -56,10 +100,22 @@ def _get_json(
 
     if cache_key:
         ensure_dir(cache_dir)
-        cp = _cache_path(cache_dir, cache_key)
+        request_identity = _cache_request(url)
+        cp = _cache_path(cache_dir, cache_key, url)
         if os.path.exists(cp):
-            with open(cp, "r") as f:
-                return json.load(f)
+            try:
+                with open(cp, encoding="utf-8") as f:
+                    envelope = json.load(f)
+                if (
+                    isinstance(envelope, dict)
+                    and envelope.get("cache_schema") == _CACHE_SCHEMA
+                    and envelope.get("request") == request_identity
+                    and isinstance(envelope.get("response"), dict)
+                ):
+                    return envelope["response"]
+            except (OSError, TypeError, ValueError):
+                # Legacy, malformed, or unverifiable entries are cache misses.
+                pass
 
     last_err = None
     for attempt in range(max_retries):
@@ -69,8 +125,7 @@ def _get_json(
             if r.status_code == 200:
                 data = r.json()
                 if cache_key:
-                    with open(_cache_path(cache_dir, cache_key), "w") as f:
-                        json.dump(data, f)
+                    _write_cache(cp, request_identity, data)
                 return data
             last_err = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
         except Exception as e:
@@ -93,10 +148,16 @@ def get_cids_by_name(name_query: str, **kwargs) -> list[int]:
 
 
 def get_props_by_cids(cids: list[int], **kwargs) -> list[dict]:
-    """Fetch a standard set of properties for one or more CIDs."""
+    """Fetch a standard set of properties for one or more CIDs.
+
+    NB: PubChem renamed its SMILES properties in 2025 — the stereo-bearing
+    ``IsomericSMILES`` became ``SMILES`` and the stereo-free ``CanonicalSMILES``
+    became ``ConnectivitySMILES``. We request the current names; response parsing
+    (:func:`_isomeric_smiles`) still accepts the legacy keys for old caches.
+    """
     props = ",".join([
-        "IsomericSMILES",
-        "CanonicalSMILES",
+        "SMILES",              # stereo-bearing (formerly IsomericSMILES)
+        "ConnectivitySMILES",  # stereo-free    (formerly CanonicalSMILES)
         "InChI",
         "InChIKey",
         "MolecularFormula",
@@ -108,6 +169,17 @@ def get_props_by_cids(cids: list[int], **kwargs) -> list[dict]:
     url = f"{PUBCHEM_BASE}/compound/cid/{cid_str}/property/{props}/JSON"
     data = _get_json(url, cache_key=f"props__{cid_str}", **kwargs)
     return data.get("PropertyTable", {}).get("Properties", [])
+
+
+def _isomeric_smiles(prop: dict) -> str:
+    """Return the stereo-bearing SMILES from a PubChem property record.
+
+    PubChem's 2025 rename means the stereochemistry-carrying SMILES now arrives
+    under the ``SMILES`` key; older records/caches used ``IsomericSMILES``. We
+    prefer the current key and fall back to the legacy one, and never use
+    ``ConnectivitySMILES``/``CanonicalSMILES``, which drop stereochemistry.
+    """
+    return prop.get("SMILES") or prop.get("IsomericSMILES") or ""
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +204,11 @@ def score_candidate(
     """
     score = 0
     formula = prop.get("MolecularFormula", "")
-    iso = prop.get("IsomericSMILES", "")
+    # Read the stereo-bearing SMILES via the helper — never the dead
+    # ``IsomericSMILES`` key directly (PubChem 2025 rename; see _isomeric_smiles).
+    # Otherwise ambiguous candidates never earn the stereo bonus and the resolver
+    # can pick the wrong CID (Codex round-02 M-03).
+    iso = _isomeric_smiles(prop)
     iupac = (prop.get("IUPACName") or "").lower()
     title = (prop.get("Title") or "").lower()
     cid = prop.get("CID", 999_999_999)
@@ -142,7 +218,7 @@ def score_candidate(
         score += 100
 
     # Stereo bonus (indicates well-defined 3D structure)
-    if prefer_stereo and ("@" in iso or "/" in iso):
+    if prefer_stereo and any(marker in iso for marker in ("@", "/", "\\")):
         score += 20
 
     # Lower CID = more canonical record
@@ -263,6 +339,61 @@ def resolve_with_fallback(
 # Table builder (Step 1)
 # ---------------------------------------------------------------------------
 
+# Column schema for the resolved molecule table. Kept explicit (and identical
+# for resolved/unresolved rows) so downstream consumers — download_sdfs (cid),
+# conformers.search_conformers (IsomericSMILES) — always see the same columns.
+MOLECULE_TABLE_COLUMNS = [
+    "name",
+    "pubchem_query",
+    "cid",
+    "IsomericSMILES",
+    "formula",
+    "iupac_name",
+    "title",
+    "status",
+    "warnings",
+]
+
+
+def _resolved_row(label: str, query: str, prop: dict | None, info: dict) -> dict:
+    """
+    Assemble one molecule-table row from a PubChem property record.
+
+    Pure (no network): given the label, the query, the best-scoring property
+    dict (or ``None`` when resolution failed), and the diagnostics ``info``,
+    return a row dict with the fixed :data:`MOLECULE_TABLE_COLUMNS` schema.
+
+    Carries the stereo-bearing SMILES (via :func:`_isomeric_smiles`; never the
+    stereo-free ``ConnectivitySMILES``/``CanonicalSMILES``) into an
+    ``IsomericSMILES`` column so the v2 conformer stage can embed from it.
+    Unresolved rows carry an empty ``IsomericSMILES`` so the column always exists.
+    """
+    warnings = "; ".join(info.get("warnings", []))
+    if prop is None:
+        return {
+            "name": label,
+            "pubchem_query": query,
+            "cid": None,
+            "IsomericSMILES": "",
+            "formula": None,
+            "iupac_name": None,
+            "title": None,
+            "status": info["status"],
+            "warnings": warnings,
+        }
+    return {
+        "name": label,
+        "pubchem_query": query,
+        "cid": prop.get("CID"),
+        "IsomericSMILES": _isomeric_smiles(prop),
+        "formula": prop.get("MolecularFormula"),
+        "iupac_name": prop.get("IUPACName"),
+        "title": prop.get("Title"),
+        "status": info["status"],
+        "warnings": warnings,
+    }
+
+
 def build_molecule_table(
     molecules: list[str],
     alias: dict[str, str] | None = None,
@@ -302,31 +433,9 @@ def build_molecule_table(
             **kwargs,
         )
         diagnostics.append(info)
+        rows.append(_resolved_row(label, info.get("query", query), prop, info))
 
-        if prop is None:
-            rows.append({
-                "name": label,
-                "pubchem_query": query,
-                "cid": None,
-                "formula": None,
-                "iupac_name": None,
-                "title": None,
-                "status": info["status"],
-                "warnings": "; ".join(info.get("warnings", [])),
-            })
-        else:
-            rows.append({
-                "name": label,
-                "pubchem_query": query,
-                "cid": prop.get("CID"),
-                "formula": prop.get("MolecularFormula"),
-                "iupac_name": prop.get("IUPACName"),
-                "title": prop.get("Title"),
-                "status": info["status"],
-                "warnings": "; ".join(info.get("warnings", [])),
-            })
-
-    return pd.DataFrame(rows), pd.DataFrame(diagnostics)
+    return pd.DataFrame(rows, columns=MOLECULE_TABLE_COLUMNS), pd.DataFrame(diagnostics)
 
 
 # ---------------------------------------------------------------------------
