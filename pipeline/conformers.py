@@ -827,6 +827,23 @@ def search_conformers(
     relative_artifact_path(xyz_dir, manifest_path)
     relative_artifact_path(log_csv, manifest_path)
 
+    # A fresh/recreated manifest must not publish into stale conformer-stage
+    # state.  Keep this scoped to the destinations owned by this stage; later
+    # Gaussian/SLURM outputs are guarded by their own stages.  An empty XYZ
+    # directory remains valid because the notebook creates it up front.
+    stale_paths = [
+        path for path in (log_csv, failed_csv) if os.path.lexists(path)
+    ]
+    if os.path.isdir(xyz_dir) and os.listdir(xyz_dir):
+        stale_paths.append(xyz_dir)
+    if stale_paths:
+        raise FileExistsError(
+            "This run package contains existing conformer-stage outputs. v2.1 "
+            "runs are immutable and do not support resume or overwrite. Start "
+            "a new run_id or remove the stale run directory. Conflicts: "
+            + ", ".join(repr(path) for path in stale_paths)
+        )
+
     ensure_dir(xyz_dir)
 
     # Clear any stale failure log from a prior run (MIN-02) so a later clean run

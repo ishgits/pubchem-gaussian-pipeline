@@ -217,6 +217,10 @@ def write_linked_conformer_log(
                 "pipeline_commit": row.get("pipeline_commit", pipeline_commit),
                 "rdkit_version": row.get("rdkit_version", rdkit_version),
                 "conformer_record_id": recorded_id,
+                "provenance_status": row.get("provenance_status", "normal"),
+                "undefined_centers": row.get("undefined_centers", ""),
+                "pubchem_smiles": row.get("pubchem_smiles", ""),
+                "arbitrated_smiles": row.get("arbitrated_smiles", ""),
             })
             output_rows.append(output)
     log_path = tmp_path / "conformer_log.csv"

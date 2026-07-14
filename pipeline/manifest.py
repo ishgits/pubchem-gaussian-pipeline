@@ -557,6 +557,14 @@ def validate_manifest(manifest: dict) -> None:
         molecule_conformers = molecule["conformers"]
         if not isinstance(molecule_conformers, list):
             raise ValueError("Manifest molecule conformers must be a list.")
+        if (
+            molecule_status == "provisional_undefined_stereo"
+            and len(molecule_conformers) != 1
+        ):
+            raise ValueError(
+                f"Provisional undefined-stereo molecule {molecule['molecule_name']!r} "
+                "must contain exactly one conformer."
+            )
         for record in molecule_conformers:
             if not isinstance(record, dict):
                 raise ValueError("Manifest conformer record must be a dictionary.")
@@ -1150,6 +1158,7 @@ def record_conformer_group(
             placements.append((staged_path, final_path))
 
     final_keys = {final_key for _staged_key, final_key in path_mappings}
+    xyz_final_keys = set(final_keys)
     for staged_key, final_key in path_mappings:
         if staged_key != final_key and staged_key in final_keys:
             cleanup_staging()
@@ -1168,6 +1177,9 @@ def record_conformer_group(
         if artifact.get("conformer_record_id") in prior_record_ids
         and artifact.get("kind") == "xyz"
     ]
+    prior_xyz_keys = {
+        os.path.normcase(os.path.realpath(path)) for path in prior_xyz_paths
+    }
     candidate_molecule["conformers"] = prepared_records
     # v2.1 (contract §9): stamp the provisional undefined-stereo provenance onto
     # the molecule record. Normal molecules carry provenance_status="normal" and
@@ -1265,6 +1277,21 @@ def record_conformer_group(
         final_keys.add(final_key)
         if os.path.abspath(staged_log_path) != os.path.abspath(final_log_path):
             placements.append((staged_log_path, final_log_path))
+
+    # Publication is allowed to replace only XYZ artifacts already tracked for
+    # this molecule group.  A fresh manifest can otherwise be pointed at stale
+    # output files and silently replace them during the placement loop below.
+    # Check every final XYZ destination before any backup, unlink, or replace.
+    for _staged_path, final_path in placements:
+        final_key = os.path.normcase(os.path.realpath(final_path))
+        if final_key not in xyz_final_keys:
+            continue
+        if os.path.lexists(final_path) and final_key not in prior_xyz_keys:
+            cleanup_staging()
+            raise FileExistsError(
+                "Conformer XYZ destination already exists but is not a tracked "
+                f"prior artifact for this molecule group: {final_path!r}."
+            )
 
     backups = []
     placed = []

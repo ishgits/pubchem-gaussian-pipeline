@@ -6,8 +6,8 @@
 
 **PR:** (opened for v2.1 on branch `feat/pipeline-v2.2`)
 **Branch:** `feat/pipeline-v2.2`
-**Current phase:** v2.1 implementation complete; awaiting Codex review and Ish's
-final approval
+**Current phase:** targeted PR #4 remediation implemented; awaiting verification,
+push, and Ish's final approval
 **Merge status:** local checks green (pytest, check_invariants, git diff --check,
 ignored-tracked-files check); requires push, green remote CI, an independent
 review, and Ish's final approval
@@ -113,6 +113,19 @@ the HPC submission contract (submit the `.sh` from the directory holding its
 provenance/reproducibility section, the run-folder archive/submission steps, the
 resume-removal note (with B-04 disposition), and the provisional undefined-stereo
 caveat.
+
+### PR #4 remediation — complete
+
+- The conformer stage rejects existing conformer logs, failure logs, or a
+  nonempty `conformer_xyz/` before it creates staging state or publishes output;
+  untracked final XYZ destinations hard-fail before publication mutation.
+- Manifest-driven Gaussian COM and SLURM defaults both use `gaussian_jobs/`, so
+  the default SLURM command finds its source COM beside the script.
+- Gaussian preflight requires conformer-log provisional provenance fields to
+  match the authoritative manifest molecule exactly before a COM/log/manifest
+  mutation; provisional COMs therefore retain `dE=NA` and the visible marker.
+- Manifest validation requires an undefined-stereo provisional molecule to carry
+  exactly one conformer, including for hand-edited or damaged manifests.
 
 ## 2. Scientific invariants (unchanged)
 

@@ -1,6 +1,7 @@
 """Tests for pipeline.slurm"""
 
 import os
+import inspect
 import sys
 import tempfile
 
@@ -103,6 +104,12 @@ class TestSlurmScriptCoLocated:
 
 
 class TestWriteSlurmScriptsLogDriven:
+    def test_manifest_driven_default_is_gaussian_jobs(self):
+        assert (
+            inspect.signature(write_slurm_scripts).parameters["slurm_dir"].default
+            == "gaussian_jobs"
+        )
+
     """M-01: default consumes the current run's com_write_log.csv, not a glob."""
 
     def _make_log(self, tmpdir, com_paths):

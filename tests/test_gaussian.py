@@ -1,6 +1,7 @@
 """Tests for pipeline.gaussian"""
 
 import json
+import inspect
 import os
 import sys
 import tempfile
@@ -418,6 +419,13 @@ class TestWriteGaussianComConformer:
 
 
 class TestWriteGaussianComsFromConformers:
+    def test_manifest_driven_default_is_gaussian_jobs(self):
+        assert (
+            inspect.signature(write_gaussian_coms_from_conformers)
+            .parameters["outdir"].default
+            == "gaussian_jobs"
+        )
+
     def test_three_conformer_rows_three_coms(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -523,6 +531,55 @@ class TestWriteGaussianComsFromConformers:
             text = f.read()
         assert "provenance " not in text
         assert "commit=" not in text
+
+    @pytest.mark.parametrize(
+        "field,value", [
+            ("provenance_status", "normal"),
+            ("undefined_centers", "different center"),
+            ("pubchem_smiles", "C"),
+            ("arbitrated_smiles", "N"),
+        ],
+    )
+    def test_provisional_log_metadata_drift_fails_before_com_mutation(
+        self, tmp_path, field, value
+    ):
+        import pandas as pd
+        from pipeline.manifest import load_manifest, write_manifest
+
+        conformer_log, manifest_path = write_linked_conformer_log(
+            tmp_path, [{"name": "Ribose", "conformer_id": 0}], SAMPLE_XYZ
+        )
+        manifest = load_manifest(manifest_path)
+        molecule = manifest["molecules"][0]
+        molecule.update({
+            "provenance_status": "provisional_undefined_stereo",
+            "undefined_centers": "C1",
+            "pubchem_smiles": "C[C@H](O)C",
+            "arbitrated_smiles": "C[C@@H](O)C",
+        })
+        write_manifest(manifest_path, manifest)
+
+        rows = pd.read_csv(conformer_log, dtype=str, keep_default_na=False)
+        rows.loc[0, "provenance_status"] = "provisional_undefined_stereo"
+        rows.loc[0, "undefined_centers"] = "C1"
+        rows.loc[0, "pubchem_smiles"] = "C[C@H](O)C"
+        rows.loc[0, "arbitrated_smiles"] = "C[C@@H](O)C"
+        rows.loc[0, field] = value
+        rows.to_csv(conformer_log, index=False)
+
+        com_log = tmp_path / "com_write_log.csv"
+        com_log.write_bytes(b"existing log\n")
+        with pytest.raises(ValueError, match="provisional metadata disagrees"):
+            write_gaussian_coms_from_conformers(
+                conformer_log,
+                outdir=str(tmp_path / "gaussian_jobs"),
+                log_csv=str(com_log),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                manifest_path=manifest_path,
+            )
+        assert com_log.read_bytes() == b"existing log\n"
+        assert not (tmp_path / "gaussian_jobs").exists()
 
 
 class TestRequiredConformerProvenance:

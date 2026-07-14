@@ -219,7 +219,7 @@ def write_slurm_script(
 
 def write_slurm_scripts(
     com_log_csv: str = "com_write_log.csv",
-    slurm_dir: str = "slurm_scripts",
+    slurm_dir: str = "gaussian_jobs",
     log_csv: str = "slurm_write_log.csv",
     com_dir: str | None = None,
     manifest_path: str = "run_manifest.json",

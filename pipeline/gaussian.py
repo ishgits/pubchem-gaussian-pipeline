@@ -106,6 +106,44 @@ def _validate_required_conformer_provenance(conf_log: pd.DataFrame) -> None:
         )
 
 
+def _validated_conformer_provenance(
+    row: pd.Series,
+    molecule_record: dict,
+    *,
+    row_index: int,
+    artifact_id: str,
+) -> tuple[str, str | None]:
+    """Require the stage CSV's v2.1 provenance to match the manifest exactly."""
+    def disagree(field: str) -> None:
+        raise ValueError(
+            "Conformer log provisional metadata disagrees with the run manifest "
+            f"for artifact {artifact_id}: {field} (row {row_index})."
+        )
+
+    manifest_status = _optional_text(molecule_record.get("provenance_status")) or "normal"
+    row_status = _optional_text(row.get("provenance_status"))
+    if row_status not in ("normal", "provisional_undefined_stereo"):
+        disagree("provenance_status")
+    if row_status != manifest_status:
+        disagree("provenance_status")
+
+    provisional_fields = (
+        "undefined_centers", "pubchem_smiles", "arbitrated_smiles",
+    )
+    if manifest_status == "normal":
+        for field in provisional_fields:
+            if _optional_text(row.get(field)) is not None:
+                disagree(field)
+        return "normal", None
+
+    for field in provisional_fields:
+        manifest_value = _optional_text(molecule_record.get(field))
+        row_value = _optional_text(row.get(field))
+        if manifest_value is None or row_value is None or row_value != manifest_value:
+            disagree(field)
+    return manifest_status, _optional_text(molecule_record["undefined_centers"])
+
+
 def _validate_direct_conformer_provenance(
     conformer_id: int | None,
     pipeline_version,
@@ -504,7 +542,7 @@ def write_gaussian_coms(
 
 def write_gaussian_coms_from_conformers(
     conformer_log_csv: str,
-    outdir: str = "gaussian_inputs",
+    outdir: str = "gaussian_jobs",
     log_csv: str = "com_write_log.csv",
     manifest_path: str = "run_manifest.json",
     **kwargs,
@@ -599,6 +637,12 @@ def write_gaussian_coms_from_conformers(
             raise ValueError(f"Conformer row {int(index)} XYZ path disagrees with manifest.")
         if str(row["xyz_sha256"]) != xyz_artifact["sha256"] or sha256_file(xyz_path) != xyz_artifact["sha256"]:
             raise ValueError(f"Conformer row {int(index)} XYZ hash disagrees with manifest.")
+        provenance_status, undefined_centers = _validated_conformer_provenance(
+            row,
+            molecule_record,
+            row_index=int(index),
+            artifact_id=xyz_artifact_id,
+        )
         conformer_id = int(row["conformer_id"])
         base = f"{sanitize_basename(str(row['name']))}_c{conformer_id:02d}"
         com_path = os.path.join(outdir, f"{base}_F.com")
@@ -609,7 +653,10 @@ def write_gaussian_coms_from_conformers(
         com_artifact_id = stable_record_id(
             manifest["run_id"], "com", xyz_artifact_id
         )
-        prepared.append((row, xyz_artifact, com_path, com_artifact_id, converged))
+        prepared.append((
+            row, xyz_artifact, com_path, com_artifact_id, converged,
+            provenance_status, undefined_centers,
+        ))
 
     # A stage CSV is a subordinate index, not an independent source of truth.
     # After validating each present row, reject a valid-looking subset or extra
@@ -645,7 +692,10 @@ def write_gaussian_coms_from_conformers(
     written = []
     failed = []
 
-    for row, xyz_artifact, expected_com_path, com_artifact_id, converged in prepared:
+    for (
+        row, xyz_artifact, expected_com_path, com_artifact_id, converged,
+        provenance_status, undefined_centers,
+    ) in prepared:
         name = row["name"]
         xyz_path = row["xyz_path"]
         conformer_id = int(row["conformer_id"])
@@ -657,10 +707,6 @@ def write_gaussian_coms_from_conformers(
         rdkit_version = _optional_text(row.get("rdkit_version"))
         run_id = str(row["run_id"])
         config_hash = str(row["config_hash"])
-        # v2.1: the provisional undefined-stereo marker rides through on the
-        # conformer-log row's provenance_status column — no special-case branch.
-        provenance_status = _optional_text(row.get("provenance_status")) or "normal"
-        undefined_centers = _optional_text(row.get("undefined_centers"))
         try:
             com_path = write_gaussian_com(
                 name,

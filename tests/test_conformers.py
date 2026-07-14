@@ -145,6 +145,40 @@ RIBOSE_SMILES = "C([C@@H]1[C@H]([C@H]([C@H](O1)O)O)O)O"
 
 
 class TestSearchConformers:
+    @pytest.mark.parametrize("stale_target", [
+        "conformer_log.csv", "conformer_search_failed.csv", "conf_xyz/foreign.xyz",
+    ])
+    def test_stale_conformer_stage_state_fails_before_generation(
+        self, tmp_path, monkeypatch, stale_target
+    ):
+        pd = pytest.importorskip("pandas")
+        pytest.importorskip("rdkit")
+        import pipeline.conformers as C
+
+        table = pd.DataFrame([
+            {"name": "Water", "cid": 962, "IsomericSMILES": "O"},
+        ])
+        manifest_path = ensure_manifest(tmp_path, table)
+        target = tmp_path / stale_target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"stale sentinel\n")
+        manifest_before = open(manifest_path, "rb").read()
+        monkeypatch.setattr(
+            C, "generate_conformers",
+            lambda *_args, **_kwargs: pytest.fail("generator must not run"),
+        )
+
+        with pytest.raises(FileExistsError, match="existing conformer-stage outputs"):
+            C.search_conformers(
+                table,
+                xyz_dir=str(tmp_path / "conf_xyz"),
+                log_csv=str(tmp_path / "conformer_log.csv"),
+                failed_csv=str(tmp_path / "conformer_search_failed.csv"),
+                manifest_path=manifest_path,
+            )
+        assert target.read_bytes() == b"stale sentinel\n"
+        assert open(manifest_path, "rb").read() == manifest_before
+
     def _table(self):
         pd = pytest.importorskip("pandas")
         return pd.DataFrame([
@@ -832,9 +866,9 @@ class TestGroupTransactionRollback:
         assert not any(name.endswith(".xyz") for name in os.listdir(xyz_dir))
 
 class TestStaleFailedCsvCleared:
-    """MIN-02: a prior run's *_failed.csv must not survive a later clean run."""
+    """A fresh v2.1 run never reuses a prior run's failure log."""
 
-    def test_failed_csv_cleared_on_clean_rerun(self, tmp_path, monkeypatch):
+    def test_stale_failed_csv_rejects_a_fresh_manifest_before_mutation(self, tmp_path, monkeypatch):
         import pandas as pd
 
         import pipeline.conformers as C
@@ -859,7 +893,7 @@ class TestStaleFailedCsvCleared:
         C.search_conformers(bad_table, **bad_kw)
         assert failed_csv.exists()
 
-        # Second run is clean → the stale failure log is cleared, not left behind.
+        # A fresh manifest cannot reuse the prior run's conformer-stage outputs.
         monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
         monkeypatch.setattr(
             C, "generate_conformers",
@@ -869,8 +903,10 @@ class TestStaleFailedCsvCleared:
         good_kw = dict(kw, manifest_path=ensure_manifest(
             tmp_path, good_table, rdkit_version="test-rdkit"
         ))
-        C.search_conformers(good_table, **good_kw)
-        assert not failed_csv.exists()
+        failed_before = failed_csv.read_bytes()
+        with pytest.raises(FileExistsError, match="existing conformer-stage outputs"):
+            C.search_conformers(good_table, **good_kw)
+        assert failed_csv.read_bytes() == failed_before
 
 
 class TestParameterValidation:
