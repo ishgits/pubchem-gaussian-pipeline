@@ -1,6 +1,7 @@
 """Tests for pipeline.gaussian"""
 
 import json
+import inspect
 import os
 import sys
 import tempfile
@@ -249,10 +250,10 @@ class TestWriteGaussianComConformer:
             assert "%chk=ribose_c00_F.chk" in text
             assert text.count("%chk=ribose_c00_F.chk") == 2  # opt + Link1
             assert "--Link1--" in text  # Link1 contract preserved
-            assert (
-                "provenance pipeline=2.0.0 commit=unavailable rdkit=2025.03.3"
-                in text
-            )
+            # v2.1: title carries a single artifact_id back-pointer, no provenance line.
+            assert f"artifact_id={linkage['artifact_id']}" in text
+            assert "provenance " not in text
+            assert "pipeline=" not in text
 
     def test_conformer_delta_energy_in_title(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -276,11 +277,8 @@ class TestWriteGaussianComConformer:
             with open(com_path) as f:
                 text = f.read()
             assert "dE=1.2345 kcal/mol" in text
-            assert "ribose_c02" in text  # id in title line
-            assert (
-                "provenance pipeline=2.0.0 commit=unavailable rdkit=2025.03.3"
-                in text
-            )
+            assert "ribose_c02" in text  # id in title line (via basename)
+            assert "provenance " not in text
 
     @pytest.mark.parametrize(
         "pipeline_version,rdkit_version,missing",
@@ -356,7 +354,10 @@ class TestWriteGaussianComConformer:
             )
         assert not outdir.exists()
 
-    def test_provenance_is_stamped_only_in_title_section(self):
+    def test_title_is_single_line_with_only_artifact_id(self):
+        # v2.1 (contract §5): the COM title is a single line carrying inline
+        # science + one artifact_id. No second `provenance …` line, no
+        # run_id/config_hash/version tokens. Routes/charge/Link1 unchanged.
         route_opt = "# opt b3lyp/6-31g(d)"
         route_freq = "# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -386,44 +387,21 @@ class TestWriteGaussianComConformer:
             with open(com_path) as f:
                 text = f.read()
 
-            provenance = (
-                "provenance pipeline=2.0.0 commit=abc1234 rdkit=2025.09.3"
-            )
             title_and_rest = text.split(f"{route_opt}\n\n", 1)[1]
-            title_block, after_title = title_and_rest.split("\n\n", 1)
-            assert provenance in title_block
-            assert text.count(provenance) == 1
-            assert provenance not in after_title
+            title_block, _after_title = title_and_rest.split("\n\n", 1)
+            # Single-line title with the one back-pointer, nothing manifest-only.
+            assert title_block.count("\n") == 0
+            assert f"artifact_id={linkage['artifact_id']}" in title_block
+            for gone in (
+                "provenance ", "pipeline=", "commit=", "rdkit=",
+                "run_id=", "config_hash=",
+            ):
+                assert gone not in text
             assert text.count(route_opt) == 1
             assert text.count(route_freq) == 1
             assert "\n-1 2\n" in text
             assert text.count("%chk=ribose_c00_F.chk") == 2
             assert "--Link1--" in text
-
-    def test_missing_commit_is_explicit_when_other_provenance_exists(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            xyz_path, linkage = direct_com_context(
-                Path(tmpdir), SAMPLE_XYZ, pipeline_commit="",
-            )
-            com_path = write_gaussian_com(
-                name="Ribose",
-                xyz_path=xyz_path,
-                outdir=tmpdir,
-                route_opt="# opt b3lyp/6-31g(d)",
-                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
-                conformer_id=0,
-                rel_energy_kcalmol=0.0,
-                pipeline_version="2.0.0",
-                pipeline_commit="",
-                rdkit_version="2025.09.3",
-                **linkage,
-            )
-            with open(com_path) as f:
-                text = f.read()
-            assert (
-                "provenance pipeline=2.0.0 commit=unavailable rdkit=2025.09.3"
-                in text
-            )
 
     def test_none_conformer_preserves_v1_naming(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -439,8 +417,66 @@ class TestWriteGaussianComConformer:
                 text = f.read()
             assert "provenance " not in text
 
+    def test_direct_v2_com_derives_provisional_metadata_from_manifest(self, tmp_path):
+        from pipeline.manifest import load_manifest, write_manifest
+
+        xyz_path, linkage = direct_com_context(tmp_path, SAMPLE_XYZ)
+        manifest = load_manifest(linkage["manifest_path"])
+        manifest["molecules"][0].update({
+            "provenance_status": "provisional_undefined_stereo",
+            "undefined_centers": "C1",
+            "pubchem_smiles": "C[C@H](O)C",
+            "arbitrated_smiles": "C[C@@H](O)C",
+        })
+        write_manifest(linkage["manifest_path"], manifest)
+
+        com_path = write_gaussian_com(
+            name="Ribose", xyz_path=xyz_path, outdir=str(tmp_path / "gaussian_jobs"),
+            route_opt="# opt b3lyp/6-31g(d)",
+            route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+            conformer_id=0, rel_energy_kcalmol=0.0,
+            pipeline_version="2.0.0", pipeline_commit="abc1234",
+            rdkit_version="2025.09.3", **linkage,
+        )
+        text = Path(com_path).read_text(encoding="utf-8")
+        assert "dE=NA" in text
+        assert "PROVISIONAL: stereo arbitrated at C1" in text
+        assert "dE=0.0000 kcal/mol" not in text
+
+    def test_direct_v2_provisional_metadata_mismatch_fails_before_mutation(self, tmp_path):
+        from pipeline.manifest import load_manifest, write_manifest
+
+        xyz_path, linkage = direct_com_context(tmp_path, SAMPLE_XYZ)
+        manifest = load_manifest(linkage["manifest_path"])
+        manifest["molecules"][0].update({
+            "provenance_status": "provisional_undefined_stereo",
+            "undefined_centers": "C1",
+            "pubchem_smiles": "C[C@H](O)C",
+            "arbitrated_smiles": "C[C@@H](O)C",
+        })
+        write_manifest(linkage["manifest_path"], manifest)
+        outdir = tmp_path / "gaussian_jobs"
+
+        with pytest.raises(ValueError, match="provenance_status disagrees"):
+            write_gaussian_com(
+                name="Ribose", xyz_path=xyz_path, outdir=str(outdir),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                conformer_id=0, rel_energy_kcalmol=0.0,
+                pipeline_version="2.0.0", pipeline_commit="abc1234",
+                rdkit_version="2025.09.3", provenance_status="normal", **linkage,
+            )
+        assert not outdir.exists()
+
 
 class TestWriteGaussianComsFromConformers:
+    def test_manifest_driven_default_is_gaussian_jobs(self):
+        assert (
+            inspect.signature(write_gaussian_coms_from_conformers)
+            .parameters["outdir"].default
+            == "gaussian_jobs"
+        )
+
     def test_three_conformer_rows_three_coms(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -512,15 +548,15 @@ class TestWriteGaussianComsFromConformers:
         assert written_log.loc[0, "pipeline_version"] == "2.0.0"
         assert written_log.loc[0, "pipeline_commit"] == "abc1234"
         assert written_log.loc[0, "rdkit_version"] == "2025.09.3"
+        # v2.1: provenance stays in the manifest and COM write log (asserted
+        # above), but is NOT printed into the COM body.
         with open(out.loc[0, "com_path"]) as f:
             text = f.read()
-        assert (
-            "provenance pipeline=2.0.0 commit=abc1234 rdkit=2025.09.3" in text
-        )
+        assert "provenance " not in text
+        assert "pipeline=" not in text
+        assert f"artifact_id={out.loc[0, 'artifact_id']}" in text
 
-    def test_batch_missing_commit_writes_unavailable(self, tmp_path):
-        import pandas as pd
-
+    def test_batch_commit_stays_out_of_com_body(self, tmp_path):
         conformer_log, manifest_path = write_linked_conformer_log(
             tmp_path,
             [{
@@ -544,10 +580,57 @@ class TestWriteGaussianComsFromConformers:
 
         with open(out.loc[0, "com_path"]) as f:
             text = f.read()
-        assert (
-            "provenance pipeline=2.0.0 commit=unavailable rdkit=2025.09.3"
-            in text
+        assert "provenance " not in text
+        assert "commit=" not in text
+
+    @pytest.mark.parametrize(
+        "field,value", [
+            ("provenance_status", "normal"),
+            ("undefined_centers", "different center"),
+            ("pubchem_smiles", "C"),
+            ("arbitrated_smiles", "N"),
+        ],
+    )
+    def test_provisional_log_metadata_drift_fails_before_com_mutation(
+        self, tmp_path, field, value
+    ):
+        import pandas as pd
+        from pipeline.manifest import load_manifest, write_manifest
+
+        conformer_log, manifest_path = write_linked_conformer_log(
+            tmp_path, [{"name": "Ribose", "conformer_id": 0}], SAMPLE_XYZ
         )
+        manifest = load_manifest(manifest_path)
+        molecule = manifest["molecules"][0]
+        molecule.update({
+            "provenance_status": "provisional_undefined_stereo",
+            "undefined_centers": "C1",
+            "pubchem_smiles": "C[C@H](O)C",
+            "arbitrated_smiles": "C[C@@H](O)C",
+        })
+        write_manifest(manifest_path, manifest)
+
+        rows = pd.read_csv(conformer_log, dtype=str, keep_default_na=False)
+        rows.loc[0, "provenance_status"] = "provisional_undefined_stereo"
+        rows.loc[0, "undefined_centers"] = "C1"
+        rows.loc[0, "pubchem_smiles"] = "C[C@H](O)C"
+        rows.loc[0, "arbitrated_smiles"] = "C[C@@H](O)C"
+        rows.loc[0, field] = value
+        rows.to_csv(conformer_log, index=False)
+
+        com_log = tmp_path / "com_write_log.csv"
+        com_log.write_bytes(b"existing log\n")
+        with pytest.raises(ValueError, match="provisional metadata disagrees"):
+            write_gaussian_coms_from_conformers(
+                conformer_log,
+                outdir=str(tmp_path / "gaussian_jobs"),
+                log_csv=str(com_log),
+                route_opt="# opt b3lyp/6-31g(d)",
+                route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
+                manifest_path=manifest_path,
+            )
+        assert com_log.read_bytes() == b"existing log\n"
+        assert not (tmp_path / "gaussian_jobs").exists()
 
 
 class TestRequiredConformerProvenance:
@@ -768,8 +851,10 @@ class TestEmptyComLogSchemas:
 
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
+        # v2.1: undefined stereo is now provisional (produces output), so to
+        # exercise the genuine zero-job path use a hard skip reason instead.
         monkeypatch.setattr(
-            C, "check_conformer_eligibility", lambda smiles: "undefined stereochemistry"
+            C, "check_conformer_eligibility", lambda smiles: "no IsomericSMILES"
         )
         molecule_table = pd.DataFrame([{
             "name": "Ambiguous",
@@ -799,8 +884,8 @@ class TestEmptyComLogSchemas:
             route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
             manifest_path=manifest_path,
         )
-        slurm_dir = tmp_path / "slurm_scripts"
-        slurm_dir.mkdir()
+        slurm_dir = tmp_path / "gaussian_jobs"
+        slurm_dir.mkdir(exist_ok=True)
         (slurm_dir / "stale_F.sh").write_text("#!/bin/bash\n")
         slurm_log = tmp_path / "slurm_write_log.csv"
         scripts = write_slurm_scripts(
@@ -959,7 +1044,7 @@ class TestPackageBoundaryPreflight:
             route_freq="# freq b3lyp/6-31g(d) Geom=AllChk Guess=Read",
             manifest_path=manifest_path,
         )
-        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_dir = outdir
         slurm_log = tmp_path / "slurm_write_log.csv"
         write_slurm_scripts(
             com_log_csv=str(com_log),

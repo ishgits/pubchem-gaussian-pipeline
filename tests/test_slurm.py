@@ -1,8 +1,10 @@
 """Tests for pipeline.slurm"""
 
 import os
+import inspect
 import sys
 import tempfile
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -49,15 +51,16 @@ class TestWriteSlurmScript:
             assert "--time=48:00:00" in text
 
     def test_g16_runs_the_com_basename(self):
-        # B-03: the script cd's to the input's directory and runs g16 on the
-        # basename (resolved relative to the script's own location), not a bare
-        # `g16 {jobname}.com` that only works from one directory.
+        # v2.1 (contract §5, architecture Change 2): COM+SH are co-located, so the
+        # script drops all path-resolution machinery and simply runs g16 on the
+        # .com in its own directory.
         with tempfile.TemporaryDirectory() as tmpdir:
             sh_path = write_slurm_script("cytosine_F", tmpdir)
             with open(sh_path) as f:
                 text = f.read()
-            assert 'g16 "$(basename "$COM_PATH")"' in text
-            assert 'COM_PATH="$SCRIPT_DIR/cytosine_F.com"' in text
+            assert "g16 cytosine_F.com" in text
+            for gone in ("SCRIPT_DIR", "COM_PATH", "cd ", "../", "basename"):
+                assert gone not in text
 
     def test_custom_template(self):
         custom = "#!/bin/bash\n#SBATCH --job-name={jobname}\necho {jobname}\n"
@@ -67,50 +70,116 @@ class TestWriteSlurmScript:
                 text = f.read()
             assert "echo test_mol" in text
 
+    @pytest.mark.parametrize("placeholder", ["com_relpath", "unknown_field"])
+    def test_unsupported_template_placeholder_fails_before_directory_creation(
+        self, tmp_path, placeholder
+    ):
+        outdir = tmp_path / "gaussian_jobs"
+        with pytest.raises(ValueError, match=placeholder):
+            write_slurm_script(
+                "test_mol",
+                str(outdir),
+                template=f"#!/bin/bash\necho {{{placeholder}}}\n",
+            )
+        assert not outdir.exists()
 
-class TestSlurmScriptResolvesInput:
-    """B-03: a script in slurm_scripts/ must resolve its .com in a sibling
-    gaussian_inputs/ directory, regardless of the submission directory."""
 
-    def test_sibling_dirs_relpath(self):
+class TestSlurmScriptCoLocated:
+    """v2.1: COM+SH ship together in gaussian_jobs/, so the script runs
+    `g16 {jobname}.com` from its own directory — no path-resolution machinery."""
+
+    def test_runs_bare_com_basename_regardless_of_com_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            com_dir = os.path.join(tmpdir, "gaussian_inputs")
-            slurm_dir = os.path.join(tmpdir, "slurm_scripts")
-            os.makedirs(com_dir)
-            os.makedirs(slurm_dir)
-            com_path = os.path.join(com_dir, "adenine_F.com")
+            jobs_dir = os.path.join(tmpdir, "gaussian_jobs")
+            os.makedirs(jobs_dir)
+            com_path = os.path.join(jobs_dir, "adenine_F.com")
             with open(com_path, "w") as f:
                 f.write("%chk=adenine_F.chk\n")
 
-            sh_path = write_slurm_script("adenine_F", slurm_dir, com_path=com_path)
+            sh_path = write_slurm_script("adenine_F", jobs_dir, com_path=com_path)
             with open(sh_path) as f:
                 text = f.read()
 
-            # The stored path is relative and preserves the real directory name.
-            assert 'COM_PATH="$SCRIPT_DIR/../gaussian_inputs/adenine_F.com"' in text
+            assert "g16 adenine_F.com" in text
+            for gone in ("SCRIPT_DIR", "COM_PATH", "../", "basename", "cd "):
+                assert gone not in text
 
-            # And it actually resolves back to the real input file on disk.
-            rel = os.path.join("..", "gaussian_inputs", "adenine_F.com")
-            resolved = os.path.normpath(os.path.join(slurm_dir, rel))
-            assert resolved == os.path.normpath(com_path)
-            assert os.path.exists(resolved)
-
-    def test_custom_com_dir_name_preserved(self):
-        # relpath preserves a non-default directory name (not hardcoded).
+    def test_no_path_machinery_even_for_nondefault_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            com_dir = os.path.join(tmpdir, "my_inputs")
-            slurm_dir = os.path.join(tmpdir, "jobs")
-            os.makedirs(com_dir)
-            os.makedirs(slurm_dir)
-            com_path = os.path.join(com_dir, "water_F.com")
+            jobs_dir = os.path.join(tmpdir, "jobs")
+            os.makedirs(jobs_dir)
+            com_path = os.path.join(jobs_dir, "water_F.com")
             open(com_path, "w").close()
-            sh_path = write_slurm_script("water_F", slurm_dir, com_path=com_path)
+            sh_path = write_slurm_script("water_F", jobs_dir, com_path=com_path)
             with open(sh_path) as f:
                 text = f.read()
-            assert "../my_inputs/water_F.com" in text
+            assert "g16 water_F.com" in text
+            assert "jobs/water_F.com" not in text  # no directory path in the body
+
+
+    def test_separate_direct_com_and_sh_dirs_fail_before_mutation(self, tmp_path):
+        com_dir = tmp_path / "gaussian_inputs"
+        com_dir.mkdir()
+        com_path = com_dir / "water_F.com"
+        com_path.write_bytes(b"%chk=water_F.chk\n")
+        outdir = tmp_path / "slurm_scripts"
+
+        with pytest.raises(ValueError, match="same directory"):
+            write_slurm_script(
+                "water_F",
+                str(outdir),
+                com_path=str(com_path),
+            )
+
+        assert not outdir.exists()
+        assert com_path.read_bytes() == b"%chk=water_F.chk\n"
+
+    def test_direct_sibling_com_and_sh_still_succeeds(self, tmp_path):
+        jobs_dir = tmp_path / "gaussian_jobs"
+        jobs_dir.mkdir()
+        com_path = jobs_dir / "water_F.com"
+        com_path.write_text("%chk=water_F.chk\n")
+
+        sh_path = write_slurm_script(
+            "water_F",
+            str(jobs_dir),
+            com_path=str(com_path),
+        )
+
+        assert Path(sh_path).parent == jobs_dir
+        assert "g16 water_F.com" in Path(sh_path).read_text()
 
 
 class TestWriteSlurmScriptsLogDriven:
+    def test_manifest_driven_default_is_gaussian_jobs(self):
+        assert (
+            inspect.signature(write_slurm_scripts).parameters["slurm_dir"].default
+            == "gaussian_jobs"
+        )
+
+    def test_separate_manifest_driven_com_and_sh_dirs_fail_before_mutation(self, tmp_path):
+        com_log, manifest_path = write_linked_com_log(
+            tmp_path,
+            [{"name": "Water", "com_path": tmp_path / "gaussian_inputs" / "water_F.com"}],
+            SAMPLE_XYZ,
+        )
+        slurm_dir = tmp_path / "gaussian_jobs"
+        slurm_log = tmp_path / "slurm_write_log.csv"
+        slurm_log.write_bytes(b"prior log\n")
+        manifest_before = open(manifest_path, "rb").read()
+
+        with pytest.raises(ValueError, match="co-located"):
+            write_slurm_scripts(
+                com_log_csv=str(com_log),
+                slurm_dir=str(slurm_dir),
+                log_csv=str(slurm_log),
+                manifest_path=manifest_path,
+            )
+
+        assert not slurm_dir.exists()
+        assert slurm_log.read_bytes() == b"prior log\n"
+        assert open(manifest_path, "rb").read() == manifest_before
+
     """M-01: default consumes the current run's com_write_log.csv, not a glob."""
 
     def _make_log(self, tmpdir, com_paths):
@@ -128,7 +197,7 @@ class TestWriteSlurmScriptsLogDriven:
 
             root = Path(tmpdir)
             com_dir = os.path.join(tmpdir, "gaussian_inputs")
-            slurm_dir = os.path.join(tmpdir, "slurm_scripts")
+            slurm_dir = os.path.join(tmpdir, "gaussian_inputs")
             log_csv, manifest_path = write_linked_com_log(
                 root,
                 [
@@ -158,7 +227,7 @@ class TestWriteSlurmScriptsLogDriven:
     def test_legacy_com_dir_glob_still_reachable(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             com_dir = os.path.join(tmpdir, "gaussian_inputs")
-            slurm_dir = os.path.join(tmpdir, "slurm_scripts")
+            slurm_dir = com_dir
             os.makedirs(com_dir)
             for name in ("a_F", "b_F"):
                 open(os.path.join(com_dir, f"{name}.com"), "w").close()
@@ -168,6 +237,29 @@ class TestWriteSlurmScriptsLogDriven:
                 log_csv=os.path.join(tmpdir, "slurm_write_log.csv"),
             )
             assert sorted(df["jobname"]) == ["a_F", "b_F"]
+
+    def test_legacy_separate_directories_fail_before_mutation(self, tmp_path):
+        com_dir = tmp_path / "gaussian_inputs"
+        slurm_dir = tmp_path / "slurm_scripts"
+        com_dir.mkdir()
+        (com_dir / "job_F.com").write_text("%chk=job_F.chk\n")
+        slurm_dir.mkdir()
+        prior_script = slurm_dir / "prior.sh"
+        prior_script.write_bytes(b"prior script\n")
+        slurm_log = tmp_path / "slurm_write_log.csv"
+        slurm_log.write_bytes(b"prior log\n")
+        com_before = (com_dir / "job_F.com").read_bytes()
+
+        with pytest.raises(ValueError, match="same directory|co-located"):
+            write_slurm_scripts(
+                com_dir=str(com_dir),
+                slurm_dir=str(slurm_dir),
+                log_csv=str(slurm_log),
+            )
+
+        assert prior_script.read_bytes() == b"prior script\n"
+        assert slurm_log.read_bytes() == b"prior log\n"
+        assert (com_dir / "job_F.com").read_bytes() == com_before
 
     @pytest.mark.parametrize(
         "bad_path",
@@ -219,7 +311,7 @@ class TestWriteSlurmScriptsLogDriven:
         rows.to_csv(com_log, index=False)
 
         slurm_dir = tmp_path / "slurm_scripts"
-        slurm_dir.mkdir()
+        slurm_dir.mkdir(exist_ok=True)
         prior_script = slurm_dir / "prior_F.sh"
         prior_script.write_bytes(b"prior script\n")
         slurm_log = tmp_path / "slurm_write_log.csv"
@@ -245,7 +337,7 @@ class TestStrictOneToOneManifestMapping:
     @staticmethod
     def _prior_outputs(tmp_path):
         slurm_dir = tmp_path / "slurm_scripts"
-        slurm_dir.mkdir()
+        slurm_dir.mkdir(exist_ok=True)
         prior_script = slurm_dir / "prior.sh"
         prior_script.write_bytes(b"prior script\n")
         slurm_log = tmp_path / "slurm_write_log.csv"
@@ -324,7 +416,7 @@ class TestStrictOneToOneManifestMapping:
         )
         out = write_slurm_scripts(
             com_log_csv=com_log,
-            slurm_dir=str(tmp_path / "slurm_scripts"),
+            slurm_dir=str(tmp_path / "inputs"),
             log_csv=str(tmp_path / "slurm_write_log.csv"),
             manifest_path=manifest_path,
         )
@@ -333,9 +425,11 @@ class TestStrictOneToOneManifestMapping:
         assert out["sh_path"].is_unique
         for _, row in out.iterrows():
             text = open(row["sh_path"], encoding="utf-8").read()
-            assert f"# run_id={row['run_id']}" in text
+            # v2.1 reduced header: artifact_id + co-located source COM basename + sha256.
             assert f"# artifact_id={row['artifact_id']}" in text
-            assert f"# source_com_sha256={row['com_sha256']}" in text
+            assert f"# source_com={os.path.basename(row['com_path'])} sha256={row['com_sha256']}" in text
+            assert "# run_id=" not in text
+            assert "source_com_relative_path" not in text
 
 
 class TestWriteSlurmScriptsOverwrite:
@@ -344,7 +438,7 @@ class TestWriteSlurmScriptsOverwrite:
     def test_rewrite_updates_account_and_reports_overwrite(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             com_dir = os.path.join(tmpdir, "gaussian_inputs")
-            slurm_dir = os.path.join(tmpdir, "slurm_scripts")
+            slurm_dir = com_dir
             os.makedirs(com_dir)
             com_path = os.path.join(com_dir, "adenine_F.com")
             with open(com_path, "w") as handle:
@@ -383,14 +477,14 @@ class TestWriteSlurmScriptsCurrentRunCleanup:
         ).to_csv(path, index=False)
 
     def test_smaller_rerun_prunes_stale_scripts(self, tmp_path):
-        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_dir = tmp_path / "gaussian_inputs"
         slurm_log = tmp_path / "slurm_write_log.csv"
         com_log, manifest_path = write_linked_com_log(
             tmp_path,
             [{"name": "Water", "com_path": tmp_path / "gaussian_inputs" / "water_F.com"}],
             SAMPLE_XYZ,
         )
-        slurm_dir.mkdir()
+        slurm_dir.mkdir(exist_ok=True)
         (slurm_dir / "stale_F.sh").write_text("#!/bin/bash\n")
         out = write_slurm_scripts(
             com_log_csv=str(com_log),
@@ -415,7 +509,7 @@ class TestWriteSlurmScriptsCurrentRunCleanup:
             ],
             SAMPLE_XYZ,
         )
-        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_dir = tmp_path / "gaussian_inputs"
         slurm_log = tmp_path / "slurm_write_log.csv"
         first = write_slurm_scripts(
             com_log_csv=str(com_log),
@@ -446,7 +540,7 @@ class TestWriteSlurmScriptsCurrentRunCleanup:
         assert {path: path.read_bytes() for path in slurm_dir.glob("*.sh")} == script_bytes
 
     def test_zero_job_rerun_prunes_all_and_keeps_log_schema(self, tmp_path):
-        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_dir = tmp_path / "gaussian_inputs"
         slurm_dir.mkdir()
         (slurm_dir / "old_F.sh").write_text("#!/bin/bash\n")
         com_log = tmp_path / "com_write_log.csv"
@@ -482,10 +576,10 @@ class TestPackageBoundaryPreflight:
     def _build_valid_run(self, tmp_path):
         com_log, manifest_path = write_linked_com_log(
             tmp_path,
-            [{"name": "Water", "com_path": tmp_path / "gaussian_inputs" / "water_F.com"}],
+            [{"name": "Water", "com_path": tmp_path / "gaussian_jobs" / "water_F.com"}],
             SAMPLE_XYZ,
         )
-        slurm_dir = tmp_path / "slurm_scripts"
+        slurm_dir = tmp_path / "gaussian_jobs"
         slurm_log = tmp_path / "slurm_write_log.csv"
         write_slurm_scripts(
             com_log_csv=str(com_log),

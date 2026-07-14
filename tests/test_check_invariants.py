@@ -108,13 +108,6 @@ class TestGaussianProvenanceGuard:
         problems = check_invariants._gaussian_provenance_problems(broken)
         assert any("does not forward pipeline_commit" in p for p in problems)
 
-    def test_detects_missing_title_token(self):
-        broken = self._source().replace(
-            'f"rdkit={rdkit_version}"', 'f"kit={rdkit_version}"', 1
-        )
-        problems = check_invariants._gaussian_provenance_problems(broken)
-        assert any("title missing token 'rdkit='" in p for p in problems)
-
     def test_detects_missing_required_source_version(self):
         broken = self._source().replace(
             '    "rdkit_version",\n    "xyz_sha256",',
@@ -167,73 +160,45 @@ class TestGaussianProvenanceGuard:
         assert any("direct conformer provenance validation occurs after mutation" in p for p in problems)
 
 
-class TestAppendIntegrityGuard:
-    """M-15/M-19/M-20: guard reuse and generated XYZ provenance."""
+class TestNoResumeGuard:
+    """v2.1 (contract §7): the resume/append subsystem is removed; the guard
+    proves the path is GONE, not merely refactored, and holds the reduced XYZ
+    provenance tokens."""
 
     @staticmethod
     def _source():
         return (SCRIPT.parents[1] / "pipeline" / "conformers.py").read_text()
 
     def test_current_conformer_source_passes(self):
-        assert check_invariants._append_integrity_problems(self._source()) == []
+        assert check_invariants._no_resume_problems(self._source()) == []
 
-    def test_detects_missing_complete_group_check(self):
+    def test_detects_reintroduced_resume_helper(self):
         broken = self._source().replace(
-            "        _resume_group_is_complete(rows, manifest_path, manifest)\n",
-            "        True\n",
+            "def search_conformers(",
+            "def _resume_partition(existing):\n    return None\n\n\ndef search_conformers(",
             1,
         )
-        problems = check_invariants._append_integrity_problems(broken)
-        assert any("omits _resume_group_is_complete" in p for p in problems)
+        problems = check_invariants._no_resume_problems(broken)
+        assert any("_resume_partition was not removed" in p for p in problems)
 
-    def test_detects_missing_identity_check(self):
+    def test_detects_reintroduced_append_parameter(self):
         broken = self._source().replace(
-            "        and _group_identity_is_consistent(rows)\n", "", 1
-        )
-        problems = check_invariants._append_integrity_problems(broken)
-        assert any("omits _group_identity_is_consistent" in p for p in problems)
-
-    def test_detects_missing_commit_field_check(self):
-        broken = self._source().replace('"pipeline_commit" in row', '"other" in row', 1)
-        problems = check_invariants._append_integrity_problems(broken)
-        assert any("omits pipeline_commit" in p for p in problems)
-
-    def test_detects_missing_resume_commit_comparison(self):
-        broken = self._source().replace(
-            'row.get("pipeline_commit")', 'row.get("other_commit")', 1
-        )
-        problems = check_invariants._append_integrity_problems(broken)
-        assert any("matching omits pipeline_commit" in p for p in problems)
-
-    def test_detects_missing_dirty_commit_rejection(self):
-        broken = self._source().replace('.endswith(".dirty")', '.endswith(".other")')
-        problems = check_invariants._append_integrity_problems(broken)
-        assert any("omits dirty-commit rejection" in p for p in problems)
-
-    def test_detects_missing_blank_commit_rejection(self):
-        broken = self._source().replace(
-            "    if not row_commit or not config_commit:\n        return False\n",
-            "",
+            "    seed: int = SEED,\n    manifest_path: str = \"run_manifest.json\",",
+            "    seed: int = SEED,\n    append: bool = False,\n    manifest_path: str = \"run_manifest.json\",",
             1,
         )
-        problems = check_invariants._append_integrity_problems(broken)
-        assert any("permits a missing commit" in p for p in problems)
+        problems = check_invariants._no_resume_problems(broken)
+        assert any("still exposes an append parameter" in p for p in problems)
 
-    def test_detects_missing_commit_in_run_config(self):
-        broken = self._source().replace(
-            '        "pipeline_commit": pipeline_commit,\n', "", 1
-        )
-        problems = check_invariants._append_integrity_problems(broken)
-        assert any("run_config omits pipeline_commit" in p for p in problems)
+    def test_detects_missing_populated_run_guard(self):
+        broken = self._source().replace("already populated", "some-other-text")
+        problems = check_invariants._no_resume_problems(broken)
+        assert any("already-populated run folder" in p for p in problems)
 
-    def test_detects_missing_rdkit_xyz_token(self):
-        broken = self._source().replace(
-            'f"pipeline_version={pipeline_version} rdkit_version={rdkit_ver}"',
-            'f"pipeline_version={pipeline_version}"',
-            1,
-        )
-        problems = check_invariants._append_integrity_problems(broken)
-        assert any("XYZ provenance omits rdkit_version=" in p for p in problems)
+    def test_detects_missing_xyz_metadata_token(self):
+        broken = self._source().replace("method={method}", "ff={method}", 1)
+        problems = check_invariants._no_resume_problems(broken)
+        assert any("omits 'method='" in p for p in problems)
 
 
 class TestFrozenManifestMatrixGuard:
@@ -262,11 +227,7 @@ class TestFrozenManifestMatrixGuard:
 
     def test_detects_missing_xyz_linkage_field(self):
         manifest, conformers, gaussian, slurm = self._sources()
-        conformers = conformers.replace(
-            'f"relative_energy_kcalmol={rel_e:.6f} method={method} "',
-            'f"relative_energy={rel_e:.6f} method={method} "',
-            1,
-        )
+        conformers = conformers.replace("method={method}", "ff={method}", 1)
         problems = check_invariants._frozen_matrix_problems(
             manifest, conformers, gaussian, slurm
         )

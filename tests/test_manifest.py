@@ -169,6 +169,21 @@ class TestCanonicalConfigurationHash:
 
 
 class TestManifestValidation:
+    @pytest.mark.parametrize("count", [0, 2])
+    def test_provisional_manifest_requires_exactly_one_conformer(self, tmp_path, count):
+        path, _, _ = _create_with_xyz(tmp_path)
+        manifest = load_manifest(str(path))
+        molecule = manifest["molecules"][0]
+        molecule.update({
+            "provenance_status": "provisional_undefined_stereo",
+            "undefined_centers": "C1",
+            "pubchem_smiles": "C[C@H](O)C",
+            "arbitrated_smiles": "C[C@@H](O)C",
+        })
+        molecule["conformers"] = molecule["conformers"] * count
+        with pytest.raises(ValueError, match="must contain exactly one conformer"):
+            validate_manifest(manifest)
+
     def test_manifest_is_immutable_and_zero_job_valid(self, tmp_path):
         path = _create(tmp_path)
         manifest = finalize_manifest(str(path))
@@ -726,6 +741,20 @@ class TestAtomicConformerGroupPublication:
         assert len(final["molecules"][0]["conformers"]) == 3
         assert len([a for a in final["artifacts"] if a["kind"] == "xyz"]) == 3
         assert not list(tmp_path.glob(".staging-*"))
+
+    def test_foreign_final_xyz_fails_before_publication(self, tmp_path):
+        path = self._manifest(tmp_path)
+        payload = self._payload(path, tmp_path, count=1)
+        final_path = Path(payload[0]["xyz_path"])
+        final_path.write_bytes(b"foreign sentinel\n")
+        manifest_before = path.read_bytes()
+
+        with pytest.raises(FileExistsError, match="not a tracked prior artifact"):
+            self._publish(path, payload)
+
+        assert final_path.read_bytes() == b"foreign sentinel\n"
+        assert path.read_bytes() == manifest_before
+        assert not list(tmp_path.rglob("*.backup-*"))
 
     @pytest.mark.parametrize(
         "ids",

@@ -18,14 +18,7 @@ from manifest_helpers import ensure_manifest
 
 from pipeline.conformers import (
     UNCONVERGED_FF_SEED,
-    _carry_forward_group_is_valid,
     _finalize_convergence,
-    _group_identity_is_consistent,
-    _resume_group_is_complete,
-    _resume_partition,
-    _row_config_matches,
-    _row_identity_matches,
-    _row_xyz_present,
     check_conformer_eligibility,
     select_converged_top_n,
     select_top_n,
@@ -152,6 +145,40 @@ RIBOSE_SMILES = "C([C@@H]1[C@H]([C@H]([C@H](O1)O)O)O)O"
 
 
 class TestSearchConformers:
+    @pytest.mark.parametrize("stale_target", [
+        "conformer_log.csv", "conformer_search_failed.csv", "conf_xyz/foreign.xyz",
+    ])
+    def test_stale_conformer_stage_state_fails_before_generation(
+        self, tmp_path, monkeypatch, stale_target
+    ):
+        pd = pytest.importorskip("pandas")
+        pytest.importorskip("rdkit")
+        import pipeline.conformers as C
+
+        table = pd.DataFrame([
+            {"name": "Water", "cid": 962, "IsomericSMILES": "O"},
+        ])
+        manifest_path = ensure_manifest(tmp_path, table)
+        target = tmp_path / stale_target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"stale sentinel\n")
+        manifest_before = open(manifest_path, "rb").read()
+        monkeypatch.setattr(
+            C, "generate_conformers",
+            lambda *_args, **_kwargs: pytest.fail("generator must not run"),
+        )
+
+        with pytest.raises(FileExistsError, match="existing conformer-stage outputs"):
+            C.search_conformers(
+                table,
+                xyz_dir=str(tmp_path / "conf_xyz"),
+                log_csv=str(tmp_path / "conformer_log.csv"),
+                failed_csv=str(tmp_path / "conformer_search_failed.csv"),
+                manifest_path=manifest_path,
+            )
+        assert target.read_bytes() == b"stale sentinel\n"
+        assert open(manifest_path, "rb").read() == manifest_before
+
     def _table(self):
         pd = pytest.importorskip("pandas")
         return pd.DataFrame([
@@ -221,7 +248,9 @@ class TestSearchConformers:
         # No XYZ files written for a skipped molecule.
         assert not any(os.scandir(xyz_dir)) if os.path.isdir(xyz_dir) else True
 
-    def test_undefined_stereo_is_skipped_and_logged(self, tmp_path):
+    def test_undefined_stereo_is_provisional_not_skipped(self, tmp_path):
+        # v2.1 judgment #5: undefined stereo now yields ONE provisional structure,
+        # loudly flagged — no longer skipped.
         pd = pytest.importorskip("pandas")
         pytest.importorskip("rdkit")
         from pipeline.conformers import search_conformers
@@ -240,51 +269,58 @@ class TestSearchConformers:
             failed_csv=str(failed_csv),
             manifest_path=manifest_path,
         )
-        # Adenine (no stereo) proceeds; the undefined-stereo sugar is skipped.
-        assert set(log["name"]) == {"Adenine"}
-        fail_df = pd.read_csv(failed_csv)
-        assert dict(zip(fail_df["name"], fail_df["error"])) == {
-            "UndefSugar": "undefined stereochemistry"
-        }
-        # No XYZ written for the skipped molecule.
-        written = [os.path.basename(p) for p in log["xyz_path"]]
-        assert all(name.startswith("adenine") for name in written)
-        assert not any("undefsugar" in f for f in os.listdir(xyz_dir))
+        # Both molecules now appear; the sugar is provisional (not a failure).
+        assert set(log["name"]) == {"Adenine", "UndefSugar"}
+        assert not failed_csv.exists()
 
-    def test_resume_skips_completed(self, tmp_path, monkeypatch):
+        sugar = log[log["name"] == "UndefSugar"]
+        assert len(sugar) == 1  # exactly one arbitrated structure
+        assert set(sugar["provenance_status"]) == {"provisional_undefined_stereo"}
+        assert set(log[log["name"] == "Adenine"]["provenance_status"]) == {"normal"}
+        # arbitrated SMILES recorded and distinct from the underspecified PubChem one.
+        assert sugar.iloc[0]["arbitrated_smiles"]
+        assert sugar.iloc[0]["arbitrated_smiles"] != sugar.iloc[0]["pubchem_smiles"]
+        # The provisional XYZ exists and is loudly marked.
+        sugar_xyz = sugar.iloc[0]["xyz_path"]
+        assert os.path.exists(sugar_xyz)
+        comment = open(sugar_xyz).read().splitlines()[1]
+        assert "dE=NA" in comment
+        assert "PROVISIONAL" in comment
+
+    def test_rerun_populated_run_folder_raises(self, tmp_path, monkeypatch):
+        # v2.1 (contract §7): no resume/append. Re-running on a populated run
+        # folder raises rather than reusing/appending — B-04 removed by construction.
         pytest.importorskip("rdkit")
         import pipeline.conformers as C
-
-        monkeypatch.setattr(
-            C, "pipeline_provenance", lambda: ("2.0.0", "test-clean-commit")
-        )
 
         log_csv = tmp_path / "conformer_log.csv"
         xyz_dir = tmp_path / "conf_xyz"
         table = self._table()
-        manifest_path = ensure_manifest(
-            tmp_path,
-            table,
-            pipeline_version="2.0.0",
-            pipeline_commit="test-clean-commit",
-        )
+        manifest_path = ensure_manifest(tmp_path, table)
 
-        first = C.search_conformers(
+        C.search_conformers(
             table,
             xyz_dir=str(xyz_dir),
             log_csv=str(log_csv),
             failed_csv=str(tmp_path / "fail.csv"),
             manifest_path=manifest_path,
         )
-        # Rerun with the same table: nothing new appended (both already done).
-        second = C.search_conformers(
-            table,
-            xyz_dir=str(xyz_dir),
-            log_csv=str(log_csv),
-            failed_csv=str(tmp_path / "fail.csv"),
-            manifest_path=manifest_path,
-        )
-        assert len(second) == len(first)
+        with pytest.raises(ValueError, match="already populated"):
+            C.search_conformers(
+                table,
+                xyz_dir=str(xyz_dir),
+                log_csv=str(log_csv),
+                failed_csv=str(tmp_path / "fail.csv"),
+                manifest_path=manifest_path,
+            )
+
+    def test_search_conformers_has_no_append_parameter(self):
+        # Verify-by (Change 4): the append/resume path is GONE, not refactored.
+        import inspect
+
+        from pipeline.conformers import search_conformers
+
+        assert "append" not in inspect.signature(search_conformers).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -644,580 +680,155 @@ class TestProvenanceLogging:
         for v in log["pipeline_commit"]:
             assert isinstance(v, str)
 
-    def test_xyz_comment_has_provenance_tokens(self, tmp_path, monkeypatch):
+    def test_xyz_comment_has_reduced_metadata(self, tmp_path, monkeypatch):
+        # v2.1 (contract §5): XYZ line 2 carries only inline science (dE, method)
+        # plus the one artifact_id back-pointer. The manifest-only fields are gone.
         log = self._run(tmp_path, monkeypatch)
         with open(log.iloc[0]["xyz_path"]) as f:
             comment = f.read().splitlines()[1]  # line 2 of an XYZ file is the comment
-        for token in (
-            "run_id=", "artifact_id=", "config_hash=", "conformer_id=",
-            "relative_energy_kcalmol=", "method=", "pipeline_version=",
-            "rdkit_version=test-rdkit",
-        ):
+        for token in ("dE=", "method=MMFF94", "artifact_id=xyz-"):
             assert token in comment
+        for removed in (
+            "run_id=", "config_hash=", "conformer_id=",
+            "relative_energy_kcalmol=", "pipeline_version=", "rdkit_version=",
+        ):
+            assert removed not in comment
 
 
 # ---------------------------------------------------------------------------
-# M-09 — resume must validate recorded config, not just the molecule name
+# ---------------------------------------------------------------------------
+# v2.1 judgment #5 — provisional structure for undefined stereo
 # ---------------------------------------------------------------------------
 
-_CFG = {"seed": 42, "n_generate": 20, "top_n": 3, "rmsd_prune": 0.5,
-        "pipeline_version": "0.2.0", "pipeline_commit": "abc1234",
-        "rdkit_version": "2024.03.1"}
+# D-Ribose, PubChem CID 10975657: the pyranose SMILES leaves the anomeric carbon
+# undefined, so v2.1 embeds ONE arbitrated provisional structure.
+DRIBOSE_SMILES = "C1[C@@H]([C@H]([C@@H](C(O1)O)O)O)O"
 
 
-class TestRowConfigMatches:
-    """Pure config-match predicate (no RDKit)."""
+class TestProvisionalUndefinedStereo:
+    def _table(self):
+        pd = pytest.importorskip("pandas")
+        return pd.DataFrame([
+            {"name": "D-Ribose", "cid": 10975657, "IsomericSMILES": DRIBOSE_SMILES},
+        ])
 
-    def _row(self, **override):
-        row = dict(_CFG)
-        row.update(override)
-        return row
+    def test_dribose_provisional_end_to_end(self, tmp_path, capsys):
+        pd = pytest.importorskip("pandas")
+        pytest.importorskip("rdkit")
+        from pipeline.conformers import search_conformers
+        from pipeline.gaussian import write_gaussian_coms_from_conformers
+        from pipeline.manifest import load_manifest
+        from pipeline.slurm import write_slurm_scripts
 
-    def test_exact_match(self):
-        assert _row_config_matches(self._row(), _CFG) is True
-
-    def test_seed_mismatch(self):
-        assert _row_config_matches(self._row(seed=7), _CFG) is False
-
-    def test_n_generate_mismatch(self):
-        assert _row_config_matches(self._row(n_generate=50), _CFG) is False
-
-    def test_top_n_mismatch(self):
-        assert _row_config_matches(self._row(top_n=1), _CFG) is False
-
-    def test_pipeline_version_mismatch(self):
-        assert _row_config_matches(self._row(pipeline_version="0.1.0"), _CFG) is False
-
-    def test_rdkit_version_mismatch(self):
-        # B-02: ETKDGv3+MMFF geometry is RDKit-version-dependent.
-        assert _row_config_matches(self._row(rdkit_version="2020.09.1"), _CFG) is False
-
-    def test_clean_pipeline_commit_mismatch(self):
-        assert _row_config_matches(
-            self._row(pipeline_commit="def5678"), _CFG
-        ) is False
-
-    def test_missing_pipeline_commit_disables_reuse(self):
-        row = self._row()
-        del row["pipeline_commit"]
-        assert _row_config_matches(row, _CFG) is False
-
-    @pytest.mark.parametrize(
-        ("row_commit", "config_commit"),
-        [
-            ("abc1234.dirty", "abc1234"),
-            ("abc1234", "abc1234.dirty"),
-            ("abc1234.dirty", ""),
-            ("", "abc1234.dirty"),
-        ],
-    )
-    def test_dirty_pipeline_commit_never_reuses(self, row_commit, config_commit):
-        row = self._row(pipeline_commit=row_commit)
-        config = dict(_CFG, pipeline_commit=config_commit)
-        assert _row_config_matches(row, config) is False
-
-    def test_rmsd_within_float_tolerance(self):
-        assert _row_config_matches(self._row(rmsd_prune=0.5 + 1e-12), _CFG) is True
-
-    def test_rmsd_mismatch(self):
-        assert _row_config_matches(self._row(rmsd_prune=0.75), _CFG) is False
-
-    def test_missing_column_is_mismatch(self):
-        row = self._row()
-        del row["top_n"]  # pre-provenance / older-schema log
-        assert _row_config_matches(row, _CFG) is False
-
-    def test_missing_rdkit_version_is_mismatch(self):
-        row = self._row()
-        del row["rdkit_version"]  # log predates the rdkit_version guard
-        assert _row_config_matches(row, _CFG) is False
-
-
-class TestRowIdentityAndXyz:
-    """Pure per-molecule identity + XYZ-existence predicates (B-02, no RDKit)."""
-
-    def test_cid_matches_across_int_and_float_string(self):
-        assert _row_identity_matches({"cid": 190, "smiles": "O"}, 190.0, "O") is True
-        assert _row_identity_matches({"cid": "190", "smiles": "O"}, 190, "O") is True
-
-    def test_changed_cid_mismatch(self):
-        assert _row_identity_matches({"cid": 190, "smiles": "O"}, 191, "O") is False
-
-    def test_changed_smiles_mismatch(self):
-        assert _row_identity_matches({"cid": 190, "smiles": "O"}, 190, "[OH2]") is False
-
-    def test_xyz_present_true_for_nonempty(self, tmp_path):
-        p = tmp_path / "a.xyz"
-        p.write_text("3\n\nO 0 0 0\n")
-        assert _row_xyz_present({"xyz_path": str(p)}) is True
-
-    def test_xyz_present_false_for_missing(self, tmp_path):
-        assert _row_xyz_present({"xyz_path": str(tmp_path / "nope.xyz")}) is False
-
-    def test_xyz_present_false_for_empty(self, tmp_path):
-        p = tmp_path / "empty.xyz"
-        p.write_text("")
-        assert _row_xyz_present({"xyz_path": str(p)}) is False
-
-
-class TestResumePartition:
-    """Pure partition of an existing log into done / kept / stale (no RDKit)."""
-
-    def _rows_with_xyz(self, tmp_path, *specs):
-        """Build rows with a real, non-empty xyz_path per spec (name, **override)."""
-        import pandas as pd
-
-        rows = []
-        counts = {name: sum(spec_name == name for spec_name, _ in specs) for name, _ in specs}
-        next_id = {name: 0 for name, _ in specs}
-        for i, (name, override) in enumerate(specs):
-            xyz = tmp_path / f"{name}_{i}.xyz"
-            xyz.write_text("1\n\nO 0 0 0\n")
-            row = dict(_CFG, name=name, cid=1, smiles="O",
-                       pipeline_commit="abc1234",
-                       conformer_id=next_id[name], n_kept=counts[name],
-                       xyz_path=str(xyz))
-            next_id[name] += 1
-            row.update(override)
-            rows.append(row)
-        return pd.DataFrame(rows)
-
-    def _requested(self, *names):
-        return {n: {"cid": 1, "smiles": "O"} for n in names}
-
-    def test_partition_default_drops_unrequested(self, tmp_path):
-        existing = self._rows_with_xyz(
-            tmp_path,
-            ("A", {}),            # requested, matches
-            ("B", {"seed": 7}),   # requested, config drift
-            ("C", {}),            # NOT requested
+        table = self._table()
+        route_opt = "# opt=(tight,calcfc) b3lyp/6-311++g(2df,2p) scrf=(iefpcm,solvent=water)"
+        route_freq = "# freq b3lyp/6-311++g(2df,2p) scrf=(iefpcm,solvent=water) temperature=298 Geom=AllChk Guess=Read"
+        manifest_path = ensure_manifest(
+            tmp_path, table, route_opt=route_opt, route_freq=route_freq,
+            title_suffix="PCM 298 K 6-311++G(2df,2p)",
         )
-        done, kept, stale, invalid = _resume_partition(
-            existing, _CFG, self._requested("A", "B")
+        xyz_dir = tmp_path / "conformer_xyz"
+        log_csv = tmp_path / "conformer_log.csv"
+        conf_log = search_conformers(
+            table,
+            xyz_dir=str(xyz_dir),
+            log_csv=str(log_csv),
+            failed_csv=str(tmp_path / "conformer_search_failed.csv"),
+            manifest_path=manifest_path,
         )
-        assert done == {"A"}
-        assert stale == {"B"}
-        assert invalid == {}
-        # M-02 default: unrequested C is dropped; only resumed A is kept.
-        assert {r["name"] for r in kept} == {"A"}
 
-    def test_preserve_unrequested_keeps_carry_forward(self, tmp_path):
-        existing = self._rows_with_xyz(
-            tmp_path, ("A", {}), ("C", {}),
+        # Exactly one PROVISIONAL XYZ; recorded as provisional, not a failure.
+        assert len(conf_log) == 1
+        row = conf_log.iloc[0]
+        assert row["provenance_status"] == "provisional_undefined_stereo"
+        assert str(row["undefined_centers"]).strip()
+        assert row["arbitrated_smiles"] and row["arbitrated_smiles"] != row["pubchem_smiles"]
+        assert not (tmp_path / "conformer_search_failed.csv").exists()
+
+        # Loud console warning.
+        out = capsys.readouterr().out
+        assert "undefined stereochemistry" in out
+        assert "ARBITRARY" in out
+
+        # XYZ comment: dE=NA + PROVISIONAL marker, no fabricated dE.
+        comment = open(row["xyz_path"]).read().splitlines()[1]
+        assert "dE=NA" in comment
+        assert "PROVISIONAL: stereo arbitrated at" in comment
+
+        # Manifest molecule record carries the provisional provenance fields.
+        manifest = load_manifest(manifest_path)
+        molecule = next(m for m in manifest["molecules"] if m["molecule_name"] == "D-Ribose")
+        assert molecule["provenance_status"] == "provisional_undefined_stereo"
+        assert molecule["undefined_centers"]
+        assert molecule["arbitrated_smiles"] != molecule["pubchem_smiles"]
+
+        # A COM+SH pair is generated, co-located in gaussian_jobs/, carrying the marker.
+        jobs_dir = tmp_path / "gaussian_jobs"
+        com_log = write_gaussian_coms_from_conformers(
+            conformer_log_csv=str(log_csv),
+            outdir=str(jobs_dir),
+            log_csv=str(tmp_path / "com_write_log.csv"),
+            route_opt=route_opt,
+            route_freq=route_freq,
+            title_suffix="PCM 298 K 6-311++G(2df,2p)",
+            nproc=16,
+            manifest_path=manifest_path,
         )
-        done, kept, stale, invalid = _resume_partition(
-            existing, _CFG, self._requested("A"), preserve_unrequested=True
+        assert len(com_log) == 1
+        com_path = com_log.iloc[0]["com_path"]
+        com_text = open(com_path).read()
+        assert "dE=NA" in com_text
+        assert "PROVISIONAL: stereo arbitrated at" in com_text
+
+        write_slurm_scripts(
+            com_log_csv=str(tmp_path / "com_write_log.csv"),
+            slurm_dir=str(jobs_dir),
+            log_csv=str(tmp_path / "slurm_write_log.csv"),
+            manifest_path=manifest_path,
         )
-        assert done == {"A"}
-        assert invalid == {}
-        # append=True: unrequested C carried forward alongside resumed A.
-        assert {r["name"] for r in kept} == {"A", "C"}
-
-    def test_changed_identity_is_stale(self, tmp_path):
-        # Same name A, but recorded cid differs from requested → stale.
-        existing = self._rows_with_xyz(tmp_path, ("A", {"cid": 999}))
-        done, kept, stale, invalid = _resume_partition(
-            existing, _CFG, self._requested("A")
-        )
-        assert done == set()
-        assert stale == {"A"}
-        assert invalid == {}
-
-    def test_missing_xyz_is_stale(self, tmp_path):
-        import pandas as pd
-
-        row = dict(_CFG, name="A", cid=1, smiles="O",
-                   conformer_id=0, xyz_path=str(tmp_path / "gone.xyz"))
-        done, kept, stale, invalid = _resume_partition(
-            pd.DataFrame([row]), _CFG, self._requested("A")
-        )
-        assert stale == {"A"}
-        assert done == set()
-        assert invalid == {}
-
-    def test_all_rows_of_a_molecule_must_match(self, tmp_path):
-        # Two rows for A: one matches, one drifted → A is stale (regenerate all).
-        existing = self._rows_with_xyz(
-            tmp_path, ("A", {}), ("A", {"top_n": 1}),
-        )
-        done, kept, stale, invalid = _resume_partition(
-            existing, _CFG, self._requested("A")
-        )
-        assert done == set()
-        assert stale == {"A"}
-        assert kept == []
-        assert invalid == {}
-
-    def test_invalid_unrequested_is_reported_not_kept(self, tmp_path):
-        existing = self._rows_with_xyz(
-            tmp_path, ("A", {}), ("C", {"seed": 7}),
-        )
-        done, kept, stale, invalid = _resume_partition(
-            existing, _CFG, self._requested("A"), preserve_unrequested=True
-        )
-        assert done == {"A"}
-        assert stale == set()
-        assert {row["name"] for row in kept} == {"A"}
-        assert set(invalid) == {"C"}
+        # COM and its SH sit in the SAME directory (co-located, contract §2).
+        base = os.path.splitext(os.path.basename(com_path))[0]
+        assert (jobs_dir / f"{base}.sh").exists()
+        assert os.path.dirname(com_path) == str(jobs_dir)
 
 
-class TestResumeGroupCompleteness:
-    """M-12: resume only complete, self-consistent conformer groups."""
+class TestGroupTransactionRollback:
+    """A publication failure on a fresh run leaves no partial group behind."""
 
-    def _rows(self, tmp_path):
-        rows = []
-        for conformer_id in range(3):
-            xyz = tmp_path / f"a_{conformer_id}.xyz"
-            xyz.write_text("1\n\nO 0 0 0\n")
-            rows.append(dict(
-                _CFG,
-                name="A",
-                cid=1,
-                smiles="O",
-                conformer_id=conformer_id,
-                n_kept=3,
-                xyz_path=str(xyz),
-            ))
-        return rows
-
-    def test_intact_group_is_complete(self, tmp_path):
-        assert _resume_group_is_complete(self._rows(tmp_path)) is True
-
-    def test_deleted_last_row_is_incomplete(self, tmp_path):
-        rows = self._rows(tmp_path)[:-1]
-        assert _resume_group_is_complete(rows) is False
-
-    def test_missing_middle_id_is_incomplete(self, tmp_path):
-        rows = self._rows(tmp_path)
-        assert _resume_group_is_complete([rows[0], rows[2]]) is False
-
-    def test_duplicate_conformer_row_is_incomplete(self, tmp_path):
-        rows = self._rows(tmp_path)
-        rows[1] = dict(rows[0])
-        assert _resume_group_is_complete(rows) is False
-
-    def test_disagreeing_n_kept_is_incomplete(self, tmp_path):
-        rows = self._rows(tmp_path)
-        rows[1]["n_kept"] = 2
-        assert _resume_group_is_complete(rows) is False
-
-    def test_duplicate_xyz_path_is_incomplete(self, tmp_path):
-        rows = self._rows(tmp_path)
-        rows[1]["xyz_path"] = rows[0]["xyz_path"]
-        assert _resume_group_is_complete(rows) is False
-
-
-class TestCarryForwardGroupValidation:
-    """M-15: retained groups need integrity, identity, config, and provenance."""
-
-    def _rows(self, tmp_path):
-        rows = []
-        for conformer_id in range(2):
-            xyz = tmp_path / f"retained_{conformer_id}.xyz"
-            xyz.write_text("1\n\nO 0 0 0\n")
-            rows.append(dict(
-                _CFG,
-                name="Retained",
-                cid=1,
-                smiles="O",
-                pipeline_commit="abc1234",
-                conformer_id=conformer_id,
-                n_kept=2,
-                xyz_path=str(xyz),
-            ))
-        return rows
-
-    def test_valid_group_passes(self, tmp_path):
-        rows = self._rows(tmp_path)
-        assert _group_identity_is_consistent(rows) is True
-        assert _carry_forward_group_is_valid(rows, _CFG) is True
-
-    @pytest.mark.parametrize("field,value", [("cid", 2), ("smiles", "N")])
-    def test_inconsistent_identity_fails(self, tmp_path, field, value):
-        rows = self._rows(tmp_path)
-        rows[1][field] = value
-        assert _group_identity_is_consistent(rows) is False
-        assert _carry_forward_group_is_valid(rows, _CFG) is False
-
-    def test_missing_commit_field_fails(self, tmp_path):
-        rows = self._rows(tmp_path)
-        for row in rows:
-            del row["pipeline_commit"]
-        assert _carry_forward_group_is_valid(rows, _CFG) is False
-
-    def test_blank_commit_value_disables_reuse(self, tmp_path):
-        rows = self._rows(tmp_path)
-        for row in rows:
-            row["pipeline_commit"] = ""
-        assert _carry_forward_group_is_valid(rows, _CFG) is False
-
-    def test_dirty_commit_group_is_not_reusable(self, tmp_path):
-        rows = self._rows(tmp_path)
-        config = dict(_CFG, pipeline_commit="abc1234.dirty")
-        for row in rows:
-            row["pipeline_commit"] = "abc1234.dirty"
-        assert _carry_forward_group_is_valid(rows, config) is False
-
-
-class TestResumeConfigValidationBatch:
-    """search_conformers end-to-end with RDKit stubbed (synthetic/offline)."""
-
-    def _patch(
-        self,
-        monkeypatch,
-        calls,
-        rdkit_version="test-rdkit",
-        pipeline_commit="test-clean-commit",
-    ):
+    def _patch(self, monkeypatch, calls):
         import pipeline.conformers as C
 
         monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
-        monkeypatch.setattr(C, "_rdkit_version", lambda: rdkit_version)
+        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
         monkeypatch.setattr(
-            C, "pipeline_provenance", lambda: ("2.0.0", pipeline_commit)
+            C, "pipeline_provenance", lambda: ("2.0.0", "test-clean-commit")
         )
-        self._rdkit_version = rdkit_version
-        self._pipeline_commit = pipeline_commit
 
-        def gen(smiles, **kw):
+        def gen_three(smiles, **kw):
             calls.append(smiles)
-            return ([[("O", 0.0, 0.0, 0.0)]], [0.0], "MMFF94", [True])
+            coords = [[("O", float(i), 0.0, 0.0)] for i in range(3)]
+            return coords, [0.0, 0.5, 1.0], "MMFF94", [True, True, True]
 
-        monkeypatch.setattr(C, "generate_conformers", gen)
+        monkeypatch.setattr(C, "generate_conformers", gen_three)
         return C
 
-    def _table(self, name="Water", smiles="O", cid=1):
+    def _table(self):
         import pandas as pd
 
-        return pd.DataFrame([{"name": name, "cid": cid, "IsomericSMILES": smiles}])
+        return pd.DataFrame([{"name": "Water", "cid": 1, "IsomericSMILES": "O"}])
 
-    def _kw(self, tmp_path, manifest_table=None, **over):
-        kw = dict(
-            xyz_dir=str(tmp_path / "xyz"),
-            log_csv=str(tmp_path / "conformer_log.csv"),
-            failed_csv=str(tmp_path / "fail.csv"),
-            seed=42, n_generate=20, top_n=3, rmsd_prune=0.5,
+    def test_staged_xyz_failure_leaves_no_partial_group(self, tmp_path, monkeypatch):
+        calls = []
+        C = self._patch(monkeypatch, calls)
+        manifest_path = ensure_manifest(
+            tmp_path, self._table(),
+            pipeline_version="2.0.0", pipeline_commit="test-clean-commit",
+            rdkit_version="test-rdkit",
         )
-        kw.update(over)
-        table = self._table() if manifest_table is None else manifest_table
-        kw["manifest_path"] = ensure_manifest(
-            tmp_path,
-            table,
-            seed=kw["seed"],
-            n_generate=kw["n_generate"],
-            top_n=kw["top_n"],
-            rmsd_prune=kw["rmsd_prune"],
-            pipeline_version="2.0.0",
-            pipeline_commit=self._pipeline_commit,
-            rdkit_version=self._rdkit_version,
-        )
-        return kw
-
-    @staticmethod
-    def _package_snapshot(kw):
-        xyz_dir = kw["xyz_dir"]
-        return {
-            "manifest": open(kw["manifest_path"], "rb").read(),
-            "log": open(kw["log_csv"], "rb").read(),
-            "xyz": {
-                os.path.join(xyz_dir, name): open(
-                    os.path.join(xyz_dir, name), "rb"
-                ).read()
-                for name in os.listdir(xyz_dir)
-                if name.endswith(".xyz")
-            },
-        }
-
-    @staticmethod
-    def _assert_package_snapshot(kw, snapshot):
-        assert open(kw["manifest_path"], "rb").read() == snapshot["manifest"]
-        assert open(kw["log_csv"], "rb").read() == snapshot["log"]
-        assert {
-            os.path.join(kw["xyz_dir"], name): open(
-                os.path.join(kw["xyz_dir"], name), "rb"
-            ).read()
-            for name in os.listdir(kw["xyz_dir"])
-            if name.endswith(".xyz")
-        } == snapshot["xyz"]
-
-    def test_matching_config_skips_regeneration(self, tmp_path, monkeypatch):
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        C.search_conformers(self._table(), **self._kw(tmp_path))  # same config
-        assert len(calls) == 1  # second run resumed; molecule NOT regenerated
-
-    @pytest.mark.parametrize(
-        "damaged_value", [None, float("nan"), "", "unknown", False]
-    )
-    def test_damaged_convergence_never_resumes(
-        self, tmp_path, monkeypatch, damaged_value
-    ):
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        kw = self._kw(tmp_path)
-        C.search_conformers(self._table(), **kw)
-        rows = pd.read_csv(kw["log_csv"]).astype({"converged": object})
-        rows.loc[0, "converged"] = damaged_value
-        rows.to_csv(kw["log_csv"], index=False)
-
-        C.search_conformers(self._table(), **kw)
-        assert len(calls) == 2
-
-    def test_missing_convergence_column_never_resumes(
-        self, tmp_path, monkeypatch
-    ):
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        kw = self._kw(tmp_path)
-        C.search_conformers(self._table(), **kw)
-        rows = pd.read_csv(kw["log_csv"]).drop(columns=["converged"])
-        rows.to_csv(kw["log_csv"], index=False)
-
-        C.search_conformers(self._table(), **kw)
-        assert len(calls) == 2
-
-    def test_changed_seed_regenerates(self, tmp_path, monkeypatch, capsys):
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        C.search_conformers(self._table(), **self._kw(tmp_path, seed=42))
-        log2 = C.search_conformers(self._table(), **self._kw(tmp_path, seed=7))
-        assert len(calls) == 2  # regenerated under the new seed
-        assert set(log2[log2["name"] == "Water"]["seed"].astype(int)) == {7}
-        assert "regenerating" in capsys.readouterr().out
-
-    def test_changed_top_n_regenerates(self, tmp_path, monkeypatch):
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        C.search_conformers(self._table(), **self._kw(tmp_path, top_n=1))
-        C.search_conformers(self._table(), **self._kw(tmp_path, top_n=3))
-        assert len(calls) == 2  # the TOP_N=1→3 case from the finding
-
-    def test_changed_cid_regenerates(self, tmp_path, monkeypatch):
-        # B-02: same name + knobs but a corrected CID must NOT reuse the geometry.
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        first_table = self._table(cid=1)
-        second_table = self._table(cid=2)
-        C.search_conformers(first_table, **self._kw(tmp_path, manifest_table=first_table))
-        log2 = C.search_conformers(second_table, **self._kw(tmp_path, manifest_table=second_table))
-        assert len(calls) == 2
-        assert set(log2[log2["name"] == "Water"]["cid"].astype(int)) == {2}
-
-    def test_changed_smiles_regenerates(self, tmp_path, monkeypatch):
-        # B-02: same name + knobs but a corrected SMILES must regenerate.
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        first_table = self._table(smiles="O")
-        second_table = self._table(smiles="[OH2]")
-        C.search_conformers(first_table, **self._kw(tmp_path, manifest_table=first_table))
-        C.search_conformers(second_table, **self._kw(tmp_path, manifest_table=second_table))
-        assert len(calls) == 2
-
-    def test_changed_rdkit_version_regenerates(self, tmp_path, monkeypatch):
-        # B-02: a different RDKit build changes ETKDGv3+MMFF geometry → regenerate.
-        calls = []
-        C = self._patch(monkeypatch, calls, rdkit_version="2024.03.1")
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        C = self._patch(monkeypatch, calls, rdkit_version="2020.09.1")
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        assert len(calls) == 2
-
-    def test_changed_clean_pipeline_commit_regenerates(self, tmp_path, monkeypatch):
-        calls = []
-        C = self._patch(monkeypatch, calls, pipeline_commit="abc1234")
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        C = self._patch(monkeypatch, calls, pipeline_commit="def5678")
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        assert len(calls) == 2
-
-    def test_dirty_pipeline_commit_never_resumes(self, tmp_path, monkeypatch):
-        calls = []
-        C = self._patch(monkeypatch, calls, pipeline_commit="abc1234.dirty")
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        assert len(calls) == 2
-
-    def test_missing_pipeline_commit_regenerates(
-        self, tmp_path, monkeypatch
-    ):
-        calls = []
-        C = self._patch(monkeypatch, calls, pipeline_commit="")
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        assert len(calls) == 2
-
-    def test_deleted_xyz_regenerates(self, tmp_path, monkeypatch):
-        # B-02: identity + config match, but the recorded XYZ is gone → regenerate.
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        log1 = C.search_conformers(self._table(), **self._kw(tmp_path))
-        os.remove(log1.iloc[0]["xyz_path"])  # user cleaned the geometry away
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        assert len(calls) == 2
-
-    def test_pre_provenance_log_regenerates(self, tmp_path, monkeypatch):
-        import pandas as pd
-
-        calls = []
-        C = self._patch(monkeypatch, calls)
+        xyz_dir = tmp_path / "xyz"
+        failed_csv = tmp_path / "fail.csv"
         log_csv = tmp_path / "conformer_log.csv"
-        # Old-schema log: no n_generate/top_n/pipeline_version columns.
-        pd.DataFrame([{
-            "name": "Water", "cid": 1, "conformer_id": 0,
-            "seed": 42, "rmsd_prune": 0.5, "xyz_path": "old.xyz",
-        }]).to_csv(log_csv, index=False)
-        C.search_conformers(self._table(), **self._kw(tmp_path))
-        assert len(calls) == 1  # name present but stale → regenerated
 
-    def test_truncated_three_conformer_log_regenerates(self, tmp_path, monkeypatch):
-        import pandas as pd
-
-        calls = []
-        C = self._patch(monkeypatch, calls)
-
-        def gen_three(smiles, **kw):
-            calls.append(smiles)
-            coords = [[("O", float(i), 0.0, 0.0)] for i in range(3)]
-            return coords, [0.0, 0.5, 1.0], "MMFF94", [True, True, True]
-
-        monkeypatch.setattr(C, "generate_conformers", gen_three)
-        kw = self._kw(tmp_path)
-        first = C.search_conformers(self._table(), **kw)
-        assert len(first) == 3
-
-        # Simulate a truncated but still parseable log: surviving rows and XYZ
-        # files are individually valid, but the group declares n_kept=3.
-        first.iloc[[0, 2]].to_csv(kw["log_csv"], index=False)
-        second = C.search_conformers(self._table(), **kw)
-        assert len(calls) == 2
-        assert list(second["conformer_id"]) == [0, 1, 2]
-        assert set(second["n_kept"].astype(int)) == {3}
-
-    def test_second_staged_xyz_failure_publishes_no_partial_group(
-        self, tmp_path, monkeypatch
-    ):
-        calls = []
-        C = self._patch(monkeypatch, calls)
-
-        def gen_three(smiles, **kw):
-            calls.append(smiles)
-            coords = [[("O", float(i), 0.0, 0.0)] for i in range(3)]
-            return coords, [0.0, 0.5, 1.0], "MMFF94", [True, True, True]
-
-        monkeypatch.setattr(C, "generate_conformers", gen_three)
-        kw = self._kw(tmp_path)
-        first = C.search_conformers(self._table(), **kw)
-        assert len(first) == 3
-        manifest_before = open(kw["manifest_path"], "rb").read()
-        log_before = open(kw["log_csv"], "rb").read()
-        xyz_before = {
-            path: open(path, "rb").read() for path in first["xyz_path"]
-        }
-
-        damaged = first.copy()
-        damaged.loc[0, "xyz_sha256"] = "0" * 64
-        damaged.to_csv(kw["log_csv"], index=False)
         real_write_xyz = C._write_xyz
         staged_writes = 0
 
@@ -1229,446 +840,35 @@ class TestResumeConfigValidationBatch:
             return real_write_xyz(path, coords, comment)
 
         monkeypatch.setattr(C, "_write_xyz", fail_second)
-        second = C.search_conformers(self._table(), **kw)
-
-        assert len(second) == 3
-        assert open(kw["manifest_path"], "rb").read() == manifest_before
-        assert open(kw["log_csv"], "rb").read() == log_before
-        for path, expected in xyz_before.items():
-            assert open(path, "rb").read() == expected
-        assert not any(
-            name.startswith(".staging-") for name in os.listdir(kw["xyz_dir"])
-        )
-        assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
-
-    def test_candidate_log_staging_failure_preserves_complete_package(
-        self, tmp_path, monkeypatch
-    ):
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        kw = self._kw(tmp_path)
-        first = C.search_conformers(self._table(), **kw)
-        snapshot = self._package_snapshot(kw)
-
-        # Force a replacement attempt while leaving the committed package valid.
-        monkeypatch.setattr(C, "_row_config_matches", lambda *_args: False)
-        real_to_csv = pd.DataFrame.to_csv
-
-        def fail_candidate_stage(frame, path, *args, **kwargs):
-            if os.path.basename(os.fspath(path)).startswith(".conformer_log."):
-                raise OSError("simulated conformer-log staging failure")
-            return real_to_csv(frame, path, *args, **kwargs)
-
-        monkeypatch.setattr(pd.DataFrame, "to_csv", fail_candidate_stage)
-        second = C.search_conformers(self._table(), **kw)
-
-        self._assert_package_snapshot(kw, snapshot)
-        assert list(second["artifact_id"]) == list(first["artifact_id"])
-        assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
-        assert not any(
-            name.startswith(".conformer_log.")
-            for name in os.listdir(tmp_path)
+        out = C.search_conformers(
+            self._table(),
+            xyz_dir=str(xyz_dir),
+            log_csv=str(log_csv),
+            failed_csv=str(failed_csv),
+            manifest_path=manifest_path,
         )
 
-    def test_candidate_log_replacement_failure_rolls_back_xyz_and_log(
-        self, tmp_path, monkeypatch
-    ):
-        import pipeline.manifest as manifest_module
-
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        kw = self._kw(tmp_path)
-        first = C.search_conformers(self._table(), **kw)
-        snapshot = self._package_snapshot(kw)
-        monkeypatch.setattr(C, "_row_config_matches", lambda *_args: False)
-
-        real_replace = os.replace
-        failed = False
-
-        def fail_log_replace(source, destination):
-            nonlocal failed
-            source_text = os.fspath(source)
-            if (
-                not failed
-                and os.path.realpath(os.fspath(destination))
-                == os.path.realpath(kw["log_csv"])
-                and os.path.basename(source_text).startswith(".conformer_log.")
-                and ".backup-" not in source_text
-            ):
-                failed = True
-                raise OSError("simulated conformer-log replacement failure")
-            return real_replace(source, destination)
-
-        monkeypatch.setattr(manifest_module.os, "replace", fail_log_replace)
-        second = C.search_conformers(self._table(), **kw)
-
-        assert failed is True
-        self._assert_package_snapshot(kw, snapshot)
-        assert list(second["artifact_id"]) == list(first["artifact_id"])
-        assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
-        assert not any(".backup-" in name for name in os.listdir(tmp_path))
-
-    def test_manifest_write_failure_rolls_back_xyz_and_log(
-        self, tmp_path, monkeypatch
-    ):
-        import pipeline.manifest as manifest_module
-
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        kw = self._kw(tmp_path)
-        first = C.search_conformers(self._table(), **kw)
-        snapshot = self._package_snapshot(kw)
-        monkeypatch.setattr(C, "_row_config_matches", lambda *_args: False)
-        monkeypatch.setattr(
-            manifest_module,
-            "write_manifest",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                OSError("simulated manifest write failure")
-            ),
-        )
-
-        second = C.search_conformers(self._table(), **kw)
-
-        self._assert_package_snapshot(kw, snapshot)
-        assert list(second["artifact_id"]) == list(first["artifact_id"])
-        assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
-
-    def test_xyz_placement_failure_rolls_back_complete_package(
-        self, tmp_path, monkeypatch
-    ):
-        import pipeline.manifest as manifest_module
-
-        calls = []
-        C = self._patch(monkeypatch, calls)
-
-        def gen_three(smiles, **kw):
-            calls.append(smiles)
-            coords = [[("O", float(i), 0.0, 0.0)] for i in range(3)]
-            return coords, [0.0, 0.5, 1.0], "MMFF94", [True, True, True]
-
-        monkeypatch.setattr(C, "generate_conformers", gen_three)
-        kw = self._kw(tmp_path)
-        first = C.search_conformers(self._table(), **kw)
-        snapshot = self._package_snapshot(kw)
-        monkeypatch.setattr(C, "_row_config_matches", lambda *_args: False)
-
-        real_replace = os.replace
-        staged_moves = 0
-
-        def fail_second_xyz_placement(source, destination):
-            nonlocal staged_moves
-            source_text = os.fspath(source)
-            if os.path.basename(os.path.dirname(source_text)).startswith(
-                ".staging-"
-            ) and source_text.endswith(".xyz"):
-                staged_moves += 1
-                if staged_moves == 2:
-                    raise OSError("simulated XYZ placement failure")
-            return real_replace(source, destination)
-
-        monkeypatch.setattr(
-            manifest_module.os, "replace", fail_second_xyz_placement
-        )
-        second = C.search_conformers(self._table(), **kw)
-
-        self._assert_package_snapshot(kw, snapshot)
-        assert list(second["artifact_id"]) == list(first["artifact_id"])
-        assert pd.read_csv(kw["failed_csv"]).shape[0] == 1
-
-    def test_successful_smaller_group_keeps_manifest_log_ids_exact(
-        self, tmp_path, monkeypatch
-    ):
+        import pandas as pd
         from pipeline.manifest import load_manifest
 
-        calls = []
-        C = self._patch(monkeypatch, calls)
-
-        def gen_three(smiles, **kw):
-            calls.append(smiles)
-            coords = [[("O", float(i), 0.0, 0.0)] for i in range(3)]
-            return coords, [0.0, 0.5, 1.0], "MMFF94", [True, True, True]
-
-        monkeypatch.setattr(C, "generate_conformers", gen_three)
-        kw = self._kw(tmp_path)
-        first = C.search_conformers(self._table(), **kw)
-        old_paths = list(first["xyz_path"])
-
-        monkeypatch.setattr(C, "_row_config_matches", lambda *_args: False)
-        monkeypatch.setattr(
-            C,
-            "generate_conformers",
-            lambda smiles, **_kw: (
-                [[("O", 9.0, 0.0, 0.0)]],
-                [0.0],
-                "MMFF94",
-                [True],
-            ),
+        # The molecule is recorded as a failure; no partial conformer group.
+        assert len(out) == 0
+        assert pd.read_csv(failed_csv).shape[0] == 1
+        manifest = load_manifest(manifest_path)
+        assert manifest["artifacts"] == []
+        assert all(not m["conformers"] for m in manifest["molecules"])
+        # The committed log is header-only (no partial group), no staging dir
+        # leftover, and no committed XYZ.
+        assert pd.read_csv(log_csv).empty
+        assert not any(
+            name.startswith(".staging-") for name in os.listdir(xyz_dir)
         )
-        second = C.search_conformers(self._table(), **kw)
-
-        manifest = load_manifest(kw["manifest_path"])
-        manifest_ids = {
-            artifact["artifact_id"]
-            for artifact in manifest["artifacts"]
-            if artifact["kind"] == "xyz"
-        }
-        assert len(second) == 1
-        assert set(second["artifact_id"]) == manifest_ids
-        assert os.path.exists(old_paths[0])
-        assert not os.path.exists(old_paths[1])
-        assert not os.path.exists(old_paths[2])
-
-
-class TestPreserveUnrequestedBatch:
-    """M-02 call 2a: the conformer log represents molecules requested this run."""
-
-    def _patch(self, monkeypatch, calls):
-        import pipeline.conformers as C
-
-        monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
-        monkeypatch.setattr(C, "_rdkit_version", lambda: "test-rdkit")
-        monkeypatch.setattr(
-            C, "pipeline_provenance", lambda: ("2.0.0", "test-clean-commit")
-        )
-
-        def gen(smiles, **kw):
-            calls.append(smiles)
-            return ([[("O", 0.0, 0.0, 0.0)]], [0.0], "MMFF94", [True])
-
-        monkeypatch.setattr(C, "generate_conformers", gen)
-        return C
-
-    def _kw(self, tmp_path, **over):
-        import pandas as pd
-
-        manifest_table = over.pop("manifest_table", None)
-        kw = dict(
-            xyz_dir=str(tmp_path / "xyz"),
-            log_csv=str(tmp_path / "conformer_log.csv"),
-            failed_csv=str(tmp_path / "fail.csv"),
-            seed=42, n_generate=20, top_n=3, rmsd_prune=0.5,
-        )
-        kw.update(over)
-        if manifest_table is None:
-            manifest_table = pd.concat([self._two(), self._one()], ignore_index=True)
-        kw["manifest_path"] = ensure_manifest(
-            tmp_path,
-            manifest_table,
-            seed=kw["seed"],
-            n_generate=kw["n_generate"],
-            top_n=kw["top_n"],
-            rmsd_prune=kw["rmsd_prune"],
-            pipeline_version="2.0.0",
-            pipeline_commit="test-clean-commit",
-            rdkit_version="test-rdkit",
-        )
-        return kw
-
-    def _two(self):
-        import pandas as pd
-
-        return pd.DataFrame([
-            {"name": "Water", "cid": 1, "IsomericSMILES": "O"},
-            {"name": "Glycine", "cid": 2, "IsomericSMILES": "O"},
-        ])
-
-    def _one(self):
-        import pandas as pd
-
-        return pd.DataFrame([{"name": "Adenine", "cid": 3, "IsomericSMILES": "O"}])
-
-    def test_default_subset_rejected(self, tmp_path, monkeypatch):
-        import pandas as pd
-
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        full = pd.concat([self._two(), self._one()], ignore_index=True)
-        kw = self._kw(tmp_path, manifest_table=full)
-        C.search_conformers(full, **kw)
-        before = (tmp_path / "conformer_log.csv").read_bytes()
-        with pytest.raises(ValueError, match="match the run manifest exactly"):
-            C.search_conformers(self._one(), **kw)
-        assert (tmp_path / "conformer_log.csv").read_bytes() == before
-
-    def test_append_retains_all(self, tmp_path, monkeypatch):
-        import pandas as pd
-
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        full = pd.concat([self._two(), self._one()], ignore_index=True)
-        kw = self._kw(tmp_path, manifest_table=full)
-        C.search_conformers(full, **kw)
-        log2 = C.search_conformers(self._one(), **dict(kw, append=True))
-        # append=True may operate on a subset only when valid retained rows account
-        # for every other manifest molecule.
-        assert set(log2["name"]) == {"Water", "Glycine", "Adenine"}
-
-    @pytest.mark.parametrize(
-        "corruption",
-        [
-            "truncated",
-            "missing_xyz",
-            "seed",
-            "n_generate",
-            "top_n",
-            "rmsd_prune",
-            "pipeline_version",
-            "pipeline_commit",
-            "rdkit_version",
-            "pre_provenance",
-            "inconsistent_cid",
-            "inconsistent_smiles",
-        ],
-    )
-    def test_invalid_retained_group_fails_before_any_mutation(
-        self, tmp_path, monkeypatch, corruption
-    ):
-        import pandas as pd
-
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        full = pd.concat([self._two(), self._one()], ignore_index=True)
-        kw = self._kw(tmp_path, manifest_table=full)
-        C.search_conformers(full, **kw)
-        log_path = tmp_path / "conformer_log.csv"
-        existing = pd.read_csv(log_path)
-        water_index = existing.index[existing["name"] == "Water"][0]
-
-        if corruption == "truncated":
-            existing.loc[water_index, "n_kept"] = 2
-        elif corruption == "missing_xyz":
-            os.remove(existing.loc[water_index, "xyz_path"])
-        elif corruption == "pre_provenance":
-            existing = existing.drop(
-                columns=["pipeline_version", "rdkit_version", "pipeline_commit"]
-            )
-        elif corruption in {"inconsistent_cid", "inconsistent_smiles"}:
-            second = existing.loc[water_index].copy()
-            existing.loc[water_index, "n_kept"] = 2
-            second["conformer_id"] = 1
-            second["n_kept"] = 2
-            copied_xyz = tmp_path / "xyz" / "water_c01.xyz"
-            copied_xyz.write_text("1\n\nO 1 0 0\n")
-            second["xyz_path"] = str(copied_xyz)
-            if corruption == "inconsistent_cid":
-                second["cid"] = 999
-            else:
-                second["smiles"] = "N"
-            existing = pd.concat([existing, second.to_frame().T], ignore_index=True)
-        else:
-            mismatches = {
-                "seed": 7,
-                "n_generate": 50,
-                "top_n": 1,
-                "rmsd_prune": 0.75,
-                "pipeline_version": "1.9.0",
-                "pipeline_commit": "other-clean-commit",
-                "rdkit_version": "old-rdkit",
-            }
-            existing.loc[water_index, corruption] = mismatches[corruption]
-
-        if corruption != "missing_xyz":
-            existing.to_csv(log_path, index=False)
-        else:
-            # Preserve the original CSV so it points at the now-missing XYZ.
-            assert not os.path.exists(existing.loc[water_index, "xyz_path"])
-
-        failed_path = tmp_path / "fail.csv"
-        failed_path.write_bytes(b"prior failure log\n")
-        before = {
-            path.relative_to(tmp_path): path.read_bytes()
-            for path in tmp_path.rglob("*")
-            if path.is_file()
-        }
-        calls_before = len(calls)
-
-        with pytest.raises(ValueError, match="cannot carry forward invalid") as excinfo:
-            C.search_conformers(self._one(), **dict(kw, append=True))
-
-        assert "Water" in str(excinfo.value)
-        assert len(calls) == calls_before
-        after = {
-            path.relative_to(tmp_path): path.read_bytes()
-            for path in tmp_path.rglob("*")
-            if path.is_file()
-        }
-        assert after == before
-
-    @pytest.mark.parametrize(
-        "prior_label,current_label",
-        [("A+B", "A B"), ("Water", "water")],
-    )
-    def test_append_collision_raises_before_any_mutation(
-        self, tmp_path, monkeypatch, prior_label, current_label
-    ):
-        import pandas as pd
-
-        calls = []
-        C = self._patch(monkeypatch, calls)
-        first = pd.DataFrame([{
-            "name": prior_label,
-            "cid": 1,
-            "IsomericSMILES": "O",
-        }])
-        second = pd.DataFrame([{
-            "name": current_label,
-            "cid": 2,
-            "IsomericSMILES": "N",
-        }])
-        with pytest.raises(ValueError, match="both map to output basename"):
-            self._kw(
-                tmp_path,
-                manifest_table=pd.concat([first, second], ignore_index=True),
-            )
-
-        # The manifest boundary now rejects the invalid one-to-one mapping
-        # before conformer generation or any run-output mutation begins.
-        assert calls == []
-        assert not list(tmp_path.glob("run_manifest_*.json"))
-        assert not (tmp_path / "conformer_log.csv").exists()
-        assert not (tmp_path / "xyz").exists()
-        assert not (tmp_path / "fail.csv").exists()
-
-    def test_already_corrupt_append_log_is_rejected_without_mutation(
-        self, tmp_path
-    ):
-        import pandas as pd
-        import pipeline.conformers as C
-
-        log_path = tmp_path / "conformer_log.csv"
-        pd.DataFrame([{"name": "A+B"}, {"name": "A B"}]).to_csv(
-            log_path, index=False
-        )
-        xyz_dir = tmp_path / "xyz"
-        xyz_dir.mkdir()
-        xyz_path = xyz_dir / "a_b_c00.xyz"
-        xyz_path.write_text("prior geometry\n")
-        before_log = log_path.read_bytes()
-        before_xyz = xyz_path.read_bytes()
-        current = pd.DataFrame([{
-            "name": "Adenine",
-            "cid": 3,
-            "IsomericSMILES": "N",
-        }])
-
-        with pytest.raises(ValueError, match="both map to output basename"):
-            C.search_conformers(
-                current,
-                xyz_dir=str(xyz_dir),
-                log_csv=str(log_path),
-                failed_csv=str(tmp_path / "fail.csv"),
-                append=True,
-            )
-
-        assert log_path.read_bytes() == before_log
-        assert xyz_path.read_bytes() == before_xyz
-        assert not (tmp_path / "fail.csv").exists()
-
+        assert not any(name.endswith(".xyz") for name in os.listdir(xyz_dir))
 
 class TestStaleFailedCsvCleared:
-    """MIN-02: a prior run's *_failed.csv must not survive a later clean run."""
+    """A fresh v2.1 run never reuses a prior run's failure log."""
 
-    def test_failed_csv_cleared_on_clean_rerun(self, tmp_path, monkeypatch):
+    def test_stale_failed_csv_rejects_a_fresh_manifest_before_mutation(self, tmp_path, monkeypatch):
         import pandas as pd
 
         import pipeline.conformers as C
@@ -1693,7 +893,7 @@ class TestStaleFailedCsvCleared:
         C.search_conformers(bad_table, **bad_kw)
         assert failed_csv.exists()
 
-        # Second run is clean → the stale failure log is cleared, not left behind.
+        # A fresh manifest cannot reuse the prior run's conformer-stage outputs.
         monkeypatch.setattr(C, "check_conformer_eligibility", lambda s: None)
         monkeypatch.setattr(
             C, "generate_conformers",
@@ -1703,8 +903,10 @@ class TestStaleFailedCsvCleared:
         good_kw = dict(kw, manifest_path=ensure_manifest(
             tmp_path, good_table, rdkit_version="test-rdkit"
         ))
-        C.search_conformers(good_table, **good_kw)
-        assert not failed_csv.exists()
+        failed_before = failed_csv.read_bytes()
+        with pytest.raises(FileExistsError, match="existing conformer-stage outputs"):
+            C.search_conformers(good_table, **good_kw)
+        assert failed_csv.read_bytes() == failed_before
 
 
 class TestParameterValidation:
@@ -1867,11 +1069,9 @@ class TestManifestMoleculeCoverage:
         assert prior_failure.read_bytes() == b"prior failure\n"
         assert not (tmp_path / "xyz").exists()
 
-    def test_append_true_requires_current_plus_retained_complete_manifest(
-        self, tmp_path, monkeypatch
-    ):
-        from pathlib import Path
-
+    def test_subset_table_rejected_no_append_alternative(self, tmp_path, monkeypatch):
+        # v2.1 removed append: a subset table has no reuse path and simply fails
+        # the exact-manifest requirement before any mutation.
         C = self._patch(monkeypatch)
         full, subset = self._tables()
         manifest_path = ensure_manifest(
@@ -1881,22 +1081,15 @@ class TestManifestMoleculeCoverage:
             pipeline_commit="test-clean-commit",
             rdkit_version="test-rdkit",
         )
-        manifest_before = Path(manifest_path).read_bytes()
-
-        with pytest.raises(ValueError, match="account for the complete run manifest"):
+        with pytest.raises(ValueError, match="match the run manifest exactly"):
             C.search_conformers(
                 subset,
                 xyz_dir=str(tmp_path / "xyz"),
                 log_csv=str(tmp_path / "conformer_log.csv"),
                 failed_csv=str(tmp_path / "conformer_search_failed.csv"),
-                append=True,
                 manifest_path=manifest_path,
             )
-
-        assert Path(manifest_path).read_bytes() == manifest_before
         assert not (tmp_path / "xyz").exists()
-        assert not (tmp_path / "conformer_log.csv").exists()
-        assert not (tmp_path / "conformer_search_failed.csv").exists()
 
 
 class TestPackageBoundaryPreflight:
@@ -1905,7 +1098,7 @@ class TestPackageBoundaryPreflight:
     log fails atomically — no lineage removal, directory creation, failure-log
     deletion, XYZ write, or log rewrite occurs, and RDKit is never reached."""
 
-    def _build_valid_run(self, tmp_path, monkeypatch):
+    def _build_fresh_manifest(self, tmp_path, monkeypatch):
         import pandas as pd
 
         import pipeline.conformers as C
@@ -1915,11 +1108,6 @@ class TestPackageBoundaryPreflight:
         monkeypatch.setattr(
             C, "pipeline_provenance", lambda: ("2.0.0", "test-clean-commit")
         )
-        coords = [[("O", 0.0, 0.0, 0.0), ("H", 0.0, 0.0, 0.96)]]
-        monkeypatch.setattr(
-            C, "generate_conformers",
-            lambda smiles, **kw: (coords, [0.0], "MMFF94", [True]),
-        )
         table = pd.DataFrame([{"name": "Water", "cid": 1, "IsomericSMILES": "O"}])
         manifest_path = ensure_manifest(
             tmp_path,
@@ -1928,35 +1116,23 @@ class TestPackageBoundaryPreflight:
             pipeline_commit="test-clean-commit",
             rdkit_version="test-rdkit",
         )
-        xyz_dir = tmp_path / "xyz"
-        log_csv = tmp_path / "conformer_log.csv"
-        failed_csv = tmp_path / "conformer_search_failed.csv"
-        C.search_conformers(
-            table,
-            xyz_dir=str(xyz_dir),
-            log_csv=str(log_csv),
-            failed_csv=str(failed_csv),
-            manifest_path=manifest_path,
-        )
-        return C, table, manifest_path, xyz_dir, log_csv, failed_csv
+        return C, table, manifest_path
 
-    @pytest.mark.parametrize("target", ["xyz_dir", "log_csv"])
+    @pytest.mark.parametrize("target", ["xyz_dir", "log_csv", "failed_csv"])
     def test_outside_package_destination_fails_atomically(
         self, tmp_path, monkeypatch, target
     ):
         from pathlib import Path
 
-        C, table, manifest_path, xyz_dir, log_csv, failed_csv = (
-            self._build_valid_run(tmp_path, monkeypatch)
-        )
-        # An existing failure log from a prior run must survive an aborted rerun.
+        C, table, manifest_path = self._build_fresh_manifest(tmp_path, monkeypatch)
+        xyz_dir = tmp_path / "xyz"
+        log_csv = tmp_path / "conformer_log.csv"
+        failed_csv = tmp_path / "conformer_search_failed.csv"
+        # A pre-existing failure log must survive an aborted run.
         failed_csv.write_bytes(b"prior failure\n")
 
         manifest_before = Path(manifest_path).read_bytes()
-        log_before = log_csv.read_bytes()
         failed_before = failed_csv.read_bytes()
-        xyz_before = {p: p.read_bytes() for p in xyz_dir.glob("*.xyz")}
-        assert xyz_before  # the valid run wrote at least one XYZ
 
         # Any generation attempt after preflight would be a bug: prove the stage
         # aborts during package-boundary preflight, before RDKit is reached.
@@ -1968,11 +1144,14 @@ class TestPackageBoundaryPreflight:
         outside = tmp_path.parent / f"m30_conformer_outside_{tmp_path.name}"
         if target == "xyz_dir":
             call = dict(xyz_dir=str(outside), log_csv=str(log_csv))
-        else:
+        elif target == "log_csv":
             call = dict(
                 xyz_dir=str(xyz_dir),
                 log_csv=str(outside / "conformer_log.csv"),
             )
+        else:
+            call = dict(xyz_dir=str(xyz_dir), log_csv=str(log_csv))
+            failed_csv = outside / "conformer_search_failed.csv"
 
         with pytest.raises(ValueError, match="inside the run package"):
             C.search_conformers(
@@ -1983,7 +1162,10 @@ class TestPackageBoundaryPreflight:
             )
 
         assert Path(manifest_path).read_bytes() == manifest_before
-        assert log_csv.read_bytes() == log_before
-        assert failed_csv.read_bytes() == failed_before
-        assert {p: p.read_bytes() for p in xyz_dir.glob("*.xyz")} == xyz_before
+        if target == "failed_csv":
+            assert not failed_csv.exists()
+        else:
+            assert failed_csv.read_bytes() == failed_before
+        assert not xyz_dir.exists()
+        assert not log_csv.exists()
         assert not outside.exists()
