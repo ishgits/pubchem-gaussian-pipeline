@@ -344,7 +344,7 @@ def generate_conformers(
     # geometry AND energy: otherwise a whole-ensemble retry would move converged
     # geometries while _finalize_convergence kept their first-pass energies,
     # leaving ranked energies describing a different geometry than the XYZ/.com we
-    # write (Codex round-02 M-05).
+    # write.
     first = _optimize_confs(mol, method, FF_MAXITERS)
     if any(nc != 0 for nc, _ in first):
         retry = list(first)

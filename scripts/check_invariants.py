@@ -371,8 +371,8 @@ def check_gaussian_provenance() -> list[str]:
 
 
 # 4) Resume/append removal (v2.1). Every run
-# is fresh and immutable; the entire reuse subsystem is deleted, which removes
-# B-04 by construction. This guard proves the resume path is GONE — not merely
+# is fresh and immutable; the entire reuse subsystem is deleted. This guard
+# proves the resume path is GONE — not merely
 # refactored — so a future change cannot quietly reintroduce it: search_conformers
 # must expose no `append` parameter and no resume helpers, and it must raise on an
 # already-populated run folder rather than reusing it. It also holds the reduced

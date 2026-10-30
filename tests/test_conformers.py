@@ -288,8 +288,8 @@ class TestSearchConformers:
         assert "PROVISIONAL" in comment
 
     def test_rerun_populated_run_folder_raises(self, tmp_path, monkeypatch):
-        # v2.1 (contract §7): no resume/append. Re-running on a populated run
-        # folder raises rather than reusing/appending — B-04 removed by construction.
+        # v2.1: no resume/append. Re-running on a populated run
+        # folder raises rather than reusing/appending.
         pytest.importorskip("rdkit")
         import pipeline.conformers as C
 
