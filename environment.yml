@@ -10,5 +10,5 @@ dependencies:
   - jupyterlab
   - pytest
 # numpy is NOT an explicit dependency: it is unused outside pipeline/ (verified)
-# and pulled in transitively by pandas/rdkit. For a reproducible v2.0.0 stack,
+# and pulled in transitively by pandas/rdkit. For a reproducible pinned stack,
 # install the pinned versions in requirements-lock.txt.

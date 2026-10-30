@@ -6,7 +6,7 @@ For each molecule the pipeline generates an RDKit conformer ensemble
 top-N lowest-energy, distinct conformers forward as DFT starting geometries,
 each with recorded provenance (seed, method, relative energy).
 
-Scientific notes (see AGENTS.md §2 and docs/architecture.md v2):
+Scientific notes (see CONTRIBUTING.md and docs/architecture.md):
 
 - These are force-field *starting* geometries, NOT optimized minima. The DFT
   step makes the final call among the carried candidates.
@@ -50,7 +50,7 @@ from .utils import (
     sanitize_basename,
 )
 
-# Locked defaults (docs/implementation-plan.md v2 — confirm at approval).
+# Locked defaults (see docs/architecture.md).
 N_GENERATE = 20
 TOP_N = 3
 RMSD_PRUNE = 0.5  # Ångström
@@ -297,8 +297,7 @@ def generate_conformers(
     plan: provenance requires recording which FF ran (MMFF94 vs UFF fallback) and
     whether each conformer's optimization actually converged — a log that implies
     success when the optimizer did not converge would violate the provenance /
-    "ran ≠ validated" invariants. Recorded as a deviation in
-    docs/implementation-status-v2.md.
+    "ran ≠ validated" invariants.
 
     Any conformer flagged not-converged on the first pass is re-optimized once
     with ``FF_MAXITERS_RETRY`` iterations before its flag is finalized (M-04).
@@ -345,7 +344,7 @@ def generate_conformers(
     # geometry AND energy: otherwise a whole-ensemble retry would move converged
     # geometries while _finalize_convergence kept their first-pass energies,
     # leaving ranked energies describing a different geometry than the XYZ/.com we
-    # write (Codex round-02 M-05).
+    # write.
     first = _optimize_confs(mol, method, FF_MAXITERS)
     if any(nc != 0 for nc, _ in first):
         retry = list(first)

@@ -20,7 +20,6 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PIPELINE = ROOT / "pipeline"
-STATUS_DOC = ROOT / "docs" / "implementation-status.md"
 GITIGNORE = ROOT / ".gitignore"
 GAUSSIAN = PIPELINE / "gaussian.py"
 CONFORMERS = PIPELINE / "conformers.py"
@@ -44,7 +43,7 @@ PLACEHOLDER_PATTERNS = [
 #    code (constants named ROUTE_OPT / ROUTE_FREQ in the package). Today they are
 #    passed in from user config, so this is a no-op that activates automatically
 #    if/when route construction moves into pipeline/. Until then, route-line
-#    integrity is a REVIEW guideline (AGENTS.md §2/§6), not a CI gate.
+#    integrity is a review guideline (see CONTRIBUTING.md), not a CI gate.
 REQUIRED_OPT_TOKENS = ["b3lyp", "scrf", "6-311"]
 REQUIRED_FREQ_TOKENS = ["b3lyp", "scrf", "6-311", "temperature"]
 
@@ -104,38 +103,7 @@ def check_generated_artifact_ignores() -> list[str]:
     ]
 
 
-# 3) Canonical status-doc drift guard (M-07). AGENTS.md §5 names
-#    docs/implementation-status.md as the merge gate. It must never sit as the
-#    empty template while the real status lives in implementation-status-v2.md, so
-#    reviewers/maintainers following the mandated gate can't miss v2 deviations.
-#    This turns "canonical went stale" from a reviewer catch into a floor failure.
-#    (The v2 working-history drafts are archived under docs/review-history/v2/.)
-def _status_doc_problems(text: str) -> list[str]:
-    """Return template-marker problems in a status-doc string (pure, testable)."""
-    problems = []
-    # Angle-bracket template placeholders: <n>, <name>, <none | ...>, <>, <e.g...>.
-    # The populated status doc must contain no bare angle-bracket tokens.
-    for m in re.finditer(r"<[^>\n]*>", text):
-        problems.append(f"template placeholder {m.group(0)!r}")
-    # Empty bullets: a list line that is just "-" / "- " with nothing after it.
-    for i, line in enumerate(text.splitlines(), 1):
-        if re.match(r"^\s*-\s*$", line):
-            problems.append(f"empty bullet at line {i}")
-    return problems
-
-
-def check_status_doc() -> list[str]:
-    if not STATUS_DOC.exists():
-        return [f"[status-doc] {STATUS_DOC.name} is missing"]
-    text = STATUS_DOC.read_text(encoding="utf-8", errors="replace")
-    return [
-        f"[status-doc] docs/implementation-status.md still has {p} "
-        f"(populate the canonical merge-gate doc — AGENTS.md §5 gate)"
-        for p in _status_doc_problems(text)
-    ]
-
-
-# 4) V2 Gaussian provenance enforcement (M-14/M-16/M-17). Every
+# 3) Gaussian provenance enforcement. Every
 #    conformer-derived COM must carry pipeline/commit/RDKit identity, whether it
 #    comes through the batch API or a direct conformer-specific writer call. Use
 #    the AST so this guard checks semantic structure without depending on
@@ -402,9 +370,9 @@ def check_gaussian_provenance() -> list[str]:
     ]
 
 
-# 5) v2.1 resume/append removal (contract §7, architecture Change 4). Every run
-# is fresh and immutable; the entire reuse subsystem is deleted, which removes
-# B-04 by construction. This guard proves the resume path is GONE — not merely
+# 4) Resume/append removal (v2.1). Every run
+# is fresh and immutable; the entire reuse subsystem is deleted. This guard
+# proves the resume path is GONE — not merely
 # refactored — so a future change cannot quietly reintroduce it: search_conformers
 # must expose no `append` parameter and no resume helpers, and it must raise on an
 # already-populated run folder rather than reusing it. It also holds the reduced
@@ -485,7 +453,7 @@ def check_append_integrity() -> list[str]:
     ]
 
 
-# 6) Frozen manifest-centric v2.0 matrix. This intentionally checks only the
+# 5) Manifest-centric per-artifact matrix. This intentionally checks only the
 # approved per-artifact linkage fields and authoritative manifest mechanisms;
 # it must not grow into a requirement to duplicate every search knob into XYZ
 # comments or COM title blocks.
@@ -620,7 +588,6 @@ def main() -> int:
         check_placeholders()
         + check_route_constants()
         + check_generated_artifact_ignores()
-        + check_status_doc()
         + check_gaussian_provenance()
         + check_append_integrity()
         + check_frozen_matrix()

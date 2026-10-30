@@ -1,10 +1,8 @@
-# Pinned dependency stack targeted for the v2.0.0 release.
+# Pinned dependency stack for the v2.1 release.
 #
 # RDKit conformer generation is version-sensitive, so the release pins the
 # stack. These exact dependency pins were exercised on 2026-07-13 with CPython
-# 3.12.13; the verified results are recorded in
-# docs/implementation-status.md. The clean-source-archive repeat also passed on
-# 2026-07-13.
+# 3.12.13, including a clean-source-archive repeat of the test suite.
 #
 # Reproduce with: python -m pip install -r requirements-lock.txt
 # numpy is intentionally not pinned as a direct dependency; it is pulled in
