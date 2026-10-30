@@ -59,7 +59,7 @@ def git_short_sha(cwd: str | None = None) -> str:
     produced from a modified tree is visibly *not* reproducible from the commit
     alone). Returns ``""`` on **any** failure — git absent, not a repository,
     subprocess error, or timeout. It never raises and never touches the network,
-    so it is safe in the offline test suite (AGENTS.md §4) and on installed / HPC
+    so it is safe in the offline test suite (see CONTRIBUTING.md) and on installed / HPC
     copies with no ``.git`` directory.
 
     Parameters

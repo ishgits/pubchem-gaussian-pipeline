@@ -1,4 +1,4 @@
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18894724.svg)](https://doi.org/10.5281/zenodo.18894724)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18894723.svg)](https://doi.org/10.5281/zenodo.18894723)
 
 
 
@@ -7,11 +7,6 @@
 Automated generation of **Gaussian input files** (`.com`) and **SLURM submission scripts** (`.sh`) from molecule names — no manual structure building required.
 
 Give it a list of molecule names, and the pipeline resolves each to a PubChem record, runs an **RDKit conformer search**, and writes ready-to-submit Gaussian opt→freq inputs (one per conformer) plus cluster submission scripts.
-
-> **Release-candidate status:** the manifest-centric v2 implementation is
-> complete and mechanically verified on the release branch. Final merge remains
-> gated on the holistic review, green CI, and Ish's approval recorded in
-> `docs/implementation-status.md`.
 
 ## Pipeline Overview (v2 — the default)
 
@@ -38,9 +33,8 @@ The supported archive and transfer unit is the complete run package — in v2.1 
 
 ## Provenance and reproducibility contract
 
-v2.1 uses a manifest-centric model defined in
-[`docs/release-contract-v2.1.md`](docs/release-contract-v2.1.md) (a deliberate
-revision of the frozen [`docs/release-contract-v2.0.md`](docs/release-contract-v2.0.md)):
+The pipeline uses a manifest-centric provenance model, described in
+[`docs/provenance.md`](docs/provenance.md):
 
 - `run_manifest.json` stores the complete configuration and artifact hashes;
 - each run writes one immutable `runs/<study>/<run_id>/` folder, with COM+SH
@@ -69,7 +63,7 @@ git clone https://github.com/ishgits/pubchem-gaussian-pipeline.git
 cd pubchem-gaussian-pipeline
 conda env create -f environment.yml
 conda activate gaussian-pipeline
-# For the pinned v2.0.0 release-target stack: python -m pip install -r requirements-lock.txt
+# For the pinned release stack: python -m pip install -r requirements-lock.txt
 ```
 
 ### 2. Edit the notebook
@@ -103,8 +97,7 @@ There is **no resume/append** (v2.1). Every run is fresh and immutable; to add
 molecules, start a new run in a new `runs/<study>/<run_id>/` folder. Pointing the
 pipeline at an already-populated run folder raises rather than reusing or
 appending — two clean single-purpose runs are better provenance than a resume
-path. This deletes the v2.0 stale-conformer-resurrection finding (B-04) by
-construction.
+path.
 
 ## Repository Structure
 
@@ -123,9 +116,9 @@ pubchem-gaussian-pipeline/
 ├── examples/
 │   └── nucleobases_nucleosides.py  # Real-world molecule list example
 ├── tests/                      # Unit tests (pytest, offline)
-├── docs/                       # architecture.md, implementation-plan.md, status
+├── docs/                       # architecture.md, provenance.md
 ├── environment.yml             # Conda environment
-├── requirements-lock.txt       # Pinned v2.0.0 stack
+├── requirements-lock.txt       # Pinned dependency stack
 ├── LICENSE
 └── README.md
 ```
@@ -152,7 +145,7 @@ Edit `ROUTE_OPT` and `ROUTE_FREQ` in the configuration cell. The defaults are:
 ```
 
 Change the functional, basis set, solvation model, or temperature only as an
-explicit scientific choice and record it in the manifest. The supported v2.0
+explicit scientific choice and record it in the manifest. The supported
 path preserves the Link1 opt→freq contract; decoupling the jobs is a scientific
 architecture deviation and must be documented before use.
 
@@ -207,7 +200,7 @@ Tests cover the pure functions and the offline conformer/Gaussian/SLURM paths; t
 - **Open Babel** — only for the optional legacy v1.1 single-geometry path
 - **Gaussian 16** (on your HPC cluster, not needed locally)
 
-See `requirements-lock.txt` for the pinned v2.0.0 release-target stack and its recorded verification status.
+See `requirements-lock.txt` for the pinned dependency stack.
 
 ## Citation
 
